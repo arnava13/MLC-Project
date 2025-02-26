@@ -13,8 +13,14 @@ https://ocov2.jpl.nasa.gov/science/oco-2-data-center/ <br>
 GHGSat: Satellite data monitoring greenhouse gas emissions (methane and CO₂) from specific locations.
 https://earth.esa.int/eogateway/missions/ghgsat#data-section (required approval) 
 
-# Feabruary 26 2025
+# February 26 2025
 ### Major difficulty
 Some useful datsets require approval from the data provider. <br>
 How to adjust data from reports with remote sensing data? <br>
-It is difficult to definitively determine whether it is due to the company's location or the nature of its business.
+It is difficult to definitively determine whether it is due to the company's location or the nature of its business.<br>
+It seems very hard to distinguish the impact of a company's business on the environment due to the geoggraphic scales and other environmental factors.
+
+### Possible directions
+Anomaly detection of CO₂ concentration data from reports by using remote sensing data. <br>
+Time series forecasting of CO₂ concentration<br>
+Evaluate ESC score of companies by using reports and remote sensing data.
