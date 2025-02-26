@@ -1,6 +1,6 @@
 # February 25 2025
-Searched some related datasets
-### Data Sets to Use
+Searched some related datasets.
+### Datasets to Use
 #### Corporate Climate Reporting Data
 CDP Climate Change Data: Data submitted by companies regarding greenhouse gas (GHG) emissions, energy use, and risk assessments. https://www.cdp.net/en (request access)
 #### Corporate Sustainability Reports: Specific GHG emissions and renewable energy usage ratios from companies like Unilever, Coca-Cola, and Microsoft.
@@ -11,4 +11,10 @@ Microsoft: https://cdn-dynmedia-1.microsoft.com/is/content/microsoftcorp/microso
 OCO-2: CO₂ concentration data taken from satellite images.
 https://ocov2.jpl.nasa.gov/science/oco-2-data-center/ <br>
 GHGSat: Satellite data monitoring greenhouse gas emissions (methane and CO₂) from specific locations.
-https://earth.esa.int/eogateway/missions/ghgsat#data-section (required approval)
+https://earth.esa.int/eogateway/missions/ghgsat#data-section (required approval) 
+
+# Feabruary 26 2025
+### Major difficulty
+Some useful datsets require approval from the data provider. <br>
+How to adjust data from reports with remote sensing data? <br>
+It is difficult to definitively determine whether it is due to the company's location or the nature of its business.
