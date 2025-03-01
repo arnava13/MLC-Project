@@ -24,3 +24,17 @@ It seems very hard to distinguish the impact of a company's business on the envi
 Anomaly detection of CO₂ concentration data from reports by using remote sensing data. <br>
 Time series forecasting of CO₂ concentration<br>
 Evaluate ESC score of companies by using reports and remote sensing data.
+
+### first meeting
+Discuss the direction of the project. <br>
+Change our plan to follow some public projects. <br>
+EY - The 2025 EY Open Science AI and Data Challenge: Cooling Urban Heat Islands: https://challenge.ey.com/challenges/the-2025-ey-open-science-ai-and-data-challenge-cooling-urban-heat-islands-external-participants/data-description <br>
+
+#  February 28 2025
+### Datasets
+European Sentinel-2 optical satellite data <br>
+NASA Landsat optical satellite data <br>
+
+### Additional Datasets
+Building footprints of the Bronx and Manhattan regions <br>
+Detailed local weather dataset of the Bronx and Manhattan regions on 24 July 2021
