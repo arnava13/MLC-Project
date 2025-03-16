@@ -86,3 +86,9 @@ Use NDVI, NDWI, NDBI, LST as our 4 channels and run a convolution over the $W\ti
 **Traffic**
 
 - Research shows car traffic results in UHI, so we are going to use https://developers.google.com/maps/documentation/javascript/examples/layer-traffic to get a scalar traffic density value for each grid cell. Add/concat at near the end of the model when we have grid cells.
+
+# March 15 2025
+## Week 2: Planning
+
+Not much progress in this week since we both were very busy for midterms.
+try to finish preprocessing for data input and build a simple model (small number of features).
