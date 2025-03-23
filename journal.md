@@ -92,3 +92,8 @@ Use NDVI, NDWI, NDBI, LST as our 4 channels and run a convolution over the $W\ti
 
 Not much progress in this week since we both were very busy for midterms.
 try to finish preprocessing for data input and build a simple model (small number of features).
+
+Importamt papers
+- FoundTS: Comprehensive and Unified Benchmarking of Foundation Models for Time Series Forecasting <br>
+- Deep Time Series Models: A Comprehensive Survey and Benchmark<br>
+- N-BEATS: The Unique Interpretable Deep Learning Model for Time Series Forecasting<br>
