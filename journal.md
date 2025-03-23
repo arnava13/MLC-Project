@@ -97,3 +97,4 @@ Importamt papers
 - FoundTS: Comprehensive and Unified Benchmarking of Foundation Models for Time Series Forecasting <br>
 - Deep Time Series Models: A Comprehensive Survey and Benchmark<br>
 - N-BEATS: The Unique Interpretable Deep Learning Model for Time Series Forecasting<br>
+- TIME-MOE: Billion-Scale Time Series Foundation Models with Mixture of Experts<br>
