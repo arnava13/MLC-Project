@@ -98,3 +98,11 @@ Importamt papers
 - Deep Time Series Models: A Comprehensive Survey and Benchmark<br>
 - N-BEATS: The Unique Interpretable Deep Learning Model for Time Series Forecasting<br>
 - TIME-MOE: Billion-Scale Time Series Foundation Models with Mixture of Experts<br>
+
+## Week 3:
+Computation plans
+- Use latest Feature Pyramid Network for image feature <br>
+https://unit8co.github.io/darts/index.html#forecasting-models <br>
+https://unit8co.github.io/darts/userguide/torch_forecasting_models.html <br>
+
+- Use latest detection/segmentation model for time series (YOLO) <br>
