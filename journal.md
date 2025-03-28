@@ -48,7 +48,7 @@ Output Format:
 
 60 time stamps
 
-Time series model – 1123x1 
+Time series model - 1123x1 
 
 Over 60 timestamps
 
@@ -64,7 +64,7 @@ Use NDVI, NDWI, NDBI, LST as our 4 channels and run a convolution over the $W\ti
 
 “Participants might explore other combinations of bands from the Sentinel-2 and from other satellite datasets as well. For example, you can use mathematical combinations of bands to generate various indices </a> which can then be used as features in your model. These bands or indices may provide insights into surface characteristics, vegetation, or built-up areas that could influence UHI patterns.” 
 
-– Perhaps we use the spectral bands directly instead of NDVI, NDWI, NDBI, LST and these can be our channels?? There are a lot so we would run ablation, starting with those used for NDVI, NDWI, NDBI and LST and then expanding outwards
+- Perhaps we use the spectral bands directly instead of NDVI, NDWI, NDBI, LST and these can be our channels?? There are a lot so we would run ablation, starting with those used for NDVI, NDWI, NDBI and LST and then expanding outwards
 
 “Instead of a single point data extraction, participants might explore the approach of creating a focal buffer around the locations (e.g., 50 m, 100 m, 150 m etc). For example, if the specified distance was 50 m and the specified band was “Band 2”, then the value of the output pixels from this analysis would reflect the average values in band 2 within 50 meters of the specific location. This approach might help reduction in error associated with spatial autocorrelation. In this demonstration notebook, we are extracting the band data for each of the locations without creating a buffer zone.” – We should use the resolution of the output dataset i.e **gridcell size** as the area of averaging
 
