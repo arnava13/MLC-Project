@@ -4,7 +4,7 @@ import torch.nn.functional as F
 from torch import nn, optim
 from torchmetrics import MeanSquaredError
 
-from finetune.regression.factory import Regressor
+from factory import Regressor
 
 
 class NoNaNRMSE(nn.Module):
