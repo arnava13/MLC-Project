@@ -1,4 +1,5 @@
-# February 25 2025
+#Project Journal
+## February 25 2025
 Searched some related datasets.
 ### Datasets to Use
 #### Corporate Climate Reporting Data
@@ -106,3 +107,18 @@ https://unit8co.github.io/darts/index.html#forecasting-models <br>
 https://unit8co.github.io/darts/userguide/torch_forecasting_models.html <br>
 
 - Use latest detection/segmentation model for time series (YOLO) <br>
+
+# March 31 2025
+Finalised our computational plan
+- Extract the tensors specified above (nearly done)
+- Use pretrained encoder trained on satellite imagery, will try them all in this order:
+
+1. Clay
+2. U-BARN
+3. Prithvi
+
+- Use simple LSTM for getting the regression output
+- Then try transformers, N-BEATS, and DeepAR etc.
+
+
+
