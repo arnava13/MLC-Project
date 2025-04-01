@@ -100,7 +100,7 @@ Importamt papers
 - N-BEATS: The Unique Interpretable Deep Learning Model for Time Series Forecasting<br>
 - TIME-MOE: Billion-Scale Time Series Foundation Models with Mixture of Experts<br>
 
-## Week 3:
+# March 22 2025:
 Computation plans
 - Use latest Feature Pyramid Network for image feature <br>
 https://unit8co.github.io/darts/index.html#forecasting-models <br>
@@ -120,5 +120,12 @@ Finalised our computational plan
 - Use simple LSTM for getting the regression output
 - Then try transformers, N-BEATS, and DeepAR etc.
 
-
+# April 1 2025
+Created load_sentinel_LST_tensor.py 
+- Loaded Sentinel-2 imagery as a tensor with selected bands using Planetary Computer STAC API.
+- Applied cloud cover filtering and bounding box over NYC.
+- Loaded Landsat 8 LWIR11 band.
+- Resized LST tensor to match Sentinel-2 resolution using bilinear interpolation.
+- Combined Sentinel-2 and LST tensors into a final shape of (5, 1448, 1671).
+- Confirmed functionality with shape, value range checks, and LST heatmap visualization.
 
