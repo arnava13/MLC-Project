@@ -7,7 +7,7 @@ from scipy.ndimage import zoom
 import matplotlib.pyplot as plt
 
 # Function to load Sentinel-2 data and create a tensor
-def load_sentinel_tensor_from_bbox(bounds=(-74.01, 40.75, -73.86, 40.88), time_window="2021-06-01/2021-09-01", selected_bands=["B02", "B03", "B04", "B08"], resolution_m=10):
+def load_sentinel_tensor_from_bbox(bounds, time_window="2021-06-01/2021-09-01", selected_bands=["B02", "B03", "B04", "B08"], resolution_m=10):
     scale = resolution_m / 111320.0  # Convert to degrees for EPSG:4326
 
     catalog = pystac_client.Client.open("https://planetarycomputer.microsoft.com/api/stac/v1")
@@ -94,47 +94,3 @@ def load_lst_tensor_from_bbox(bounds, time_window, resolution_m=30):
     lst_tensor = lst_kelvin.values[np.newaxis, ...].astype(np.float32)
     print("LST tensor shape:", lst_tensor.shape)
     return lst_tensor
-
-# Function to combine Sentinel-2 and LST tensors
-def combine_sentinel_and_lst_tensor(bounds, time_window):
-    print("Loading Sentinel-2 tensor...")
-    sentinel_tensor = load_sentinel_tensor_from_bbox(bounds=bounds, time_window=time_window)
-    print("→ Sentinel-2 shape:", sentinel_tensor.shape)
-
-    print("Loading LST tensor...")
-    lst_tensor = load_lst_tensor_from_bbox(bounds=bounds, time_window=time_window)
-    print("→ LST shape:", lst_tensor.shape)
-
-    # Resize LST tensor to match Sentinel-2 dimensions
-    _, h_s, w_s = sentinel_tensor.shape
-    _, h_l, w_l = lst_tensor.shape
-    zoom_factors = (h_s / h_l, w_s / w_l)
-
-    print(f"Resizing LST: zoom={zoom_factors}")
-    lst_resized = zoom(lst_tensor[0], zoom_factors, order=1)  # Linear interpolation
-    lst_resized = lst_resized[np.newaxis, :, :]  # Shape=(1, H, W)
-
-    # Combine tensors
-    combined = np.concatenate([sentinel_tensor, lst_resized], axis=0)
-    print("Combined tensor shape:", combined.shape)
-    return combined
-
-# Example usage:
-bounds = (-74.01, 40.75, -73.86, 40.88)  # Bounding box for New York City
-time_window = "2021-06-01/2021-09-01"  # Time window for data search
-
-try:
-    # Combine Sentinel-2 and LST tensors
-    combined_tensor = combine_sentinel_and_lst_tensor(bounds, time_window)
-    print("Final combined tensor shape:", combined_tensor.shape)
-    print("LST (K) range: min =", np.nanmin(combined_tensor[-1]), "max =", np.nanmax(combined_tensor[-1]))
-
-    # Visualize LST
-    plt.imshow(combined_tensor[-1], cmap="jet")
-    plt.colorbar(label="LST (K)")
-    plt.title("Landsat-derived LST")
-    plt.show()
-
-except Exception as e:
-    print("Error occurred:", e)
-
