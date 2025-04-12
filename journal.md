@@ -129,3 +129,20 @@ Created load_sentinel_LST_tensor.py
 - Combined Sentinel-2 and LST tensors into a final shape of (5, 1448, 1671).
 - Confirmed functionality with shape, value range checks, and LST heatmap visualization.
 
+# April 11 2025: Began to create dataloaders 
+- We want a dataloader for each City (DONE)
+- Each dataloader consolidates the UHI data to a grid based on an input resolution parameters (DONE)
+    TODO:
+- Create a function to get weather data nearest to each latlong position of the UHI data (DONE).
+- loads the satellite data for the bounding box of the city and the time window specified by the UHI
+  data, and then we get the median mosaic (cloudless) of the satellite data in some averaging window
+  before the UHI observation day, will start with 10 days. (nearly done)
+- load the weather data nearest every UHI observation point using API (nearly done)
+- create the lst data as a tensor with the same grid as the UHI data.
+
+Goal for Tuesday the 15th:
+- Get a simple model working, we will use the Clay forward pass just once as a feature extractor and
+  not backpropagate through it. Then we will combine all features in an LSTM and train that.
+- Trying to build in such a way that we don't load all of the data into memory at once, but rather
+  query APIs when we do __getitem__() in the dataset class, and then pass this to a standard pytorch
+  dataloader.
