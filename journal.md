@@ -147,31 +147,31 @@ Goal for Tuesday the 15th:
   query APIs when we do __getitem__() in the dataset class, and then pass this to a standard pytorch
   dataloader.
 
-# April 15 2025 # Completed the dataloader
+# April 15 2025: Completed the dataloader
 
-## `ingest/get_median.py`: Data Extraction Functions
+## `ingest/get_median.py`: Data extraction functions
 - Implemented `load_sentinel_tensor_from_bbox_median()`: 
   - Loads and computes the median composite of Sentinel-2 imagery over a given bounding box and time window.
 - Implemented `load_lst_tensor_from_bbox_median()`:
   - Loads and computes the median of LST over the same region and time.
 - Resized LST tensors to match Sentinel resolution.
 
-## Modified `CityDataSet` Class 
+## Modified `CityDataSet` class 
 - Built a PyTorch `Dataset` class that:
-  - Loads Sentinel-2 tensors (median over a time window) per UHI observation.
+  - Loads Sentinel-2 tensors median over a time window per UHI.
   - Associates each UHI timestamp with its corresponding satellite data window.
 
-## Integrated Weather Data (Open-Meteo)
+## Integrated weather data from Open-Meteo
 - Used pre-downloaded `nyc_weather_grid.csv` from Open-Meteo API (`weather_data.py`).
 - Matched weather data (max/min temperature, precipitation) based on:
   - Rounded lat/lon or tolerance-based proximity
   - Normalized date (from timestamp)
 
-## Integrated LST as Optional Input (`include_lst=True`)
+## Integrated LST as optional input (`include_lst=True`)
 - Added a boolean flag `include_lst` in `CityDataSet`.
 - If True:
   - Loads LST median tensor for each UHI observation.
-  - Resizes LST tensor to match Sentinel resolution using `zoom`.
+  - Resizes LST tensor to match Sentinel resolution.
   - Concatenates LST as an additional band → Final shape: `(5, H, W)`  
 - If False:
   - Sentinel tensor shape remains `(4, H, W)`
