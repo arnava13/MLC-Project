@@ -2,36 +2,41 @@ import numpy as np
 import pandas as pd
 import torch
 from torch.utils.data import Dataset
-# from ingest.load_satellite_data import load_lst_tensor_from_bbox, load_sentinel_tensor_from_bbox
-from ingest.get_median import load_sentinel_tensor_from_bbox_median
+from ingest.get_median import load_sentinel_tensor_from_bbox_median, load_lst_tensor_from_bbox_median
 from scipy.ndimage import zoom
-# from geopy.distance import geodesic
 
 class CityDataSet(Dataset):
-    def __init__(self, bounds, averaging_window, selected_bands, resolution_m, include_lst=True, uhi_csv=None, bbox_csv=None, weather_csv=None):
-        # Parameters
+    """
+    PyTorch Dataset for UHI modeling. For testing this dataloader, use dataloader_test.py
+    Returns (satellite_tensor, weather_tensor, meta_tensor) for each UHI observation.
+    """
+
+    def __init__(self, bounds, averaging_window, selected_bands, resolution_m,
+                 include_lst=True, uhi_csv=None, bbox_csv=None, weather_csv=None):
+        # Set basic parameters
         self.bounds = bounds
-        self.averaging_window = averaging_window # Number of days before UHI Observation Day
+        self.averaging_window = averaging_window
         self.selected_bands = selected_bands
         self.include_lst = include_lst
         self.resolution_m = resolution_m
         self.bbox_csv = bbox_csv
 
-        # UHI (extract timestamps)
+        # Load UHI CSV and parse timestamp
         self.uhi_data = pd.read_csv(uhi_csv)
         self.latitudes = self.uhi_data['latitudes']
         self.longitudes = self.uhi_data['longitudes']
         self.timestamps = pd.to_datetime(self.uhi_data['timestamp'])
         self.load_uhi_data()
 
-        # Weather data
+        # Load weather CSV (daily max/min temp + precipitation)
         self.weather_df = pd.read_csv(weather_csv)
         self.weather_df['date'] = pd.to_datetime(self.weather_df['date'])
 
-        # Satellite Data
+        # Preload satellite (and optional LST) tensors
         self.satellite_tensors = self.load_satellite_tensor()
 
     def load_uhi_data(self):
+        # Compute grid index and time features from lat/lon and timestamp
         bbox_data = pd.read_csv(self.bbox_csv)
         topleft_lat = bbox_data['latitudes'].iloc[0]
         topleft_lon = bbox_data['longitudes'].iloc[0]
@@ -44,10 +49,12 @@ class CityDataSet(Dataset):
         self.uhi_data['min_since_midnight'] = self.timestamps.dt.hour * 60 + self.timestamps.dt.minute
         self.uhi_data['month'] = self.timestamps.dt.month
 
-        self.uhi_data = self.uhi_data[['latitudes', 'longitudes', 'timestamp', 'x_grid', 'y_grid', 'min_since_midnight', 'month', 'UHI']]
-        # self.uhi_data = self.uhi_data.to_numpy()
+        # Keep only necessary columns (including lat/lon/timestamp for weather matching)
+        self.uhi_data = self.uhi_data[['latitudes', 'longitudes', 'timestamp',
+                                       'x_grid', 'y_grid', 'min_since_midnight', 'month', 'UHI']]
 
     def load_satellite_tensor(self):
+        # Load median composite Sentinel-2 (and optional LST) tensor for each timestamp
         all_tensors = []
         for timestamp in self.timestamps:
             start_date = (timestamp - pd.Timedelta(days=self.averaging_window)).strftime("%Y-%m-%d")
@@ -55,23 +62,44 @@ class CityDataSet(Dataset):
             time_window = f"{start_date}/{end_date}"
 
             try:
-                median_tensor = load_sentinel_tensor_from_bbox_median(
+                sentinel_tensor = load_sentinel_tensor_from_bbox_median(
                     bounds=self.bounds,
                     time_window=time_window,
                     selected_bands=self.selected_bands,
                     resolution_m=self.resolution_m
                 )
-                all_tensors.append(median_tensor)
+
+                if self.include_lst:
+                    # Load and resize LST to match Sentinel tensor shape
+                    lst_tensor = load_lst_tensor_from_bbox_median(
+                        bounds=self.bounds,
+                        time_window=time_window,
+                        resolution_m=30
+                    )
+                    zoom_factors = (
+                        1,
+                        sentinel_tensor.shape[1] / lst_tensor.shape[1],
+                        sentinel_tensor.shape[2] / lst_tensor.shape[2]
+                    )
+                    lst_resized = zoom(lst_tensor, zoom=zoom_factors, order=1)
+                    combined = np.concatenate([sentinel_tensor, lst_resized], axis=0)
+                else:
+                    combined = sentinel_tensor
+
+                all_tensors.append(combined)
+
             except Exception as e:
-                print(f"Warning: Failed to load for {time_window} → {e}")
-                dummy = np.zeros((len(self.selected_bands), 1, 1), dtype=np.float32)
+                # On failure, append dummy tensor
+                print(f"⚠️ Warning: Failed to load for {time_window} → {e}")
+                dummy = np.zeros((len(self.selected_bands) + (1 if self.include_lst else 0), 1, 1), dtype=np.float32)
                 all_tensors.append(dummy)
 
         return all_tensors
 
     def get_weather_for(self, lat, lon, timestamp):
+        # Retrieve weather info (max/min temp, precip) for the nearest grid point and date
         date = pd.to_datetime(timestamp).normalize()
-        tolerance = 0.005  # 緯度経度のズレを許容（約500m）
+        tolerance = 0.005  # ~500m tolerance for lat/lon (adjustable)
 
         match = self.weather_df[
             (np.abs(self.weather_df['lat'] - lat) <= tolerance) &
@@ -86,9 +114,11 @@ class CityDataSet(Dataset):
         return match[['temp_max', 'temp_min', 'precip']].iloc[0].values.astype(np.float32)
 
     def __len__(self):
+        # Number of UHI samples
         return len(self.satellite_tensors)
-    
+
     def __getitem__(self, idx):
+        # Return (satellite tensor, weather info, meta features) for sample at index
         satellite = self.satellite_tensors[idx]
         uhi_row = self.uhi_data.iloc[idx]
 
