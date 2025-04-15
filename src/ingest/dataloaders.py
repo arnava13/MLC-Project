@@ -8,7 +8,7 @@ from scipy.ndimage import zoom
 # from geopy.distance import geodesic
 
 class CityDataSet(Dataset):
-    def __init__(self, bounds, averaging_window, selected_bands, resolution_m, include_lst=True, uhi_csv=None, bbox_csv=None):
+    def __init__(self, bounds, averaging_window, selected_bands, resolution_m, include_lst=True, uhi_csv=None, bbox_csv=None, weather_csv=None):
         # Parameters
         self.bounds = bounds
         self.averaging_window = averaging_window # Number of days before UHI Observation Day
@@ -24,8 +24,12 @@ class CityDataSet(Dataset):
         self.timestamps = pd.to_datetime(self.uhi_data['timestamp'])
         self.load_uhi_data()
 
-        self.satellite_tensors = self.load_satellite_tensor()
+        # Weather data
+        self.weather_df = pd.read_csv(weather_csv)
+        self.weather_df['date'] = pd.to_datetime(self.weather_df['date'])
 
+        # Satellite Data
+        self.satellite_tensors = self.load_satellite_tensor()
 
     def load_uhi_data(self):
         bbox_data = pd.read_csv(self.bbox_csv)
@@ -40,8 +44,8 @@ class CityDataSet(Dataset):
         self.uhi_data['min_since_midnight'] = self.timestamps.dt.hour * 60 + self.timestamps.dt.minute
         self.uhi_data['month'] = self.timestamps.dt.month
 
-        self.uhi_data = self.uhi_data[['x_grid', 'y_grid', 'min_since_midnight', 'month', 'UHI']]
-        self.uhi_data = self.uhi_data.to_numpy()
+        self.uhi_data = self.uhi_data[['latitudes', 'longitudes', 'timestamp', 'x_grid', 'y_grid', 'min_since_midnight', 'month', 'UHI']]
+        # self.uhi_data = self.uhi_data.to_numpy()
 
     def load_satellite_tensor(self):
         all_tensors = []
@@ -65,8 +69,33 @@ class CityDataSet(Dataset):
 
         return all_tensors
 
+    def get_weather_for(self, lat, lon, timestamp):
+        date = pd.to_datetime(timestamp).normalize()
+        tolerance = 0.005  # 緯度経度のズレを許容（約500m）
+
+        match = self.weather_df[
+            (np.abs(self.weather_df['lat'] - lat) <= tolerance) &
+            (np.abs(self.weather_df['lon'] - lon) <= tolerance) &
+            (self.weather_df['date'] == date)
+        ]
+
+        if len(match) == 0:
+            print(f"⚠️ No match for lat={lat}, lon={lon}, date={date.date()}")
+            return np.array([np.nan, np.nan, np.nan], dtype=np.float32)
+
+        return match[['temp_max', 'temp_min', 'precip']].iloc[0].values.astype(np.float32)
+
     def __len__(self):
         return len(self.satellite_tensors)
     
     def __getitem__(self, idx):
-        return self.satellite_tensors[idx], self.uhi_data[idx]
+        satellite = self.satellite_tensors[idx]
+        uhi_row = self.uhi_data.iloc[idx]
+
+        lat = uhi_row['latitudes']
+        lon = uhi_row['longitudes']
+        timestamp = pd.to_datetime(uhi_row['timestamp'])
+
+        weather = self.get_weather_for(lat, lon, timestamp)
+        meta = uhi_row[['x_grid', 'y_grid', 'min_since_midnight', 'month', 'UHI']].to_numpy(dtype=np.float32)
+        return satellite, weather, meta

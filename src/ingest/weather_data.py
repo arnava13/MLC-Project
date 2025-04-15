@@ -1,6 +1,7 @@
 import numpy as np
 import requests
 import pandas as pd
+import os
 
 # create a grid of latitude and longitude points
 # from the Sentinel file to get the range of latitudes and longitudes
@@ -45,4 +46,6 @@ for lat, lon in grid_points:
 
 # save the weather data to a CSV file
 df = pd.DataFrame(weather_records)
-df.to_csv("nyc_weather_grid.csv", index=False)
+current_dir = os.path.dirname(os.path.abspath(__file__))
+save_path = os.path.join(current_dir, "sample_data", "nyc_weather_grid.csv")
+df.to_csv(save_path, index=False)
