@@ -1,0 +1,17 @@
+pandas
+numpy
+torch
+scipy
+json
+xarray
+netcdf4
+rasterio
+pystac_client
+planetary_computer
+odc-stac
+tqdm
+matplotlib
+# Add S3 access library
+s3fs
+# Add MARSTFN from GitHub
+git+https://github.com/yourorg/MARSTFN.git@main 
