@@ -67,8 +67,27 @@ class CityDataSet(Dataset):
         self.weather_df = pd.read_csv(weather_csv)
         self.weather_df['date'] = pd.to_datetime(self.weather_df['date'])
         
+        # Pre-compute weather grid metadata
+        self.weather_lat_vals = np.sort(self.weather_df['lat'].unique())
+        self.weather_lon_vals = np.sort(self.weather_df['lon'].unique())
+        if len(self.weather_lat_vals) < 2 or len(self.weather_lon_vals) < 2:
+            raise ValueError("Weather CSV must contain at least a 2x2 grid of lat/lon points.")
+
+        # Assume uniform spacing
+        self.weather_lat_step = np.abs(np.diff(self.weather_lat_vals)).mean()
+        self.weather_lon_step = np.abs(np.diff(self.weather_lon_vals)).mean()
+        self.weather_H = len(self.weather_lat_vals)
+        self.weather_W = len(self.weather_lon_vals)
+        
         # Preload satellite (and optional LST) tensors
         self.satellite_tensors = self.load_satellite_tensor_from_files()
+
+        # Store satellite grid size from first tensor
+        if len(self.satellite_tensors) > 0:
+            _, self.sat_H, self.sat_W = self.satellite_tensors[0].shape
+        else:
+            self.sat_H = self.weather_H
+            self.sat_W = self.weather_W
 
     def load_uhi_data(self):
         """Load UHI data and compute grid coordinates."""
@@ -152,23 +171,37 @@ class CityDataSet(Dataset):
             
         return all_tensors
 
-    def get_weather_for(self, lat, lon, timestamp):
-        """Retrieve weather info for the nearest grid point and date."""
-        # Retrieve weather info (max/min temp, precip) for the nearest grid point and date
-        date = pd.to_datetime(timestamp).normalize()
-        tolerance = 0.01  # ~500m tolerance for lat/lon (adjustable)
+    # ---------------- Weather helpers -----------------
+    def _build_weather_grid(self, date: pd.Timestamp) -> np.ndarray:
+        """Return weather grid (C_w=3, H, W) for given date."""
+        # Filter rows for the date
+        rows = self.weather_df[self.weather_df['date'] == date]
 
-        match = self.weather_df[
-            (np.abs(self.weather_df['lat'] - lat) <= tolerance) &
-            (np.abs(self.weather_df['lon'] - lon) <= tolerance) &
-            (self.weather_df['date'] == date)
-        ]
+        # Initialize grid with NaNs
+        grid = np.full((3, self.weather_H, self.weather_W), np.nan, dtype=np.float32)
 
-        if len(match) == 0:
-            logging.warning(f"No weather match for lat={lat}, lon={lon}, date={date.date()}")
-            return np.array([np.nan, np.nan, np.nan], dtype=np.float32)
+        # Map each row to indices and fill grid
+        for _, row in rows.iterrows():
+            lat_idx = int(round((row['lat'] - self.weather_lat_vals[0]) / self.weather_lat_step))
+            lon_idx = int(round((row['lon'] - self.weather_lon_vals[0]) / self.weather_lon_step))
+            if 0 <= lat_idx < self.weather_H and 0 <= lon_idx < self.weather_W:
+                grid[0, lat_idx, lon_idx] = row['temp_max']
+                grid[1, lat_idx, lon_idx] = row['temp_min']
+                grid[2, lat_idx, lon_idx] = row['precip']
 
-        return match[['temp_max', 'temp_min', 'precip']].iloc[0].values.astype(np.float32)
+        # Replace NaN with zeros
+        grid = np.nan_to_num(grid)
+
+        # Resize to match satellite grid if needed
+        if (self.weather_H, self.weather_W) != (self.sat_H, self.sat_W):
+            zoom_factors = (
+                1,
+                self.sat_H / self.weather_H,
+                self.sat_W / self.weather_W,
+            )
+            grid = zoom(grid, zoom=zoom_factors, order=1)
+
+        return grid
 
     def __len__(self):
         """Number of UHI samples."""
@@ -179,13 +212,15 @@ class CityDataSet(Dataset):
         satellite = self.satellite_tensors[idx]
         uhi_row = self.uhi_data.iloc[idx]
 
-        lat = uhi_row['latitudes']
-        lon = uhi_row['longitudes']
         timestamp = pd.to_datetime(uhi_row['timestamp'])
 
-        weather = self.get_weather_for(lat, lon, timestamp)
+        # Weather grid sequence (T=1)
+        weather_grid = self._build_weather_grid(timestamp.normalize())  # (3,H,W)
+        weather_seq = weather_grid[np.newaxis, ...]  # (1,3,H,W)
+
         meta = uhi_row[['x_grid', 'y_grid', 'min_since_midnight', 'month', 'UHI']].to_numpy(dtype=np.float32)
-        return satellite, weather, meta 
+
+        return satellite, weather_seq, meta 
 
 
 

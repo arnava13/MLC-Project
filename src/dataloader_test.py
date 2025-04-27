@@ -1,6 +1,6 @@
 import torch
 from torch.utils.data import DataLoader
-from ingest.dataloader_old import CityDataSet  
+from ingest.dataloader import CityDataSet  
 
 # Instantiate the dataset
 dataset = CityDataSet(

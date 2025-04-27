@@ -13,10 +13,6 @@ import torch.nn.functional as F
 
 class ClayFeatureExtractor(nn.Module):
     """Wrap the Clay foundation model and return a *spatial* feature map (B,C,H',W').
-
-    If Clay is not available locally the wrapper falls back to a timm ViT‑MAE with
-    matching patch‑size so that the rest of the pipeline still runs.  In either
-    case we re‑shape the patch tokens back to 2‑D and *drop* the CLS token.
     """
 
     def __init__(self, in_chans: int, ckpt: Optional[str] = None):
@@ -62,209 +58,75 @@ class SpatialProjector(nn.Module):
     
 
 # -----------------------------------------------------------------------------
-# 2. TEMPORAL CONVOLUTIONAL NETWORK (TCN) BUILDING BLOCKS ----------------------
+# 2. PARAMETER-EFFICIENT RECURRENT CNN FOR SMALL DATA -------------------------
 # -----------------------------------------------------------------------------
 
-class TemporalBlock(nn.Module):
-    """A single TCN layer with dilated causal conv, followed by ReLU + Dropout."""
+class ConvGRUCell(nn.Module):
+    """Single-layer ConvGRU with 3×3 kernels."""
 
-    def __init__(
-        self,
-        in_channels: int,
-        out_channels: int,
-        kernel_size: int,
-        stride: int,
-        dilation: int,
-        padding: int,
-        dropout: float,
-    ):
+    def __init__(self, in_ch: int, hid_ch: int, kernel_size: int = 3):
         super().__init__()
-        self.conv1 = nn.utils.weight_norm(
-            nn.Conv1d(in_channels, out_channels, kernel_size, stride=stride, padding=padding, dilation=dilation)
-        )
-        self.chomp1 = Chomp1d(padding)
-        self.relu1 = nn.ReLU()
-        self.dropout1 = nn.Dropout(dropout)
+        padding = kernel_size // 2
+        self.conv_zr = nn.Conv2d(in_ch + hid_ch, 2 * hid_ch, kernel_size, padding=padding)
+        self.conv_h = nn.Conv2d(in_ch + hid_ch, hid_ch, kernel_size, padding=padding)
 
-        self.conv2 = nn.utils.weight_norm(
-            nn.Conv1d(out_channels, out_channels, kernel_size, stride=stride, padding=padding, dilation=dilation)
-        )
-        self.chomp2 = Chomp1d(padding)
-        self.relu2 = nn.ReLU()
-        self.dropout2 = nn.Dropout(dropout)
-
-        # ensure residual connection has matching channels
-        self.downsample = (
-            nn.Conv1d(in_channels, out_channels, 1) if in_channels != out_channels else nn.Identity()
-        )
-        self.relu = nn.ReLU()
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        out = self.conv1(x)
-        out = self.chomp1(out)
-        out = self.relu1(out)
-        out = self.dropout1(out)
-
-        out = self.conv2(out)
-        out = self.chomp2(out)
-        out = self.relu2(out)
-        out = self.dropout2(out)
-
-        res = self.downsample(x)
-        return self.relu(out + res)
+    def forward(self, x: torch.Tensor, h: torch.Tensor) -> torch.Tensor:
+        # x, h: (B, C, H, W)
+        combined = torch.cat([x, h], dim=1)
+        z, r = torch.chunk(torch.sigmoid(self.conv_zr(combined)), 2, dim=1)
+        combined_r = torch.cat([x, r * h], dim=1)
+        h_tilde = torch.tanh(self.conv_h(combined_r))
+        h_next = (1 - z) * h + z * h_tilde
+        return h_next
 
 
-class TemporalConvNet(nn.Module):
-    """Stack of TemporalBlocks with exponentially increasing dilation."""
+class UHINetConvGRU(nn.Module):
+    """Spatio-temporal model leveraging Clay features and spatial weather grids.
 
-    def __init__(
-        self,
-        num_inputs: int,
-        num_channels: List[int],
-        kernel_size: int = 3,
-        dropout: float = 0.2,
-    ):
-        super().__init__()
-        layers = []
-        num_levels = len(num_channels)
-        for i in range(num_levels):
-            in_ch = num_inputs if i == 0 else num_channels[i - 1]
-            out_ch = num_channels[i]
-            dilation_size = 2 ** i
-            padding = (kernel_size - 1) * dilation_size
-            layers.append(
-                TemporalBlock(
-                    in_ch,
-                    out_ch,
-                    kernel_size,
-                    stride=1,
-                    dilation=dilation_size,
-                    padding=padding,
-                    dropout=dropout,
-                )
-            )
-        self.network = nn.Sequential(*layers)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.network(x)
-
-
-# -----------------------------------------------------------------------------
-# 3. UHI REGRESSOR WITH SPATIAL PROJECTOR + TCN -------------------------------
-# -----------------------------------------------------------------------------
-
-class SimpleTemporalBlock(nn.Module):
-    """A lightweight causal block without padding chomp – suitable for small data."""
-
-    def __init__(
-        self,
-        in_channels: int,
-        out_channels: int,
-        kernel_size: int,
-        dilation: int = 1,
-        dropout: float = 0.1,
-    ):
-        super().__init__()
-        pad = (kernel_size - 1) * dilation // 2
-        self.conv1 = nn.Conv1d(in_channels, out_channels, kernel_size, padding=pad, dilation=dilation)
-        self.relu1 = nn.ReLU()
-        self.dropout1 = nn.Dropout(dropout)
-
-        self.conv2 = nn.Conv1d(out_channels, out_channels, kernel_size, padding=pad, dilation=dilation)
-        self.relu2 = nn.ReLU()
-        self.dropout2 = nn.Dropout(dropout)
-
-        self.downsample = nn.Conv1d(in_channels, out_channels, 1) if in_channels != out_channels else nn.Identity()
-        self.relu = nn.ReLU()
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        out = self.dropout1(self.relu1(self.conv1(x)))
-        out = self.dropout2(self.relu2(self.conv2(out)))
-        return self.relu(out + self.downsample(x))
-
-
-class SimpleTCN(nn.Module):
-    def __init__(self, num_inputs: int, num_channels: List[int], kernel_size: int = 3, dropout: float = 0.1):
-        super().__init__()
-        layers = []
-        for i, out_ch in enumerate(num_channels):
-            in_ch = num_inputs if i == 0 else num_channels[i - 1]
-            dilation = 2 ** i  # still use expanding receptive field
-            layers.append(SimpleTemporalBlock(in_ch, out_ch, kernel_size, dilation, dropout))
-        self.network = nn.Sequential(*layers)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.network(x)
-
-
-class UHINet(nn.Module):
-    """Spatio-temporal network for UHI regression using Clay/ViT features.
-
-    Pipeline:
-        1. Clay (or ViT) encoder → spatial feature map (low-res)
-        2. SpatialProjector (conv) → project to desired channel dim
-        3. Upsample to original input grid size
-        4. Flatten spatial grid → SimpleTCN operates on each grid-cell sequence
-        5. Linear regression head → predict UHI per grid cell
+    Args:
+        sat_channels:   # spectral bands in satellite mosaic
+        weather_channels: # channels in weather grid (e.g., 3: max/min/precip)
+        proj_ch:        # channels for projected Clay features
+        hid_ch:         # hidden channels in ConvGRU
     """
 
     def __init__(
         self,
-        in_chans: int,
-        proj_channels: int = 32,  # Reduced channels for smaller dataset
-        tcn_channels: Optional[List[int]] = None,
-        kernel_size: int = 3,
-        dropout: float = 0.1,  # Reduced dropout for smaller dataset
+        sat_channels: int,
+        weather_channels: int = 3,
+        proj_ch: int = 32,
+        hid_ch: int = 32,
     ):
         super().__init__()
-        if tcn_channels is None:
-            tcn_channels = [64, 32]
+        # Clay encoder
+        self.encoder = ClayFeatureExtractor(sat_channels)
+        for p in self.encoder.parameters():
+            p.requires_grad_(False)
 
-        # 1. Spatial encoder (Clay or ViT)
-        self.encoder = ClayFeatureExtractor(in_chans)
-        # Clay/ViT outputs 768 channels
-        encoder_output_dim = 768
+        self.proj = nn.Conv2d(768, proj_ch, kernel_size=1)
 
-        # 2. Spatial projector to reduce channel dimension
-        self.spatial_proj = SpatialProjector(num_inputs=encoder_output_dim, num_channels=proj_channels, kernel_size=1, p=dropout) # Use 1x1 conv for projection
+        # ConvGRU: input weather grid channels -> hidden
+        self.gru = ConvGRUCell(weather_channels, hid_ch)
 
-        # 4. Temporal ConvNet to model per-pixel time series
-        self.tcn = SimpleTCN(num_inputs=proj_channels, num_channels=tcn_channels, kernel_size=kernel_size, dropout=dropout)
+        self.regressor = nn.Conv2d(hid_ch, 1, kernel_size=1)
 
-        # 5. Regress final hidden features to scalar UHI value
-        self.regressor = nn.Linear(tcn_channels[-1], 1)
+        self.init_map = (
+            nn.Conv2d(proj_ch, hid_ch, kernel_size=1) if proj_ch != hid_ch else nn.Identity()
+        )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """x: (B, T, C, H, W) → preds: (B, H, W)"""
-        B, T, C, H, W = x.shape
+    def forward(self, sat_img: torch.Tensor, weather_seq: torch.Tensor) -> torch.Tensor:
+        """sat_img: (B,C,H,W), weather_seq: (B,T,C_w,H,W)"""
+        B, C, H, W = sat_img.shape
 
-        # 1. Spatial encoding for each timestamp
-        x = x.view(B * T, C, H, W)  # (B*T, C, H, W)
-        feat_enc = self.encoder(x)  # (B*T, 768, h_enc, w_enc)
-        _, _, h_enc, w_enc = feat_enc.shape
+        # Initial spatial hidden state
+        feat = self.encoder(sat_img)
+        feat = F.interpolate(self.proj(feat), size=(H, W), mode="bilinear", align_corners=False)
+        h = self.init_map(feat)
 
-        # 2. Project channels
-        feat_proj = self.spatial_proj(feat_enc) # (B*T, P, h_enc, w_enc)
-        P = feat_proj.size(1)
+        T = weather_seq.size(1)
+        for t in range(T):
+            x_t = weather_seq[:, t]  # (B,C_w,H,W)
+            h = self.gru(x_t, h)
 
-        # 3. Upsample to original grid size
-        if (h_enc, w_enc) != (H, W):
-             feat_upsampled = F.interpolate(feat_proj, size=(H, W), mode="bilinear", align_corners=False) # (B*T, P, H, W)
-        else:
-             feat_upsampled = feat_proj # (B*T, P, H, W)
-
-        # Reshape back to time dimension
-        feat = feat_upsampled.view(B, T, P, H, W)
-
-        # 4. Prepare for TCN: gather per-pixel sequences (B*H*W, P, T)
-        feat = feat.permute(0, 3, 4, 2, 1).contiguous()  # (B, H, W, P, T)
-        feat = feat.view(B * H * W, P, T)
-
-        # Temporal modelling
-        out = self.tcn(feat)  # (B*H*W, hidden, T)
-        out_last = out[:, :, -1]  # (B*H*W, hidden)
-
-        # 5. Regression
-        preds = self.regressor(out_last)  # (B*H*W, 1)
-        preds = preds.view(B, H, W)
-        return preds
+        pred = self.regressor(h)
+        return pred.squeeze(1)
