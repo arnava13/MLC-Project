@@ -12,3 +12,9 @@ odc-stac
 tqdm
 matplotlib
 s3fs
+python-box==3.4.5
+timm==0.9.1
+einops==0.6.1
+torchvision==0.18.1
+torchmetrics==1.11.0
+torchmetrics.functional.classification==1.11.0

@@ -4,6 +4,9 @@ from pathlib import Path
 import logging
 import rasterio.warp
 
+### This file is for converting UHI files found on the OSF foundation website from GeoTiff to CSV format, but not in initial model as they only have three timestamps,
+### AM, AF, PM.
+
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 def convert_directory_tifs_to_csv(input_dir: Path, output_dir: Path):
