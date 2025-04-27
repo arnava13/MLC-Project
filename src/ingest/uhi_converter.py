@@ -2,13 +2,15 @@ import rasterio
 import pandas as pd
 from pathlib import Path
 import logging
+import rasterio.warp
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 def convert_directory_tifs_to_csv(input_dir: Path, output_dir: Path):
     """
-    Processes UHI GeoTIFF files (*_t_f_ranger.tif) in a given directory,
-    extracts latitude, longitude, UHI value, and time period,
+    Processes UHI Heat Index GeoTIFF files (*_heat_index_f_ranger.tif) in a given directory,
+    extracts latitude (WGS84), longitude (WGS84), the UHI (Heat Index) value,
+    and time period ('am', 'pm', 'af' extracted from filename),
     and saves them to a single CSV file in the output directory.
 
     Args:
@@ -18,29 +20,27 @@ def convert_directory_tifs_to_csv(input_dir: Path, output_dir: Path):
     """
     input_dir = Path(input_dir)
     output_dir = Path(output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True) # Ensure output directory exists
+    output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Derive output filename from input directory name
     output_filename = f"{input_dir.name}_UHI_data.csv"
     output_file = output_dir / output_filename
 
-    # Identify relevant UHI temperature files
+    # Identify relevant UHI heat index files
     tif_files = [
-        f for f in input_dir.glob("*_t_f_ranger.tif")
+        f for f in input_dir.glob("*_heat_index_f_ranger.tif")
         if f.is_file() and f.name.startswith(('am_', 'pm_', 'af_'))
     ]
 
     if not tif_files:
-        logging.warning(f"No suitable *_t_f_ranger.tif files found in {input_dir}. Skipping.")
+        logging.warning(f"No suitable *_heat_index_f_ranger.tif files found in {input_dir}. Skipping.")
         return
 
     all_data = []
     logging.info(f"Processing directory: {input_dir}")
-    logging.info(f"Found {len(tif_files)} UHI TIF files to process.")
+    logging.info(f"Found {len(tif_files)} UHI Heat Index TIF files to process.")
 
     for tif_path in tif_files:
         try:
-            # Extract time period from filename (am, pm, af)
             time_period = tif_path.name.split('_')[0]
             logging.debug(f"Processing {tif_path.name} (Time period: {time_period})...")
 
@@ -48,6 +48,8 @@ def convert_directory_tifs_to_csv(input_dir: Path, output_dir: Path):
                 band = src.read(1)
                 transform = src.transform
                 nodata_val = src.nodata
+                src_crs = src.crs
+                dst_crs = 'EPSG:4326'
 
                 rows, cols = band.shape
                 count = 0
@@ -56,13 +58,14 @@ def convert_directory_tifs_to_csv(input_dir: Path, output_dir: Path):
                 for r in range(rows):
                     for c in range(cols):
                         uhi = band[r, c]
-                        # Skip nodata pixels
                         if nodata_val is not None and uhi == nodata_val:
                             skipped += 1
                             continue
 
-                        # Convert pixel coordinates to geographic coordinates
-                        lon, lat = rasterio.transform.xy(transform, r, c)
+                        x, y = rasterio.transform.xy(transform, r, c)
+                        lon, lat = rasterio.warp.transform(src_crs, dst_crs, [x], [y])
+                        lon = lon[0]
+                        lat = lat[0]
 
                         all_data.append([lat, lon, uhi, time_period])
                         count += 1
@@ -75,10 +78,7 @@ def convert_directory_tifs_to_csv(input_dir: Path, output_dir: Path):
     if not all_data:
         logging.warning(f"No data extracted from {input_dir}. CSV file not created.")
     else:
-        # Create DataFrame
         df = pd.DataFrame(all_data, columns=["lat", "long", "uhi", "time_period"])
-
-        # Save to CSV with semicolon delimiter
         logging.info(f"Writing data for {input_dir.name} to {output_file}...")
         try:
             df.to_csv(output_file, sep=';', index=False, float_format='%.6f')

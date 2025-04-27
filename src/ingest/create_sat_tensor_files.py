@@ -209,91 +209,6 @@ def download_lst_data(city_name, bounds, time_windows, output_dir, resolution_m=
             logging.error(f"Error processing LST data for {city_name}: {time_window}")
             logging.error(str(e))
 
-def download_goes_hourly_data(city_name, hourly_timestamps, output_dir, goes_product="ABI-L2-LSTF"):
-    """
-    Downloads hourly GOES LST NetCDF files for given timestamps.
-
-    Args:
-        city_name (str): Name of the city (used for subdirectories).
-        hourly_timestamps (list): List of pandas Timestamps for the required hours.
-        output_dir (str or Path): Base directory to save the files.
-        goes_product (str): GOES ABI L2+ product string (e.g., 'ABI-L2-LSTF').
-    """
-    try:
-        s3 = s3fs.S3FileSystem(anon=True)
-        goes_satellite = "noaa-goes16" # Or goes17/18 depending on location/time
-        s3_base = f"{goes_satellite}/{goes_product}"
-        logging.info(f"Attempting to download GOES data from S3 bucket: {s3_base}")
-    except NoCredentialsError:
-        logging.error("AWS credentials not found, but required by s3fs?")
-        logging.error("Attempting anonymous access failed unexpectedly.")
-        return
-    except Exception as e:
-        logging.error(f"Failed to initialize S3 filesystem: {e}")
-        return
-
-    # Create local output directory structure
-    goes_output_dir = Path(output_dir) / city_name / "goes_files"
-    goes_output_dir.mkdir(parents=True, exist_ok=True)
-    logging.info(f"GOES data will be saved to: {goes_output_dir}")
-
-    processed_hours = set()
-    missing_files = 0
-    downloaded_files = 0
-
-    # Get unique timestamps to avoid redundant checks
-    unique_timestamps = sorted(list(set(t.floor('h') for t in hourly_timestamps)))
-
-    for ts in tqdm(unique_timestamps, desc=f"Downloading GOES {goes_product} for {city_name}"):
-        year = ts.strftime('%Y')
-        day_of_year = ts.strftime('%j')
-        hour = ts.strftime('%H')
-
-        local_filename = f"goes_{ts.strftime('%Y%m%d%H')}.nc"
-        local_path = goes_output_dir / local_filename
-
-        # Skip if already downloaded
-        if local_path.exists():
-            logging.debug(f"GOES file already exists: {local_path}. Skipping.")
-            continue
-
-        s3_hour_path = f"{s3_base}/{year}/{day_of_year}/{hour}/"
-
-        try:
-            # List files for that hour to find the exact filename
-            # GOES filenames usually look like: OR_ABI-L2-LSTF-M6_G16_sYYYYJJJHHMMSSs_..._cYYYYJJJHHMMSSs.nc
-            logging.debug(f"Checking S3 path: {s3_hour_path}")
-            files_in_hour = s3.ls(s3_hour_path)
-
-            # Find the file corresponding to the start of the hour (best guess)
-            # Example pattern: look for _sYYYYJJJHH00
-            hour_start_pattern = f"_s{year}{day_of_year}{hour}00"
-            target_s3_file = None
-            for f in files_in_hour:
-                if hour_start_pattern in f:
-                     # More specific check if needed (e.g., ensure M6 mode)
-                     if f"_{goes_product}-M6_" in f and f.endswith(".nc"):
-                         target_s3_file = f
-                         break # Found likely file
-
-            if target_s3_file:
-                logging.info(f"Found target S3 file: {target_s3_file}")
-                logging.info(f"Downloading to: {local_path}")
-                s3.get(target_s3_file, str(local_path))
-                downloaded_files += 1
-            else:
-                logging.warning(f"No suitable GOES file found in {s3_hour_path} for pattern {hour_start_pattern}")
-                missing_files += 1
-
-        except FileNotFoundError:
-            logging.warning(f"S3 path not found or no files listed for: {s3_hour_path}")
-            missing_files += 1
-        except Exception as e:
-            logging.error(f"Error downloading GOES for {ts.strftime('%Y-%m-%d %H')}: {e}")
-            missing_files += 1
-
-    logging.info(f"GOES download complete for {city_name}. Downloaded: {downloaded_files}, Missing/Errors: {missing_files}")
-
 def download_satellite_data_for_city(city_name, bounds, timestamps,
                                      averaging_window, output_dir,
                                      selected_bands=["B02", "B03", "B04", "B08"],
@@ -337,17 +252,6 @@ def download_satellite_data_for_city(city_name, bounds, timestamps,
             output_dir=output_dir,
             resolution_m=30  # LST typically at 30m resolution
         )
-
-    # --- Download GOES data if requested ---
-    if include_goes:
-         # Use the same base output_dir, function will create city/goes_files subdir
-         goes_output_dir = output_dir
-         download_goes_hourly_data(
-             city_name=city_name,
-             hourly_timestamps=hourly_timestamps,
-             output_dir=goes_output_dir
-         )
-    # --- End GOES download ---
 
     # Create lookup table for time windows to filenames
     lookup_table = {}
