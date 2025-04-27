@@ -11,9 +11,6 @@ from pathlib import Path
 import logging
 import json
 from datetime import datetime
-import s3fs
-from botocore.exceptions import NoCredentialsError
-import re # For potential filename parsing
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
@@ -270,7 +267,7 @@ def download_satellite_data_for_city(city_name, bounds, timestamps,
 
     return lookup_table
 
-def download_data_from_uhi_csv(city_name, uhi_csv, bbox_csv,
+def download_data_from_uhi_csv(city_name, uhi_csv, lower_left, upper_right,
                                averaging_window, output_dir,
                                selected_bands=["B02", "B03", "B04", "B08"],
                                resolution_m=10, include_lst=True,
@@ -286,12 +283,7 @@ def download_data_from_uhi_csv(city_name, uhi_csv, bbox_csv,
     timestamps = pd.to_datetime(uhi_data['timestamp'])
 
     # Read bounding box
-    bbox_data = pd.read_csv(bbox_csv)
-    min_lon = bbox_data['longitudes'].min()
-    min_lat = bbox_data['latitudes'].min()
-    max_lon = bbox_data['longitudes'].max()
-    max_lat = bbox_data['latitudes'].max()
-    bounds = [min_lon, min_lat, max_lon, max_lat]
+    bounds = [lower_left, upper_right]
 
     # Download the data
     return download_satellite_data_for_city(
