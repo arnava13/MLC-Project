@@ -175,3 +175,19 @@ Goal for Tuesday the 15th:
   - Concatenates LST as an additional band → Final shape: `(5, H, W)`  
 - If False:
   - Sentinel tensor shape remains `(4, H, W)`
+
+
+## April 26 2025:
+
+- Modfiied the dataloder to load files from disk, using new download_data.ipynb
+- Added a new function to load the UHI data from disk.
+- Added a new function to load the weather data from disk.
+- Created model.py to load the pretained clay model as the feature map extractor and added a
+  temporal conv net to extract features from the time series data.
+- Next steps:
+  - Verify data downloads and download satellite images for NYC successfully on GCP
+  runtime.
+  - Train the model:
+    - For the losses we want to mask away losses for missing values and for gridcells that were not
+      measured. This allows us to mantain a consistent output shape. (Needs modification to the model.)
+    - Try to use the model to predict the UHI data for NYC.
