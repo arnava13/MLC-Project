@@ -1,3 +1,5 @@
+import math
+from typing import List, Tuple
 import numpy as np
 import pandas as pd
 import torch
@@ -184,3 +186,30 @@ class CityDataSet(Dataset):
         weather = self.get_weather_for(lat, lon, timestamp)
         meta = uhi_row[['x_grid', 'y_grid', 'min_since_midnight', 'month', 'UHI']].to_numpy(dtype=np.float32)
         return satellite, weather, meta 
+    
+
+# -----------------------------------------------------------------------------
+# 4. COLLATE FUNCTION FOR THE EXISTING DATALOADER -----------------------------
+# -----------------------------------------------------------------------------
+
+def uhi_collate(batch: List[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]], T: int = 12):
+    """Turn the current Dataset output into batched tensors compatible with UHINet.
+
+    Each element of *batch* is (satellite, weather, meta) for *one* timestamp.
+    We first group by sample index // T, assuming the DataLoader is ordered by
+    timestamp per city/day.  For production you might build a proper Sequence
+    Dataset, but this keeps the user’s existing CSV‑driven Dataset unchanged.
+    """
+    satellites, weathers, metas = zip(*batch)  # tuples of length B*T
+    satellites = torch.stack([torch.from_numpy(s).float() for s in satellites])
+    C, H, W = satellites.shape[1:]
+    satellites = satellites.view(-1, T, C, H, W)  # (B, T, C, H, W)
+
+    weathers = torch.from_numpy(np.stack(weathers)).float().view(-1, T, 3)
+    metas = torch.from_numpy(np.stack(metas)).float().view(-1, T, metas[0].shape[-1])
+
+    # Extract sin‑cos hour from meta[:, :, 2]
+    minutes = metas[:, :, 2]
+    phase = minutes / 1440 * 2 * math.pi
+    time_feats = torch.stack([torch.sin(phase), torch.cos(phase)], dim=-1)  # (B,T,2)
+    return satellites, weathers, time_feats, metas[:, :, -1]  # last column is UHI target
