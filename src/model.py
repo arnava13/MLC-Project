@@ -11,8 +11,7 @@ from box import Box
 import numpy as np
 from torchvision.transforms import v2
 
-from src.models.Clay.src.model import ClayMAEModule
-
+from src.Clay.src.module import ClayMAEModule
 
 # -----------------------------------------------------------------------------
 # 1. CLAY FEATURE EXTRACTOR ----------------------------------------------------
