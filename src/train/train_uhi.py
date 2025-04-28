@@ -1,5 +1,6 @@
 import torch
 import torch.optim as optim
+import torch.nn.functional as F # Added for interpolation
 from torch.utils.data import DataLoader, random_split
 import logging
 import argparse
@@ -11,22 +12,24 @@ from tqdm import tqdm
 import json
 import os
 from datetime import datetime
+import shutil
 
 # Add project root to path
 project_root = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(project_root))
 
 from src.ingest.dataloader import CityDataSet
-from src.models.uhi_net import UHINetConvGRU
+from src.model import UHINet # Import the refactored model
 from src.train.loss import masked_mae_loss, masked_mse_loss
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # Function to save checkpoint
 def save_checkpoint(state, is_best, filename='checkpoint.pth.tar', best_filename='model_best.pth.tar'):
+    """Saves model checkpoint."""
+    Path(filename).parent.mkdir(parents=True, exist_ok=True)
     torch.save(state, filename)
     if is_best:
-        import shutil
         shutil.copyfile(filename, best_filename)
         logging.info(f"Saved new best model to {best_filename}")
 
@@ -36,27 +39,98 @@ def train_epoch(model, dataloader, optimizer, loss_fn, device):
     total_loss = 0.0
     num_batches = 0
     progress_bar = tqdm(dataloader, desc='Training', leave=False)
+
     for batch in progress_bar:
+        # Ensure all required keys are present
+        required_keys = ['sentinel_mosaic', 'weather_seq', 'time_emb_seq', 'target', 'mask']
+        if model.use_lst: # Check model's config
+            required_keys.append('lst_seq')
+        if not all(key in batch for key in required_keys):
+            missing = [key for key in required_keys if key not in batch]
+            logging.warning(f"Skipping batch due to missing keys: {missing}")
+            continue
+
         # Move batch to device
-        batch_device = {k: v.to(device) for k, v in batch.items()}
+        try:
+            sentinel_mosaic = batch["sentinel_mosaic"].to(device)
+            weather_seq = batch["weather_seq"].to(device)       # (B, T, C_weather, H, W)
+            lst_seq = batch["lst_seq"].to(device) if model.use_lst else None # (B, T, C_lst, H, W) - T=1
+            time_emb_seq = batch["time_emb_seq"].to(device)     # (B, T, C_time, H, W)
+            target = batch["target"].to(device)               # (B, H, W)
+            mask = batch["mask"].to(device)                   # (B, H, W)
+        except Exception as e:
+            logging.error(f"Error moving batch to device: {e}")
+            continue # Skip batch if moving fails
 
         optimizer.zero_grad()
-        predictions = model(batch_device)
-        loss = loss_fn(predictions, batch_device['target'], batch_device['mask'])
+        try:
+            # --- Refactored Training Logic --- 
+            B, T, C_weather, H_in, W_in = weather_seq.shape
+            _, _, C_time, _, _ = time_emb_seq.shape
 
-        # Check for NaN loss
-        if torch.isnan(loss):
-             logging.warning("NaN loss detected, skipping batch.")
-             continue
+            # 1. Encode and project static features ONCE
+            static_lst_map = lst_seq[:, 0, :, :, :] if model.use_lst and lst_seq is not None else None # Get T=0 slice
+            with torch.no_grad(): # Ensure Clay backbone remains frozen
+                 static_features = model.encode_and_project_static(sentinel_mosaic, static_lst_map)
+            _, C_static, H_feat, W_feat = static_features.shape
+            
+            # 2. Initialize hidden state
+            h = torch.zeros(B, model.gru_hidden_dim, H_feat, W_feat, device=device)
+            
+            # 3. Resize dynamic features if needed
+            if weather_seq.shape[3:] != (H_feat, W_feat):
+                weather_seq_resized = F.interpolate(weather_seq.view(B*T, C_weather, H_in, W_in), size=(H_feat, W_feat), mode='bilinear', align_corners=False).view(B, T, C_weather, H_feat, W_feat)
+            else:
+                weather_seq_resized = weather_seq
+            if time_emb_seq.shape[3:] != (H_feat, W_feat):
+                time_emb_seq_resized = F.interpolate(time_emb_seq.view(B*T, C_time, H_in, W_in), size=(H_feat, W_feat), mode='bilinear', align_corners=False).view(B, T, C_time, H_feat, W_feat)
+            else:
+                time_emb_seq_resized = time_emb_seq
+                
+            # 4. Loop through time steps
+            for t in range(T):
+                weather_t = weather_seq_resized[:, t, :, :, :]      # (B, C_weather, H', W')
+                time_emb_t = time_emb_seq_resized[:, t, :, :, :]    # (B, C_time, H', W')
+                # Concatenate static + dynamic features
+                x_t_combined = torch.cat([static_features, weather_t, time_emb_t], dim=1) 
+                # Update hidden state
+                h = model.step(x_t_combined, h)
+            
+            # 5. Predict from final hidden state
+            prediction = model.predict(h) # (B, 1, H', W')
+            # --------------------------
 
-        loss.backward()
-        # Optional: Gradient clipping
-        # torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        optimizer.step()
+            # Resize prediction to target size if needed
+            if prediction.shape[2:] != target.shape[1:]:
+                 prediction_resized = F.interpolate(prediction, size=target.shape[1:], mode='bilinear', align_corners=False)
+            else:
+                 prediction_resized = prediction
+                 
+            # Calculate loss
+            loss = loss_fn(prediction_resized.squeeze(1), target, mask)
 
-        total_loss += loss.item()
-        num_batches += 1
-        progress_bar.set_postfix(loss=loss.item())
+            # Check for NaN loss
+            if torch.isnan(loss):
+                 logging.warning("NaN loss detected, skipping backward pass.")
+                 continue
+
+            loss.backward()
+            # Optional: Gradient clipping
+            # torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+            
+            total_loss += loss.item()
+            num_batches += 1
+            progress_bar.set_postfix(loss=loss.item())
+            
+        except RuntimeError as e:
+             logging.error(f"Runtime error during training: {e}")
+             if "out of memory" in str(e):
+                 logging.error("CUDA out of memory. Try reducing batch size.")
+             continue # Skip this batch
+        except Exception as e:
+             logging.error(f"Unexpected error during training step: {e}", exc_info=True)
+             continue # Skip this batch
 
     return total_loss / num_batches if num_batches > 0 else 0.0
 
@@ -68,16 +142,77 @@ def validate_epoch(model, dataloader, loss_fn, device):
     progress_bar = tqdm(dataloader, desc='Validation', leave=False)
     with torch.no_grad():
         for batch in progress_bar:
-            batch_device = {k: v.to(device) for k, v in batch.items()}
-            predictions = model(batch_device)
-            loss = loss_fn(predictions, batch_device['target'], batch_device['mask'])
-            if torch.isnan(loss):
-                 logging.warning("NaN validation loss detected, skipping batch.")
-                 continue
+            # Ensure all required keys are present
+            required_keys = ['sentinel_mosaic', 'weather_seq', 'time_emb_seq', 'target', 'mask']
+            if model.use_lst: # Check model's config
+                required_keys.append('lst_seq')
+            if not all(key in batch for key in required_keys):
+                missing = [key for key in required_keys if key not in batch]
+                logging.warning(f"Skipping validation batch due to missing keys: {missing}")
+                continue
+            
+            try:
+                # Move batch to device
+                sentinel_mosaic = batch["sentinel_mosaic"].to(device)
+                weather_seq = batch["weather_seq"].to(device)       
+                lst_seq = batch["lst_seq"].to(device) if model.use_lst else None
+                time_emb_seq = batch["time_emb_seq"].to(device)     
+                target = batch["target"].to(device)               
+                mask = batch["mask"].to(device)   
+                
+                # --- Refactored Validation Logic --- 
+                B, T, C_weather, H_in, W_in = weather_seq.shape
+                _, _, C_time, _, _ = time_emb_seq.shape
+    
+                # 1. Encode static features ONCE
+                static_lst_map = lst_seq[:, 0, :, :, :] if model.use_lst and lst_seq is not None else None 
+                static_features = model.encode_and_project_static(sentinel_mosaic, static_lst_map)
+                _, C_static, H_feat, W_feat = static_features.shape
+                
+                # 2. Initialize hidden state
+                h = torch.zeros(B, model.gru_hidden_dim, H_feat, W_feat, device=device)
+                
+                # 3. Resize dynamic features if needed
+                if weather_seq.shape[3:] != (H_feat, W_feat):
+                    weather_seq_resized = F.interpolate(weather_seq.view(B*T, C_weather, H_in, W_in), size=(H_feat, W_feat), mode='bilinear', align_corners=False).view(B, T, C_weather, H_feat, W_feat)
+                else:
+                    weather_seq_resized = weather_seq
+                if time_emb_seq.shape[3:] != (H_feat, W_feat):
+                    time_emb_seq_resized = F.interpolate(time_emb_seq.view(B*T, C_time, H_in, W_in), size=(H_feat, W_feat), mode='bilinear', align_corners=False).view(B, T, C_time, H_feat, W_feat)
+                else:
+                    time_emb_seq_resized = time_emb_seq
+                    
+                # 4. Loop through time steps
+                for t in range(T):
+                    weather_t = weather_seq_resized[:, t, :, :, :]
+                    time_emb_t = time_emb_seq_resized[:, t, :, :, :]
+                    x_t_combined = torch.cat([static_features, weather_t, time_emb_t], dim=1)
+                    h = model.step(x_t_combined, h)
+                
+                # 5. Predict from final hidden state
+                prediction = model.predict(h)
+                # --------------------------
+                
+                # Resize prediction to target size if needed
+                if prediction.shape[2:] != target.shape[1:]:
+                    prediction_resized = F.interpolate(prediction, size=target.shape[1:], mode='bilinear', align_corners=False)
+                else:
+                    prediction_resized = prediction
 
-            total_loss += loss.item()
-            num_batches += 1
-            progress_bar.set_postfix(loss=loss.item())
+                # Calculate loss
+                loss = loss_fn(prediction_resized.squeeze(1), target, mask)
+                
+                if torch.isnan(loss):
+                    logging.warning("NaN validation loss detected, skipping batch.")
+                    continue
+
+                total_loss += loss.item()
+                num_batches += 1
+                progress_bar.set_postfix(loss=loss.item())
+                
+            except Exception as e:
+                 logging.error(f"Error during validation step: {e}", exc_info=True)
+                 continue # Skip batch on error
 
     return total_loss / num_batches if num_batches > 0 else 0.0
 
@@ -85,36 +220,36 @@ def main(args):
     device = torch.device("cuda" if torch.cuda.is_available() and not args.cpu else "cpu")
     logging.info(f"Using device: {device}")
 
-    # --- Data Loading Setup ---
+    # --- Path Setup & Checks ---
     data_dir_path = Path(args.data_dir)
     city_data_dir = data_dir_path / args.city_name
-    uhi_csv = city_data_dir / "uhi_data.csv"
+    uhi_csv = city_data_dir / "uhi.csv" # Standardized name
     bbox_csv = city_data_dir / "bbox.csv"
-    weather_csv = city_data_dir / "weather_grid.csv"
+    # Station weather files
+    bronx_weather_csv = city_data_dir / "bronx_weather.csv"
+    manhattan_weather_csv = city_data_dir / "mahattan_weather.csv"
     cloudless_mosaic_path = Path(args.cloudless_mosaic_path)
+    clay_checkpoint_path = Path(args.clay_checkpoint)
+    clay_metadata_path = Path(args.clay_metadata)
+    
+    # LST Path (optional)
+    single_lst_median_file = Path(args.single_lst_median_path) if args.include_lst and args.single_lst_median_path else None
 
-    # Determine path for single LST median file if needed
-    single_lst_median_file = None
+    # Check essential files/dirs
+    required_paths = {
+        "UHI CSV": uhi_csv, "BBox CSV": bbox_csv,
+        "Bronx Weather CSV": bronx_weather_csv, "Manhattan Weather CSV": manhattan_weather_csv,
+        "Cloudless Mosaic": cloudless_mosaic_path, 
+        "Clay Checkpoint": clay_checkpoint_path, "Clay Metadata": clay_metadata_path
+    }
     if args.include_lst:
-        # Construct the expected filename based on the convention in create_sat_tensor_files
-        # This requires knowing the date range used to generate it.
-        # For simplicity, let's require it as an argument for now.
-        if not args.single_lst_median_path:
-            logging.error("LST is included (--include_lst) but path to the single LST median file (--single_lst_median_path) was not provided.")
+        required_paths["LST Median File"] = single_lst_median_file
+        
+    for name, path in required_paths.items():
+        if path is None or not path.exists():
+            logging.error(f"Required file/path missing for {name}: {path}")
             return
-        single_lst_median_file = Path(args.single_lst_median_path)
-        if not single_lst_median_file.exists():
-             logging.error(f"Provided single LST median file not found: {single_lst_median_file}")
-             return
-
-    # Basic file checks
-    required_files = [uhi_csv, bbox_csv, weather_csv, cloudless_mosaic_path]
-    for f in required_files:
-        if not f.exists():
-            logging.error(f"Required file/directory not found: {f}")
-            return
-    # LST file existence checked above if include_lst is True
-
+            
     # Load bounds
     bounds = args.bounds
     if not bounds:
@@ -131,65 +266,68 @@ def main(args):
              return
 
     # --- Initialize Dataset ---
+    logging.info("Initializing dataset...")
     try:
         dataset = CityDataSet(
             bounds=bounds,
-            # averaging_window=args.averaging_window, # Not needed for single LST
+            averaging_window=30, # Placeholder, not used with single LST path
             resolution_m=args.resolution_m,
             uhi_csv=str(uhi_csv),
             bbox_csv=str(bbox_csv),
-            weather_csv=str(weather_csv),
+            bronx_weather_csv=str(bronx_weather_csv),
+            manhattan_weather_csv=str(manhattan_weather_csv),
             cloudless_mosaic_path=str(cloudless_mosaic_path),
             data_dir=str(data_dir_path),
             city_name=args.city_name,
             include_lst=args.include_lst,
             single_lst_median_path=str(single_lst_median_file) if single_lst_median_file else None
         )
-    except FileNotFoundError as e:
-        logging.error(f"Dataset initialization failed: {e}")
-        return
     except Exception as e:
-        logging.error(f"Unexpected error during dataset initialization: {e}", exc_info=True)
+        logging.error(f"Error initializing dataset: {e}", exc_info=True)
         return
 
     # --- Train/Val Split ---
     val_percent = 0.15
     n_samples = len(dataset)
-    if n_samples < 10: # Handle very small datasets
-        logging.warning(f"Dataset size ({n_samples}) is very small. Consider disabling validation split or using more data.")
+    if n_samples < 10:
+        logging.warning(f"Dataset size ({n_samples}) is very small. Validation split disabled.")
         n_val = 0
         n_train = n_samples
-        train_ds = dataset
-        val_ds = None # No validation set
+        train_ds, val_ds = dataset, None
     else:
         n_val = int(n_samples * val_percent)
         n_train = n_samples - n_val
         train_ds, val_ds = random_split(dataset, [n_train, n_val], generator=torch.Generator().manual_seed(42))
 
     logging.info(f"Dataset split: {n_train} training, {n_val or 0} validation samples.")
-
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers, pin_memory=True, drop_last=True)
     val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, pin_memory=True) if val_ds else None
 
-    # --- Model Definition ---
-    mosaic_channels = dataset.num_static_bands
-    lst_channels = 1 if args.include_lst else 0
-
+    # --- Initialize Model ---
+    logging.info("Initializing model...")
     try:
-        model = UHINetConvGRU(
-            mosaic_channels=mosaic_channels,
-            weather_channels=3,
-            time_emb_channels=4,
-            lst_channels=lst_channels,
+        model = UHINet(
+            # Clay args
+            clay_checkpoint_path=str(clay_checkpoint_path),
+            clay_metadata_path=str(clay_metadata_path),
+            clay_model_size=args.clay_model_size,
+            clay_bands=args.clay_bands,
+            clay_platform=args.clay_platform,
+            clay_gsd=args.clay_gsd,
+            # Weather args
+            weather_channels=5, # Hardcoded based on dataloader change
+            # LST args
+            lst_channels=1 if args.include_lst else 0,
+            use_lst=args.include_lst,
+            # Time embedding args
+            time_embed_dim=2, # Hardcoded based on dataloader change
+            # ConvGRU args
             proj_ch=args.proj_ch,
-            hid_ch=args.hid_ch,
-            freeze_clay=not args.unfreeze_clay
+            gru_hidden_dim=args.gru_hidden_dim,
+            gru_kernel_size=args.gru_kernel_size
         ).to(device)
-    except RuntimeError as e:
-         logging.error(f"Failed to initialize model: {e}", exc_info=True)
-         return
     except Exception as e:
-        logging.error(f"Unexpected error initializing model: {e}", exc_info=True)
+        logging.error(f"Error initializing model: {e}", exc_info=True)
         return
 
     logging.info(f"Model initialized: {model.__class__.__name__}")
@@ -212,27 +350,33 @@ def main(args):
     output_dir = Path(args.output_dir) / run_name
     output_dir.mkdir(parents=True, exist_ok=True)
     logging.info(f"Checkpoints and logs: {output_dir}")
+    # Save args
     with open(output_dir / "args.json", 'w') as f: json.dump(vars(args), f, indent=2)
 
     for epoch in range(args.epochs):
         logging.info(f"--- Epoch {epoch+1}/{args.epochs} ---")
         train_loss = train_epoch(model, train_loader, optimizer, loss_fn, device)
 
+        current_loss = train_loss # Default if no validation
         if val_loader:
             val_loss = validate_epoch(model, val_loader, loss_fn, device)
             logging.info(f"Epoch {epoch+1}: Train Loss={train_loss:.4f}, Val Loss={val_loss:.4f}")
             current_loss = val_loss
         else:
              logging.info(f"Epoch {epoch+1}: Train Loss={train_loss:.4f}")
-             current_loss = train_loss # Use train loss for checkpointing if no val set
+             
+        if np.isnan(current_loss):
+            logging.error("Loss is NaN. Stopping training.")
+            break
 
         is_best = current_loss < best_val_loss
         if is_best:
             best_val_loss = current_loss
             epochs_no_improve = 0
-            logging.info(f"New best loss: {best_val_loss:.4f}")
         else:
             epochs_no_improve += 1
+            if epoch > 0: # Don't log improvement message on first epoch
+                 logging.info(f"No improvement in validation loss for {epochs_no_improve} epochs.")
 
         save_checkpoint(
             {'epoch': epoch + 1, 'state_dict': model.state_dict(), 'best_val_loss': best_val_loss,
@@ -250,33 +394,39 @@ def main(args):
     logging.info(f"Best loss recorded: {best_val_loss:.4f}")
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Train UHI Prediction Model (Single Day UHI Version)")
+    parser = argparse.ArgumentParser(description="Train UHI Prediction Model")
 
     # Data Args
-    parser.add_argument('city_name', type=str, help='Name of the city')
-    parser.add_argument('--data_dir', type=str, default='data', help='Base data directory')
-    parser.add_argument('--cloudless_mosaic_path', type=str, required=True, help='Path to the .npy cloudless mosaic file')
-    parser.add_argument('--bounds', type=float, nargs=4, default=None, help='Optional: [min_lon, min_lat, max_lon, max_lat]. Tries bbox.csv if not given.')
-    parser.add_argument('--resolution_m', type=int, default=10, help='Target resolution for grids (UHI, Weather, LST)')
-    parser.add_argument('--include_lst', action='store_true', help='Include single LST median as input')
-    parser.add_argument('--single_lst_median_path', type=str, default=None, help='Path to the pre-generated single LST median .npy file (Required if --include_lst)')
-    # parser.add_argument('--averaging_window', type=int, default=30, help='Lookback window used to generate the single LST median (for info only)') # Removed, not used by dataloader
+    parser.add_argument("--data_dir", type=str, required=True, help="Base directory for city data")
+    parser.add_argument("--city_name", type=str, required=True, help="Name of the city to train on")
+    parser.add_argument("--cloudless_mosaic_path", type=str, required=True, help="Path to the pre-generated cloudless mosaic .npy file")
+    parser.add_argument("--include_lst", action='store_true', help="Include LST data")
+    parser.add_argument("--single_lst_median_path", type=str, help="Path to the single LST median .npy file (required if --include_lst)")
+    parser.add_argument("--bounds", type=float, nargs=4, help="Bounding box [min_lon, min_lat, max_lon, max_lat] (optional, loads from bbox.csv if not provided)")
+    parser.add_argument("--resolution_m", type=int, default=10, help="Target spatial resolution in meters")
 
     # Model Args
-    parser.add_argument('--proj_ch', type=int, default=64, help='Projection channels for Clay features')
-    parser.add_argument('--hid_ch', type=int, default=64, help='Hidden channels for ConvGRU')
-    parser.add_argument('--unfreeze_clay', action='store_true', help='Unfreeze Clay encoder weights for fine-tuning')
+    parser.add_argument("--clay_checkpoint", type=str, required=True, help="Path to Clay model checkpoint (.ckpt)")
+    parser.add_argument("--clay_metadata", type=str, required=True, help="Path to Clay metadata.yaml")
+    parser.add_argument("--clay_model_size", type=str, default="large", help="Size of Clay model used")
+    parser.add_argument("--clay_bands", nargs='+', default=["blue", "green", "red", "nir"], help="Band names for Clay input mosaic")
+    parser.add_argument("--clay_platform", type=str, default="sentinel-2-l2a", help="Clay platform string")
+    parser.add_argument("--clay_gsd", type=int, default=10, help="GSD of Clay input mosaic")
+    parser.add_argument("--proj_ch", type=int, default=32, help="Channels after projecting Clay features")
+    parser.add_argument("--gru_hidden_dim", type=int, default=64, help="Hidden dimension for ConvGRU cell")
+    parser.add_argument("--gru_kernel_size", type=int, default=3, help="Kernel size for ConvGRU convolutions")
+    # Removed --unfreeze_clay as model freezing is now hardcoded in UHINet
 
     # Training Args
-    parser.add_argument('--epochs', type=int, default=50, help='Number of training epochs')
-    parser.add_argument('--batch_size', type=int, default=16, help='Batch size')
-    parser.add_argument('--lr', type=float, default=1e-4, help='Learning rate')
-    parser.add_argument('--weight_decay', type=float, default=1e-5, help='Weight decay')
-    parser.add_argument('--loss', type=str, default='mae', choices=['mae', 'mse'], help='Loss function')
-    parser.add_argument('--patience', type=int, default=10, help='Early stopping patience') # Added patience arg
-    parser.add_argument('--num_workers', type=int, default=4, help='DataLoader workers')
-    parser.add_argument('--output_dir', type=str, default='runs', help='Output directory for checkpoints/logs')
-    parser.add_argument('--cpu', action='store_true', help='Force CPU')
+    parser.add_argument("--output_dir", type=str, default="./training_runs", help="Directory to save checkpoints and logs")
+    parser.add_argument("--epochs", type=int, default=50, help="Number of training epochs")
+    parser.add_argument("--batch_size", type=int, default=8, help="Training batch size")
+    parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate")
+    parser.add_argument("--weight_decay", type=float, default=0.01, help="Optimizer weight decay")
+    parser.add_argument("--loss", type=str, default="mae", choices=["mae", "mse"], help="Loss function type")
+    parser.add_argument("--patience", type=int, default=10, help="Early stopping patience")
+    parser.add_argument("--num_workers", type=int, default=4, help="Number of dataloader workers")
+    parser.add_argument("--cpu", action='store_true', help="Force CPU usage even if CUDA is available")
 
     args = parser.parse_args()
     main(args) 

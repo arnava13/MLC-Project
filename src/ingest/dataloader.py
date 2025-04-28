@@ -9,6 +9,7 @@ from scipy.ndimage import zoom
 import json
 import logging
 from tqdm import tqdm
+from datetime import datetime, timedelta
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
@@ -16,25 +17,28 @@ class CityDataSet(Dataset):
     """
     PyTorch Dataset for UHI modeling using locally stored data.
     Loads a cloudless mosaic & optionally a single LST median for static features,
-    plus dynamic weather/time data. Returns a dictionary for the model.
+    plus dynamic weather/time data from specific weather stations. 
+    Returns a dictionary for the model.
     """
 
-    def __init__(self, bounds, averaging_window,
-                 resolution_m,
-                 uhi_csv, bbox_csv, weather_csv, cloudless_mosaic_path,
-                 data_dir, city_name,
-                 include_lst=True,
+    def __init__(self, bounds: List[float], averaging_window,
+                 resolution_m: int,
+                 uhi_csv: str,
+                 bronx_weather_csv: str, manhattan_weather_csv: str,  # New parameters for station data
+                 cloudless_mosaic_path: str,
+                 data_dir: str, city_name: str,
+                 include_lst: bool = True,
                  single_lst_median_path: str = None): # Added path for single LST
         """
         Initialize the dataset.
 
         Args:
-            bounds: Bounding box [min_lon, min_lat, max_lon, max_lat]
+            bounds: Bounding box [min_lon, min_lat, max_lon, max_lat]. MUST be provided.
             averaging_window: Days lookback for LST median (used only if single_lst_median_path not provided)
             resolution_m: Target spatial resolution (meters) for UHI/Weather/LST grids.
             uhi_csv: Path to UHI data CSV file.
-            bbox_csv: Path to bounding box CSV file.
-            weather_csv: Path to weather data CSV file.
+            bronx_weather_csv: Path to Bronx weather station CSV file.
+            manhattan_weather_csv: Path to Manhattan weather station CSV file.
             cloudless_mosaic_path: Path to the pre-generated cloudless Sentinel-2 mosaic (.npy).
             data_dir: Base directory for stored data.
             city_name: Name of the city.
@@ -43,10 +47,10 @@ class CityDataSet(Dataset):
                                                     If provided, ignores averaging_window and dynamic loading.
         """
         # --- Basic Parameters ---
+        assert bounds and len(bounds) == 4, "Bounds [min_lon, min_lat, max_lon, max_lat] must be provided."
         self.bounds = bounds
         self.include_lst = include_lst
         self.resolution_m = resolution_m
-        self.bbox_csv = Path(bbox_csv)
         self.data_dir = Path(data_dir)
         self.city_name = city_name
         self.sat_files_dir = self.data_dir / self.city_name / "sat_files"
@@ -65,7 +69,30 @@ class CityDataSet(Dataset):
 
         # --- Load UHI Data & Determine Target Grid Size ---
         self.uhi_data = pd.read_csv(uhi_csv)
-        self.timestamps = pd.to_datetime(self.uhi_data['timestamp'])
+        # Check for 'datetime' column (case-sensitive)
+        timestamp_col_name = 'datetime' # Actual name from uhi.csv
+        if timestamp_col_name not in self.uhi_data.columns:
+            raise ValueError(f"Timestamp column ('{timestamp_col_name}') not found in {uhi_csv}. Found columns: {self.uhi_data.columns.tolist()}")
+        # Convert to datetime, localize to US/Eastern, and store unique sorted timestamps
+        uhi_dt_format = '%d-%m-%Y %H:%M' # Format for uhi.csv
+        target_timezone = 'US/Eastern'
+        try:
+            all_timestamps_naive = pd.to_datetime(self.uhi_data[timestamp_col_name], format=uhi_dt_format)
+            all_timestamps = all_timestamps_naive.dt.tz_localize(target_timezone, ambiguous='infer')
+        except ValueError as e:
+             logging.error(f"Error parsing or localizing UHI timestamps with format {uhi_dt_format}: {e}. Trying default parsing.")
+             all_timestamps_naive = pd.to_datetime(self.uhi_data[timestamp_col_name], errors='coerce')
+             if all_timestamps_naive.isnull().any():
+                 raise ValueError(f"Failed to parse some UHI timestamps in {uhi_csv}")
+             try:
+                # Try localizing even if format parsing failed
+                all_timestamps = all_timestamps_naive.dt.tz_localize(target_timezone, ambiguous='infer')
+             except Exception as loc_e:
+                 raise ValueError(f"Failed to localize UHI timestamps: {loc_e}")
+
+        self.unique_timestamps = sorted(all_timestamps.unique())
+        self.uhi_data[timestamp_col_name] = all_timestamps # Update column in dataframe to be tz-aware
+
         self.sat_H, self.sat_W = self._determine_target_grid_size()
 
         # --- Load Single Static LST Median (if specified and included) ---
@@ -103,22 +130,81 @@ class CityDataSet(Dataset):
              # Ensure placeholder logic works if LST is disabled
              self.single_lst_median = np.zeros((1, 1, self.sat_H, self.sat_W), dtype=np.float32)
 
-        # --- Precompute UHI Grids/Masks & Load Weather ---
-        self.target_grids, self.valid_masks = self._precompute_uhi_grids()
-        self.weather_df = pd.read_csv(weather_csv)
-        self.weather_df['date'] = pd.to_datetime(self.weather_df['date'])
-        self._prepare_weather_metadata()
+        # --- Load Weather Station Data ---
+        self.bronx_weather = pd.read_csv(bronx_weather_csv)
+        self.manhattan_weather = pd.read_csv(manhattan_weather_csv)
 
-        logging.info(f"Dataset initialized for {self.city_name} with {len(self)} samples. LST included: {self.include_lst}")
+        # Convert datetime strings to pandas datetime objects, ensuring aware and correct timezone
+        target_timezone = 'US/Eastern'
+
+        # --- Process Bronx --- 
+        try:
+            # Try default parsing first, raise error if invalid strings found
+            dt_naive_or_aware = pd.to_datetime(self.bronx_weather['datetime'], errors='raise')
+            
+            # Ensure it's localized to the target timezone
+            if dt_naive_or_aware.dt.tz is None:
+                # If naive, localize it
+                self.bronx_weather['datetime'] = dt_naive_or_aware.dt.tz_localize(target_timezone, ambiguous='infer')
+            elif str(dt_naive_or_aware.dt.tz) != target_timezone:
+                # If aware but different timezone, convert it
+                logging.warning(f"Converting Bronx weather timezone from {dt_naive_or_aware.dt.tz} to {target_timezone}")
+                self.bronx_weather['datetime'] = dt_naive_or_aware.dt.tz_convert(target_timezone)
+            else:
+                # If already aware and correct timezone, just assign (no change needed)
+                 self.bronx_weather['datetime'] = dt_naive_or_aware
+
+        except Exception as e:
+            logging.error(f"Failed to parse or localize Bronx weather datetime: {e}")
+            # Raise a more informative error
+            raise ValueError("Error processing datetimes in Bronx weather file. Check format and timezone info.") from e
+
+        # Check for NaNs post-processing
+        if self.bronx_weather['datetime'].isnull().any():
+             # This case should ideally not happen with errors='raise', but check anyway
+            logging.warning("Some Bronx weather datetime values are NaT after processing.")
+
+        # --- Process Manhattan (similar logic) --- 
+        try:
+            dt_naive_or_aware = pd.to_datetime(self.manhattan_weather['datetime'], errors='raise')
+            
+            if dt_naive_or_aware.dt.tz is None:
+                self.manhattan_weather['datetime'] = dt_naive_or_aware.dt.tz_localize(target_timezone, ambiguous='infer')
+            elif str(dt_naive_or_aware.dt.tz) != target_timezone:
+                logging.warning(f"Converting Manhattan weather timezone from {dt_naive_or_aware.dt.tz} to {target_timezone}")
+                self.manhattan_weather['datetime'] = dt_naive_or_aware.dt.tz_convert(target_timezone)
+            else:
+                 self.manhattan_weather['datetime'] = dt_naive_or_aware
+
+        except Exception as e:
+            logging.error(f"Failed to parse or localize Manhattan weather datetime: {e}")
+            raise ValueError("Error processing datetimes in Manhattan weather file. Check format and timezone info.") from e
+
+        if self.manhattan_weather['datetime'].isnull().any():
+            logging.warning("Some Manhattan weather datetime values are NaT after processing.")
+
+        # Weather stations' coordinates (provided in the EY xlsx)
+        self.bronx_coords = (40.872, -73.893)       # (lat, lon) for Bronx
+        self.manhattan_coords = (40.767, -73.964)   # (lat, lon) for Manhattan
+        
+        logging.info(f"Loaded Bronx weather data: {len(self.bronx_weather)} records")
+        logging.info(f"Loaded Manhattan weather data: {len(self.manhattan_weather)} records")
+        
+        # --- Precompute Grid Cell Coordinates and Closest Station Map ---
+        self.grid_coords, self.closest_station_map = self._compute_grid_cell_coordinates()
+
+        # --- Precompute UHI Grids/Masks (Store in dictionaries) ---
+        self.target_grids = {}
+        self.valid_masks = {}
+        self._precompute_uhi_grids()
+        
+        logging.info(f"Dataset initialized for {self.city_name} with {len(self)} unique timestamps. LST included: {self.include_lst}")
         logging.info(f"Target grid size (H, W): ({self.sat_H}, {self.sat_W})")
 
     def _determine_target_grid_size(self):
-        """Determine the target grid size (H, W) based on bbox and resolution_m."""
-        if not self.bbox_csv.exists():
-             raise FileNotFoundError(f"Bounding box CSV not found: {self.bbox_csv}")
-        bbox_data = pd.read_csv(self.bbox_csv)
-        min_lat, max_lat = bbox_data['latitudes'].min(), bbox_data['latitudes'].max()
-        min_lon, max_lon = bbox_data['longitudes'].min(), bbox_data['longitudes'].max()
+        """Determine the target grid size (H, W) based on self.bounds and resolution_m."""
+        # Use self.bounds directly
+        min_lon, min_lat, max_lon, max_lat = self.bounds
 
         deg_per_meter_lat = 1 / 111000
         deg_per_meter_lon = 1 / (111320 * math.cos(math.radians((min_lat + max_lat) / 2)))
@@ -129,45 +215,81 @@ class CityDataSet(Dataset):
         W = math.ceil(width_deg / (self.resolution_m * deg_per_meter_lon))
         return max(1, H), max(1, W)
 
+    def _compute_grid_cell_coordinates(self):
+        """
+        Compute the lat/lon coordinates for each grid cell and determine which
+        weather station is closest to each cell. Uses self.bounds.
+
+        Returns:
+            grid_coords: Array of shape (H, W, 2) containing (lat, lon) for each cell
+            closest_station_map: Array of shape (H, W) with 0 for Bronx, 1 for Manhattan
+        """
+        # Use self.bounds directly
+        min_lon, min_lat, max_lon, max_lat = self.bounds
+
+        # Create arrays for lat/lon values across the grid
+        lats = np.linspace(max_lat, min_lat, self.sat_H)  # Top to bottom
+        lons = np.linspace(min_lon, max_lon, self.sat_W)  # Left to right
+        
+        # Create 2D grid of coordinates
+        grid_coords = np.zeros((self.sat_H, self.sat_W, 2))
+        closest_station_map = np.zeros((self.sat_H, self.sat_W), dtype=np.int8)
+        
+        # Calculate distance to stations for each grid cell
+        for i in range(self.sat_H):
+            for j in range(self.sat_W):
+                lat, lon = lats[i], lons[j]
+                grid_coords[i, j] = [lat, lon]
+                
+                # Calculate squared Euclidean distance to each station
+                # (we don't need the actual distance, just which one is closer)
+                d_bronx = (lat - self.bronx_coords[0])**2 + (lon - self.bronx_coords[1])**2
+                d_manhattan = (lat - self.manhattan_coords[0])**2 + (lon - self.manhattan_coords[1])**2
+                
+                # 0 for Bronx, 1 for Manhattan
+                closest_station_map[i, j] = 1 if d_manhattan < d_bronx else 0
+                
+        logging.info(f"Computed grid cell coordinates and closest station map")
+        logging.info(f"Grid cells assigned to Bronx: {np.sum(closest_station_map == 0)}")
+        logging.info(f"Grid cells assigned to Manhattan: {np.sum(closest_station_map == 1)}")
+        
+        return grid_coords, closest_station_map
+
     def _precompute_uhi_grids(self):
-        """Create target UHI grids and masks for all timestamps at target resolution."""
-        target_grids = []
-        valid_masks = []
-        bbox_data = pd.read_csv(self.bbox_csv)
-        topleft_lat = bbox_data['latitudes'].max()
-        topleft_lon = bbox_data['longitudes'].min()
+        """Create target UHI grids and masks for all unique timestamps.
+           Stores results in self.target_grids and self.valid_masks dictionaries.
+        """
+        # Use self.bounds directly
+        min_lon, min_lat, max_lon, max_lat = self.bounds
+        topleft_lat = max_lat # Latitude decreases downwards
+        topleft_lon = min_lon # Longitude increases rightwards
+
         deg_per_meter_lat = 1 / 111000
-        deg_per_meter_lon = 1 / (111320 * math.cos(math.radians((bbox_data['latitudes'].min() + bbox_data['latitudes'].max()) / 2)))
+        deg_per_meter_lon = 1 / (111320 * math.cos(math.radians((min_lat + max_lat) / 2)))
 
         x_res_deg = self.resolution_m * deg_per_meter_lon
         y_res_deg = self.resolution_m * deg_per_meter_lat
 
-        self.uhi_data['x_grid'] = np.clip(np.floor((self.uhi_data['longitudes'] - topleft_lon) / x_res_deg), 0, self.sat_W - 1).astype(int)
-        self.uhi_data['y_grid'] = np.clip(np.floor((topleft_lat - self.uhi_data['latitudes']) / y_res_deg), 0, self.sat_H - 1).astype(int)
+        # Use correct column names 'Longitude' and 'Latitude'
+        # Calculate grid indices once for the whole dataframe
+        self.uhi_data['x_grid'] = np.clip(np.floor((self.uhi_data['Longitude'] - topleft_lon) / x_res_deg), 0, self.sat_W - 1).astype(int)
+        self.uhi_data['y_grid'] = np.clip(np.floor((topleft_lat - self.uhi_data['Latitude']) / y_res_deg), 0, self.sat_H - 1).astype(int)
 
-        grouped = self.uhi_data.groupby(self.timestamps)
+        # Group by the actual datetime column
+        timestamp_col_name = 'datetime'
+        grouped = self.uhi_data.groupby(timestamp_col_name)
+
         for timestamp, group in tqdm(grouped, desc="Precomputing UHI grids"):
             grid = np.full((self.sat_H, self.sat_W), np.nan, dtype=np.float32)
             mask = np.zeros((self.sat_H, self.sat_W), dtype=bool)
             y_indices = group['y_grid'].values
             x_indices = group['x_grid'].values
-            uhi_values = group['UHI'].values
+            uhi_values = group['UHI Index'].values # Use correct column name
             grid[y_indices, x_indices] = uhi_values
             mask[y_indices, x_indices] = True
-            target_grids.append(grid)
-            valid_masks.append(mask)
-        return target_grids, valid_masks
-
-    def _prepare_weather_metadata(self):
-        """Pre-compute metadata for weather grid construction."""
-        self.weather_lat_vals = np.sort(self.weather_df['lat'].unique())
-        self.weather_lon_vals = np.sort(self.weather_df['lon'].unique())
-        if len(self.weather_lat_vals) < 2 or len(self.weather_lon_vals) < 2:
-            raise ValueError("Weather CSV must contain at least a 2x2 grid of lat/lon points.")
-        self.weather_lat_step = np.abs(np.diff(self.weather_lat_vals)).mean() if len(self.weather_lat_vals) > 1 else 1.0
-        self.weather_lon_step = np.abs(np.diff(self.weather_lon_vals)).mean() if len(self.weather_lon_vals) > 1 else 1.0
-        self.weather_H_orig = len(self.weather_lat_vals)
-        self.weather_W_orig = len(self.weather_lon_vals)
+            # Store in dictionary with timestamp as key
+            self.target_grids[timestamp] = grid
+            self.valid_masks[timestamp] = mask
 
     def _normalize_lst(self, lst_tensor: np.ndarray) -> np.ndarray:
         """Normalizes LST tensor from Kelvin to [-1, 1] using fixed range."""
@@ -180,49 +302,143 @@ class CityDataSet(Dataset):
         lst_norm_neg1_pos1 = (lst_norm_01 * 2.0) - 1.0
         return np.clip(lst_norm_neg1_pos1, -1.0, 1.0)
 
-    def _build_weather_grid(self, date: pd.Timestamp) -> np.ndarray:
-        """Return weather grid (C_w=3, H, W) for given date, resized to target H, W."""
-        rows = self.weather_df[self.weather_df['date'] == date.normalize()]
-        grid = np.full((3, self.weather_H_orig, self.weather_W_orig), np.nan, dtype=np.float32)
-        weather_lat_min = self.weather_lat_vals[0]
-        weather_lon_min = self.weather_lon_vals[0]
-        lat_indices = np.round((rows['lat'].values - weather_lat_min) / self.weather_lat_step).astype(int)
-        lon_indices = np.round((rows['lon'].values - weather_lon_min) / self.weather_lon_step).astype(int)
-        valid_idx = (0 <= lat_indices) & (lat_indices < self.weather_H_orig) & \
-                    (0 <= lon_indices) & (lon_indices < self.weather_W_orig)
-        lat_indices = lat_indices[valid_idx]
-        lon_indices = lon_indices[valid_idx]
-        valid_rows = rows.iloc[valid_idx]
-        grid[0, lat_indices, lon_indices] = valid_rows['temp_max'].values
-        grid[1, lat_indices, lon_indices] = valid_rows['temp_min'].values
-        grid[2, lat_indices, lon_indices] = valid_rows['precip'].values
-        grid = np.nan_to_num(grid)
-        if (self.weather_H_orig, self.weather_W_orig) != (self.sat_H, self.sat_W):
-            zoom_factors = (1, self.sat_H / self.weather_H_orig, self.sat_W / self.weather_W_orig)
-            grid = zoom(grid, zoom=zoom_factors, order=1)
-        return grid
+    # --- Weather Normalization Constants ---
+    WEATHER_NORM_PARAMS = {
+        'air_temp': {'min': -15.0, 'max': 40.0},     # Celsius
+        'rel_humidity': {'min': 0.0, 'max': 100.0},  # Percentage
+        'avg_windspeed': {'min': 0.0, 'max': 30.0},  # m/s
+        'solar_flux': {'min': 0.0, 'max': 1100.0}, # W/m^2
+        # Wind direction handled separately (sin/cos)
+    }
+    # --- End Weather Normalization Constants ---
+
+    def _normalize_min_max(self, value, var_name):
+        params = self.WEATHER_NORM_PARAMS.get(var_name)
+        if not params:
+            return value # No normalization defined
+        min_val, max_val = params['min'], params['max']
+        # Normalize to [0, 1]
+        norm_01 = (value - min_val) / (max_val - min_val)
+        # Clip to ensure values stay within [0, 1] after normalization
+        return np.clip(norm_01, 0.0, 1.0)
+
+    def _get_closest_weather_data(self, timestamp):
+        """
+        Get the weather data from both stations for the timestamp closest to the given one.
+        
+        Args:
+            timestamp: Target timestamp to find weather data for
+            
+        Returns:
+            Dictionary with weather data from both stations
+        """
+        # Find closest timestamp in each station's data
+        bronx_idx = (self.bronx_weather['datetime'] - timestamp).abs().idxmin()
+        manhattan_idx = (self.manhattan_weather['datetime'] - timestamp).abs().idxmin()
+        
+        # Get the weather data for those closest timestamps
+        bronx_data = self.bronx_weather.loc[bronx_idx]
+        manhattan_data = self.manhattan_weather.loc[manhattan_idx]
+        
+        # Extract relevant columns (5 weather variables)
+        weather_vars = ['air_temp', 'rel_humidity', 'avg_windspeed', 'wind_direction', 'solar_flux']
+        
+        return {
+            'bronx': {var: bronx_data[var] for var in weather_vars},
+            'manhattan': {var: manhattan_data[var] for var in weather_vars}
+        }
+
+    def _build_weather_grid(self, timestamp):
+        """
+        Build a normalized weather grid where each cell contains data from the closest
+        weather station. Wind direction is converted to sin/cos. Uses vectorized ops.
+
+        Args:
+            timestamp: Target timestamp to get weather data for
+
+        Returns:
+            6-channel tensor of shape (6, H, W) with normalized weather data:
+            [temp, humidity, wind_speed, wind_dir_sin, wind_dir_cos, solar_flux]
+        """
+        # Get weather data from both stations for this timestamp
+        station_data = self._get_closest_weather_data(timestamp)
+
+        # Pre-allocate the weather grid (6 channels × H × W)
+        weather_grid = np.zeros((6, self.sat_H, self.sat_W), dtype=np.float32)
+
+        # --- Get raw values for both stations ---
+        bronx_raw = station_data['bronx']
+        manhattan_raw = station_data['manhattan']
+
+        # --- Normalize values for both stations ---
+        # Temperature
+        temp_bronx_norm = self._normalize_min_max(bronx_raw['air_temp'], 'air_temp')
+        temp_manhattan_norm = self._normalize_min_max(manhattan_raw['air_temp'], 'air_temp')
+        # Humidity
+        hum_bronx_norm = self._normalize_min_max(bronx_raw['rel_humidity'], 'rel_humidity')
+        hum_manhattan_norm = self._normalize_min_max(manhattan_raw['rel_humidity'], 'rel_humidity')
+        # Wind Speed
+        ws_bronx_norm = self._normalize_min_max(bronx_raw['avg_windspeed'], 'avg_windspeed')
+        ws_manhattan_norm = self._normalize_min_max(manhattan_raw['avg_windspeed'], 'avg_windspeed')
+        # Wind Direction (Sin/Cos)
+        wd_bronx_rad = np.deg2rad(bronx_raw['wind_direction'])
+        wd_manhattan_rad = np.deg2rad(manhattan_raw['wind_direction'])
+        wd_bronx_sin, wd_bronx_cos = np.sin(wd_bronx_rad), np.cos(wd_bronx_rad)
+        wd_manhattan_sin, wd_manhattan_cos = np.sin(wd_manhattan_rad), np.cos(wd_manhattan_rad)
+        # Solar Flux
+        sf_bronx_norm = self._normalize_min_max(bronx_raw['solar_flux'], 'solar_flux')
+        sf_manhattan_norm = self._normalize_min_max(manhattan_raw['solar_flux'], 'solar_flux')
+
+        # --- Use boolean masks based on closest_station_map to assign values --- 
+        # closest_station_map: 0 for Bronx, 1 for Manhattan
+        is_bronx = (self.closest_station_map == 0)
+        is_manhattan = (self.closest_station_map == 1)
+
+        weather_grid[0][is_bronx] = temp_bronx_norm
+        weather_grid[0][is_manhattan] = temp_manhattan_norm
+
+        weather_grid[1][is_bronx] = hum_bronx_norm
+        weather_grid[1][is_manhattan] = hum_manhattan_norm
+
+        weather_grid[2][is_bronx] = ws_bronx_norm
+        weather_grid[2][is_manhattan] = ws_manhattan_norm
+
+        weather_grid[3][is_bronx] = wd_bronx_sin
+        weather_grid[3][is_manhattan] = wd_manhattan_sin
+        weather_grid[4][is_bronx] = wd_bronx_cos
+        weather_grid[4][is_manhattan] = wd_manhattan_cos
+
+        weather_grid[5][is_bronx] = sf_bronx_norm
+        weather_grid[5][is_manhattan] = sf_manhattan_norm
+
+        return weather_grid
 
     def _get_time_embedding(self, timestamp: pd.Timestamp) -> np.ndarray:
-        """Computes sin/cos embeddings for minute of day and day of year."""
+        """Computes sin/cos embeddings for minute of day."""
         total_minutes = timestamp.hour * 60 + timestamp.minute
-        day_of_year = timestamp.dayofyear
+        # day_of_year = timestamp.dayofyear # Removed day of year calculation
         norm_minute = total_minutes / 1440.0
-        norm_day = (day_of_year - 1) / 365.0
+        # norm_day = (day_of_year - 1) / 365.0 # Removed day of year calculation
         minute_sin = np.sin(2 * np.pi * norm_minute)
         minute_cos = np.cos(2 * np.pi * norm_minute)
-        day_sin = np.sin(2 * np.pi * norm_day)
-        day_cos = np.cos(2 * np.pi * norm_day)
-        time_features = np.array([minute_sin, minute_cos, day_sin, day_cos], dtype=np.float32)
+        # day_sin = np.sin(2 * np.pi * norm_day) # Removed day of year calculation
+        # day_cos = np.cos(2 * np.pi * norm_day) # Removed day of year calculation
+        time_features = np.array([minute_sin, minute_cos], dtype=np.float32)
         time_map = np.tile(time_features[:, np.newaxis, np.newaxis], (1, self.sat_H, self.sat_W))
         return time_map
 
     def __len__(self):
-        return len(self.timestamps)
+        # Length is the number of unique timestamps
+        return len(self.unique_timestamps)
 
     def __getitem__(self, idx):
-        timestamp = self.timestamps[idx]
+        # Get the unique timestamp corresponding to the index
+        timestamp = self.unique_timestamps[idx]
 
+        # Get weather data from closest stations for this timestamp
         weather_grid = self._build_weather_grid(timestamp)
+
+        # Add the time sequence dimension
         weather_seq = weather_grid[np.newaxis, ...]
 
         time_map = self._get_time_embedding(timestamp)
@@ -234,10 +450,12 @@ class CityDataSet(Dataset):
         # Add sequence dimension T=1 -> (1, 1, H, W)
         lst_seq = lst_tensor[np.newaxis, ...]
 
-        target = self.target_grids[idx]
-        mask = self.valid_masks[idx].astype(np.float32)
+        # Retrieve precomputed target and mask using the timestamp key
+        target = self.target_grids[timestamp]
+        mask = self.valid_masks[timestamp].astype(np.float32)
         target = np.nan_to_num(target)
 
+        # Return the original full-resolution mosaic
         cloudless_mosaic = self.cloudless_mosaic.astype(np.float32)
 
         return {
@@ -248,9 +466,3 @@ class CityDataSet(Dataset):
             "target": target.astype(np.float32),
             "mask": mask.astype(np.float32)
         }
-
-# TODO: Verify selected_bands is no longer needed if Clay uses fixed bands
-# TODO: Ensure cloudless_mosaic resolution aligns with how Clay expects input
-
-
-# TODO: Create dataloaders for the models in models.py. 
