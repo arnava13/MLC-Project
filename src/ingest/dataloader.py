@@ -201,6 +201,28 @@ class CityDataSet(Dataset):
         logging.info(f"Dataset initialized for {self.city_name} with {len(self)} unique timestamps. LST included: {self.include_lst}")
         logging.info(f"Target grid size (H, W): ({self.sat_H}, {self.sat_W})")
 
+    # --- ADDED Normalization Helpers (copied from ClayFeatureExtractor for convenience) ---
+    def _normalize_clay_timestamp(self, date):
+        """Normalizes timestamp for Clay encoder input (week + hour sin/cos)."""
+        if isinstance(date, (np.datetime64, str)):
+            date_pd = pd.Timestamp(date)
+        elif isinstance(date, pd.Timestamp):
+            date_pd = date
+        else:
+            raise TypeError(f"Unsupported date type: {type(date)}")
+
+        # Use isocalendar().week which is standard ISO week number
+        week = date_pd.isocalendar().week * 2 * np.pi / 52
+        hour = date_pd.hour * 2 * np.pi / 24
+        return np.array([math.sin(week), math.cos(week), math.sin(hour), math.cos(hour)], dtype=np.float32)
+
+    def _normalize_clay_latlon(self, lat, lon):
+        """Normalizes lat/lon for Clay encoder input (sin/cos)."""
+        lat_rad = lat * np.pi / 180
+        lon_rad = lon * np.pi / 180
+        return np.array([math.sin(lat_rad), math.cos(lat_rad), math.sin(lon_rad), math.cos(lon_rad)], dtype=np.float32)
+    # --- END ADDED Normalization Helpers ---
+
     def _determine_target_grid_size(self):
         """Determine the target grid size (H, W) based on self.bounds and resolution_m."""
         # Use self.bounds directly
@@ -308,7 +330,7 @@ class CityDataSet(Dataset):
         'rel_humidity': {'min': 0.0, 'max': 100.0},  # Percentage
         'avg_windspeed': {'min': 0.0, 'max': 30.0},  # m/s
         'solar_flux': {'min': 0.0, 'max': 1100.0}, # W/m^2
-        # Wind direction handled separately (sin/cos)
+        'wind_direction': {'min': 0.0, 'max': 360.0} # Degrees (for potential direct interpolation before sin/cos)
     }
     # --- End Weather Normalization Constants ---
 
@@ -350,66 +372,79 @@ class CityDataSet(Dataset):
 
     def _build_weather_grid(self, timestamp):
         """
-        Build a normalized weather grid where each cell contains data from the closest
-        weather station. Wind direction is converted to sin/cos. Uses vectorized ops.
+        Build a normalized weather grid using inverse distance weighted (IDW)
+        interpolation between the two stations. Wind direction is interpolated
+        then converted to sin/cos.
 
         Args:
             timestamp: Target timestamp to get weather data for
 
         Returns:
-            6-channel tensor of shape (6, H, W) with normalized weather data:
+            6-channel tensor of shape (6, H, W) with normalized interpolated weather data:
             [temp, humidity, wind_speed, wind_dir_sin, wind_dir_cos, solar_flux]
         """
         # Get weather data from both stations for this timestamp
         station_data = self._get_closest_weather_data(timestamp)
+        bronx_raw = station_data['bronx']
+        manhattan_raw = station_data['manhattan']
 
         # Pre-allocate the weather grid (6 channels × H × W)
         weather_grid = np.zeros((6, self.sat_H, self.sat_W), dtype=np.float32)
 
-        # --- Get raw values for both stations ---
-        bronx_raw = station_data['bronx']
-        manhattan_raw = station_data['manhattan']
+        # Calculate distances from each grid cell to stations
+        # self.grid_coords shape: (H, W, 2) -> (lat, lon)
+        # station coords: (lat, lon)
+        # Using squared Euclidean distance for simplicity (monotonic with distance)
+        lat_grid = self.grid_coords[:, :, 0]
+        lon_grid = self.grid_coords[:, :, 1]
 
-        # --- Normalize values for both stations ---
-        # Temperature
-        temp_bronx_norm = self._normalize_min_max(bronx_raw['air_temp'], 'air_temp')
-        temp_manhattan_norm = self._normalize_min_max(manhattan_raw['air_temp'], 'air_temp')
-        # Humidity
-        hum_bronx_norm = self._normalize_min_max(bronx_raw['rel_humidity'], 'rel_humidity')
-        hum_manhattan_norm = self._normalize_min_max(manhattan_raw['rel_humidity'], 'rel_humidity')
-        # Wind Speed
-        ws_bronx_norm = self._normalize_min_max(bronx_raw['avg_windspeed'], 'avg_windspeed')
-        ws_manhattan_norm = self._normalize_min_max(manhattan_raw['avg_windspeed'], 'avg_windspeed')
-        # Wind Direction (Sin/Cos)
-        wd_bronx_rad = np.deg2rad(bronx_raw['wind_direction'])
-        wd_manhattan_rad = np.deg2rad(manhattan_raw['wind_direction'])
-        wd_bronx_sin, wd_bronx_cos = np.sin(wd_bronx_rad), np.cos(wd_bronx_rad)
-        wd_manhattan_sin, wd_manhattan_cos = np.sin(wd_manhattan_rad), np.cos(wd_manhattan_rad)
-        # Solar Flux
-        sf_bronx_norm = self._normalize_min_max(bronx_raw['solar_flux'], 'solar_flux')
-        sf_manhattan_norm = self._normalize_min_max(manhattan_raw['solar_flux'], 'solar_flux')
+        dist_sq_bronx = (lat_grid - self.bronx_coords[0])**2 + (lon_grid - self.bronx_coords[1])**2
+        dist_sq_manhattan = (lat_grid - self.manhattan_coords[0])**2 + (lon_grid - self.manhattan_coords[1])**2
 
-        # --- Use boolean masks based on closest_station_map to assign values --- 
-        # closest_station_map: 0 for Bronx, 1 for Manhattan
-        is_bronx = (self.closest_station_map == 0)
-        is_manhattan = (self.closest_station_map == 1)
+        # Inverse distance weighting (power p=2)
+        # Add small epsilon to avoid division by zero if a cell is exactly at a station
+        epsilon = 1e-9
+        weight_bronx = 1.0 / (dist_sq_bronx + epsilon)
+        weight_manhattan = 1.0 / (dist_sq_manhattan + epsilon)
 
-        weather_grid[0][is_bronx] = temp_bronx_norm
-        weather_grid[0][is_manhattan] = temp_manhattan_norm
+        total_weight = weight_bronx + weight_manhattan
 
-        weather_grid[1][is_bronx] = hum_bronx_norm
-        weather_grid[1][is_manhattan] = hum_manhattan_norm
+        norm_weight_bronx = weight_bronx / total_weight
+        norm_weight_manhattan = weight_manhattan / total_weight
 
-        weather_grid[2][is_bronx] = ws_bronx_norm
-        weather_grid[2][is_manhattan] = ws_manhattan_norm
+        # Interpolate normalized values (except wind direction initially)
+        weather_vars_to_interpolate = ['air_temp', 'rel_humidity', 'avg_windspeed', 'solar_flux']
+        channel_map = {'air_temp': 0, 'rel_humidity': 1, 'avg_windspeed': 2, 'solar_flux': 5} # Map var name to grid channel index
 
-        weather_grid[3][is_bronx] = wd_bronx_sin
-        weather_grid[3][is_manhattan] = wd_manhattan_sin
-        weather_grid[4][is_bronx] = wd_bronx_cos
-        weather_grid[4][is_manhattan] = wd_manhattan_cos
+        for var_name in weather_vars_to_interpolate:
+            # Normalize station values
+            val_bronx_norm = self._normalize_min_max(bronx_raw[var_name], var_name)
+            val_manhattan_norm = self._normalize_min_max(manhattan_raw[var_name], var_name)
 
-        weather_grid[5][is_bronx] = sf_bronx_norm
-        weather_grid[5][is_manhattan] = sf_manhattan_norm
+            # Interpolate using normalized weights
+            interpolated_norm_val = (val_bronx_norm * norm_weight_bronx +
+                                     val_manhattan_norm * norm_weight_manhattan)
+
+            channel_idx = channel_map[var_name]
+            weather_grid[channel_idx] = interpolated_norm_val
+
+        # Handle Wind Direction: Interpolate degrees, then convert to sin/cos
+        # Note: Interpolating angles directly can be problematic across 0/360 boundary.
+        # A more robust method might involve interpolating sin/cos components directly,
+        # but simple interpolation is used here as a starting point.
+        wd_bronx = bronx_raw['wind_direction']
+        wd_manhattan = manhattan_raw['wind_direction']
+
+        # Simple angle interpolation (adjust for circular nature if needed, but IDW might suffice here)
+        # Example: Handle wrap-around (if one angle is near 0 and other near 360)
+        # This basic version doesn't explicitly handle wrap-around, assumes angles are close enough.
+        interpolated_wd_deg = (wd_bronx * norm_weight_bronx +
+                               wd_manhattan * norm_weight_manhattan)
+
+        # Convert interpolated angle to radians and then sin/cos
+        interpolated_wd_rad = np.deg2rad(interpolated_wd_deg)
+        weather_grid[3] = np.sin(interpolated_wd_rad) # Sin component
+        weather_grid[4] = np.cos(interpolated_wd_rad) # Cos component
 
         return weather_grid
 
@@ -435,20 +470,38 @@ class CityDataSet(Dataset):
         # Get the unique timestamp corresponding to the index
         timestamp = self.unique_timestamps[idx]
 
-        # Get weather data from closest stations for this timestamp
-        weather_grid = self._build_weather_grid(timestamp)
+        # --- ADDED: Calculate normalized time/latlon for Clay --- 
+        # Calculate center lat/lon from bounds
+        min_lon, min_lat, max_lon, max_lat = self.bounds
+        center_lon = (min_lon + max_lon) / 2.0
+        center_lat = (min_lat + max_lat) / 2.0
+        norm_latlon_tensor = self._normalize_clay_latlon(center_lat, center_lon)
+        
+        # Normalize the current timestamp
+        norm_time_tensor = self._normalize_clay_timestamp(timestamp)
+        # --- END ADDED --- 
 
-        # Add the time sequence dimension
-        weather_seq = weather_grid[np.newaxis, ...]
+        # Get weather data using IDW interpolation for this timestamp
+        weather_grid = self._build_weather_grid(timestamp) # Shape (C_weather, H, W)
+        # Restore the time sequence dimension T=1
+        weather_seq = weather_grid[np.newaxis, ...]       # Shape (1, C_weather, H, W)
 
-        time_map = self._get_time_embedding(timestamp)
-        time_map_seq = time_map[np.newaxis, ...]
+        time_map = self._get_time_embedding(timestamp) # Shape (C_time, H, W)
+        # Restore the time sequence dimension T=1
+        time_map_seq = time_map[np.newaxis, ...]        # Shape (1, C_time, H, W)
 
         # Get the static LST median (already normalized or zero)
-        # It will have shape (1, H, W)
+        # It should have shape (1, H, W)
         lst_tensor = self.single_lst_median if self.include_lst else np.zeros((1, self.sat_H, self.sat_W), dtype=np.float32)
-        # Add sequence dimension T=1 -> (1, 1, H, W)
-        lst_seq = lst_tensor[np.newaxis, ...]
+        # Ensure lst_tensor is (1, H, W)
+        if self.include_lst:
+            if lst_tensor.ndim == 4 and lst_tensor.shape[0] == 1 and lst_tensor.shape[1] == 1:
+                 lst_tensor = lst_tensor.squeeze(0) # Handle (1, 1, H, W) -> (1, H, W)
+            elif lst_tensor.ndim != 3 or lst_tensor.shape[0] != 1:
+                 logging.warning(f"Unexpected LST tensor shape {lst_tensor.shape} when LST is included. Using zeros.")
+                 lst_tensor = np.zeros((1, self.sat_H, self.sat_W), dtype=np.float32)
+        # Restore sequence dimension T=1 -> (1, 1, H, W)
+        lst_seq = lst_tensor[np.newaxis, ...] # Shape (1, 1, H, W)
 
         # Retrieve precomputed target and mask using the timestamp key
         target = self.target_grids[timestamp]
@@ -460,9 +513,12 @@ class CityDataSet(Dataset):
 
         return {
             "cloudless_mosaic": cloudless_mosaic,
-            "weather_seq": weather_seq.astype(np.float32),
-            "time_emb_seq": time_map_seq.astype(np.float32),
-            "lst_seq": lst_seq.astype(np.float32), # Now always contains the single median (or zeros)
+            "weather": weather_seq.astype(np.float32),         # Shape (1, C_weather, H, W)
+            "time_emb": time_map_seq.astype(np.float32),           # Shape (1, C_time, H, W) - Minute-based
+            "lst": lst_seq.astype(np.float32),              # Shape (1, C_lst, H, W)
             "target": target.astype(np.float32),
-            "mask": mask.astype(np.float32)
+            "mask": mask.astype(np.float32),
+            # --- ADDED tensors for Clay dynamic metadata ---
+            "norm_time_tensor": norm_time_tensor,          # Shape (4,)
+            "norm_latlon_tensor": norm_latlon_tensor        # Shape (4,)
         }
