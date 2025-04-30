@@ -348,7 +348,7 @@ class ConvGRUCell(nn.Module):
 # 3. MAIN UHI NET MODEL -------------------------------------------------------
 # -----------------------------------------------------------------------------
 
-class UHINet(nn.Module):
+class UHINetGRU(nn.Module):
     """
     Main UHI prediction model. Designed for single time step processing,
     to be used within an external training loop that manages time steps and
