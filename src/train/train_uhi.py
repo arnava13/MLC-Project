@@ -220,6 +220,11 @@ def main(args):
     device = torch.device("cuda" if torch.cuda.is_available() and not args.cpu else "cpu")
     logging.info(f"Using device: {device}")
 
+    # --- Output Directory Setup ---
+    output_dir = project_root / 'training_runs'
+    output_dir.mkdir(parents=True, exist_ok=True)
+    logging.info(f"Checkpoints will be saved to: {output_dir}")
+
     # --- Path Setup & Checks ---
     data_dir_path = Path(args.data_dir)
     city_data_dir = data_dir_path / args.city_name
@@ -341,57 +346,62 @@ def main(args):
     optimizer = optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=args.lr, weight_decay=args.weight_decay)
 
     # --- Training Loop ---
+    start_epoch = 0
+    if args.resume:
+        checkpoint = torch.load(args.resume)
+        model.load_state_dict(checkpoint['state_dict'])
+        optimizer.load_state_dict(checkpoint['optimizer'])
+        start_epoch = checkpoint['epoch']
+        if start_epoch > 0:
+             logging.info(f"Resuming training from epoch {start_epoch}")
+        else:
+             logging.info("Starting training from scratch.")
+
     best_val_loss = float('inf')
-    epochs_no_improve = 0
-    patience = args.patience
+    if args.resume:
+         best_val_loss = checkpoint.get('best_val_loss', float('inf'))
 
-    # Output directory
-    run_name = f"{args.city_name}_run_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-    output_dir = Path(args.output_dir) / run_name
-    output_dir.mkdir(parents=True, exist_ok=True)
-    logging.info(f"Checkpoints and logs: {output_dir}")
-    # Save args
-    with open(output_dir / "args.json", 'w') as f: json.dump(vars(args), f, indent=2)
-
-    for epoch in range(args.epochs):
-        logging.info(f"--- Epoch {epoch+1}/{args.epochs} ---")
+    for epoch in range(start_epoch, args.epochs):
+        logging.info(f"\nEpoch {epoch+1}/{args.epochs}")
         train_loss = train_epoch(model, train_loader, optimizer, loss_fn, device)
+        val_loss = validate_epoch(model, val_loader, loss_fn, device)
 
-        current_loss = train_loss # Default if no validation
-        if val_loader:
-            val_loss = validate_epoch(model, val_loader, loss_fn, device)
-            logging.info(f"Epoch {epoch+1}: Train Loss={train_loss:.4f}, Val Loss={val_loss:.4f}")
-            current_loss = val_loss
-        else:
-             logging.info(f"Epoch {epoch+1}: Train Loss={train_loss:.4f}")
-             
-        if np.isnan(current_loss):
-            logging.error("Loss is NaN. Stopping training.")
-            break
+        logging.info(f"Epoch {epoch+1}: Train Loss = {train_loss:.4f}, Val Loss = {val_loss:.4f}")
 
-        is_best = current_loss < best_val_loss
+        # --- Checkpointing ---
+        is_best = val_loss < best_val_loss
         if is_best:
-            best_val_loss = current_loss
-            epochs_no_improve = 0
-        else:
-            epochs_no_improve += 1
-            if epoch > 0: # Don't log improvement message on first epoch
-                 logging.info(f"No improvement in validation loss for {epochs_no_improve} epochs.")
+            best_val_loss = val_loss
+            logging.info(f"New best validation loss: {best_val_loss:.4f}")
 
+        # Define checkpoint paths within the output directory
+        checkpoint_filename = output_dir / f'checkpoint_epoch_{epoch+1}.pth.tar'
+        best_checkpoint_filename = output_dir / 'model_best.pth.tar'
+        # Save latest checkpoint
         save_checkpoint(
-            {'epoch': epoch + 1, 'state_dict': model.state_dict(), 'best_val_loss': best_val_loss,
-             'optimizer' : optimizer.state_dict(), 'args': vars(args)},
-            is_best,
-            filename=output_dir / 'checkpoint_last.pth.tar',
-            best_filename=output_dir / 'model_best.pth.tar'
+            {
+                'epoch': epoch + 1,
+                'state_dict': model.state_dict(),
+                'optimizer': optimizer.state_dict(),
+                'best_val_loss': best_val_loss,
+                'config': vars(args) # Save model config
+            },
+            is_best=is_best,
+            filename=str(checkpoint_filename), # Pass as string
+            best_filename=str(best_checkpoint_filename) # Pass as string
         )
+        logging.info(f"Saved checkpoint to {checkpoint_filename}")
+        # Optional: Prune old checkpoints here if desired
 
-        if epochs_no_improve >= patience:
-            logging.info(f"Early stopping triggered after {patience} epochs with no improvement.")
-            break
+        # Add early stopping condition if needed
+        # Example:
+        # if patience_counter >= args.patience:
+        #     logging.info("Early stopping triggered.")
+        #     break
 
     logging.info("Training finished.")
-    logging.info(f"Best loss recorded: {best_val_loss:.4f}")
+    logging.info(f"Best validation loss: {best_val_loss:.4f}")
+    logging.info(f"Best model saved to: {best_checkpoint_filename}")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train UHI Prediction Model")
@@ -427,6 +437,7 @@ if __name__ == "__main__":
     parser.add_argument("--patience", type=int, default=10, help="Early stopping patience")
     parser.add_argument("--num_workers", type=int, default=4, help="Number of dataloader workers")
     parser.add_argument("--cpu", action='store_true', help="Force CPU usage even if CUDA is available")
+    parser.add_argument("--resume", type=str, help="Path to checkpoint to resume training from")
 
     args = parser.parse_args()
     main(args) 
