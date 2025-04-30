@@ -201,26 +201,49 @@ class CityDataSet(Dataset):
         logging.info(f"Dataset initialized for {self.city_name} with {len(self)} unique timestamps. LST included: {self.include_lst}")
         logging.info(f"Target grid size (H, W): ({self.sat_H}, {self.sat_W})")
 
-    # --- ADDED Normalization Helpers (copied from ClayFeatureExtractor for convenience) ---
-    def _normalize_clay_timestamp(self, date):
+    # --- ADDED Normalization Helpers for Clay Metadata ---
+    def _normalize_clay_timestamp(self, date: pd.Timestamp) -> np.ndarray:
         """Normalizes timestamp for Clay encoder input (week + hour sin/cos)."""
-        if isinstance(date, (np.datetime64, str)):
-            date_pd = pd.Timestamp(date)
-        elif isinstance(date, pd.Timestamp):
-            date_pd = date
-        else:
-            raise TypeError(f"Unsupported date type: {type(date)}")
+        if not isinstance(date, pd.Timestamp):
+             raise TypeError(f"Input must be a pandas Timestamp, got {type(date)}")
 
-        # Use isocalendar().week which is standard ISO week number
-        week = date_pd.isocalendar().week * 2 * np.pi / 52
-        hour = date_pd.hour * 2 * np.pi / 24
-        return np.array([math.sin(week), math.cos(week), math.sin(hour), math.cos(hour)], dtype=np.float32)
+        # Use isocalendar().week which is standard ISO week number (1-52/53)
+        week_of_year = date.isocalendar().week
+        hour_of_day = date.hour
 
-    def _normalize_clay_latlon(self, lat, lon):
-        """Normalizes lat/lon for Clay encoder input (sin/cos)."""
-        lat_rad = lat * np.pi / 180
-        lon_rad = lon * np.pi / 180
+        # Normalize week and hour
+        norm_week = (week_of_year - 1) / 52.0 # Normalize week to approx [0, 1]
+        norm_hour = hour_of_day / 24.0        # Normalize hour to [0, 1)
+
+        # Sin/Cos encoding
+        week_sin = np.sin(2 * np.pi * norm_week)
+        week_cos = np.cos(2 * np.pi * norm_week)
+        hour_sin = np.sin(2 * np.pi * norm_hour)
+        hour_cos = np.cos(2 * np.pi * norm_hour)
+
+        # Return as a 4-element array (this is passed *per sample*)
+        return np.array([week_sin, week_cos, hour_sin, hour_cos], dtype=np.float32)
+
+    def _normalize_clay_latlon(self) -> np.ndarray:
+        """
+        Calculates the normalized sin/cos encoding of the *center* lat/lon 
+        of the dataset bounds, returning a (4,) numpy array.
+        Expected by ClayFeatureExtractor as the `norm_latlon_tensor` input.
+        """
+        # Use self.bounds calculated during __init__
+        min_lon, min_lat, max_lon, max_lat = self.bounds
+        
+        # Calculate center coordinates
+        center_lat = (min_lat + max_lat) / 2.0
+        center_lon = (min_lon + max_lon) / 2.0
+        
+        # Normalize using sin/cos
+        lat_rad = center_lat * np.pi / 180
+        lon_rad = center_lon * np.pi / 180
+        
+        # Return as a 4-element array
         return np.array([math.sin(lat_rad), math.cos(lat_rad), math.sin(lon_rad), math.cos(lon_rad)], dtype=np.float32)
+
     # --- END ADDED Normalization Helpers ---
 
     def _determine_target_grid_size(self):
@@ -470,25 +493,54 @@ class CityDataSet(Dataset):
         # Get the unique timestamp corresponding to the index
         timestamp = self.unique_timestamps[idx]
 
-        # --- ADDED: Calculate normalized time/latlon for Clay --- 
-        # Calculate center lat/lon from bounds
-        min_lon, min_lat, max_lon, max_lat = self.bounds
-        center_lon = (min_lon + max_lon) / 2.0
-        center_lat = (min_lat + max_lat) / 2.0
-        norm_latlon_tensor = self._normalize_clay_latlon(center_lat, center_lon)
-        
-        # Normalize the current timestamp
-        norm_time_tensor = self._normalize_clay_timestamp(timestamp)
-        # --- END ADDED --- 
+        # --- Get Clay norm_time (Dynamic per sample) ---
+        # This returns a (4,) array for sin/cos week/hour
+        norm_time_vector = self._normalize_clay_timestamp(timestamp)
+
+        # --- Get Clay norm_latlon (Static, computed once if needed) ---
+        # Compute this once during init or retrieve if already computed
+        # For simplicity here, we retrieve the precomputed grid coords
+        # The helper function _normalize_clay_latlon computes the final (2, H, W) tensor
+        if not hasattr(self, 'norm_latlon_grid_tensor'):
+             # Compute and store if it doesn't exist
+             self.norm_latlon_grid_tensor = self._normalize_clay_latlon()
+        norm_latlon_tensor = self.norm_latlon_grid_tensor # Shape (2, H, W)
 
         # Get weather data using IDW interpolation for this timestamp
         weather_grid = self._build_weather_grid(timestamp) # Shape (C_weather, H, W)
         # Restore the time sequence dimension T=1
         weather_seq = weather_grid[np.newaxis, ...]       # Shape (1, C_weather, H, W)
 
-        time_map = self._get_time_embedding(timestamp) # Shape (C_time, H, W)
-        # Restore the time sequence dimension T=1
-        time_map_seq = time_map[np.newaxis, ...]        # Shape (1, C_time, H, W)
+        # Ensure weather_grid is not None (or handle appropriately)
+        if weather_grid is None:
+            # Use the initial timestamp for the error message, not target_dt_str which might not exist
+            logging.error(f"Failed to build weather grid for timestamp {timestamp}. Skipping this item.")
+            # --- MODIFIED: Return None to be skipped by DataLoader --- 
+            return None
+            # ---------------------------------------------------------
+            
+        # --- Get Time Embedding (Dynamic per timestamp) ---
+        # Ensure target_timestamp is valid before proceeding
+        if not isinstance(timestamp, pd.Timestamp):
+             # Use the correct variable 'timestamp' in the error message
+             print(f"ERROR: timestamp is not a valid Timestamp object at this point for idx {idx}! Type: {type(timestamp)}. Skipping item.")
+             return None
+
+        # Call _get_time_embedding with the correct timestamp variable
+        time_embedding = self._get_time_embedding(timestamp) # (C_time, H, W)
+        if time_embedding is None: # Check if the function itself failed
+             print(f"ERROR: _get_time_embedding returned None for {timestamp}. Skipping item.")
+             return None
+        # --- END MODIFICATION ---
+
+        # --- Construct Sample Dictionary ---
+        # Retrieve precomputed target and mask using the timestamp key
+        target = self.target_grids[timestamp]
+        mask = self.valid_masks[timestamp].astype(np.float32)
+        target = np.nan_to_num(target)
+
+        # Return the original full-resolution mosaic
+        cloudless_mosaic = self.cloudless_mosaic.astype(np.float32)
 
         # Get the static LST median (already normalized or zero)
         # It should have shape (1, H, W)
@@ -500,25 +552,22 @@ class CityDataSet(Dataset):
             elif lst_tensor.ndim != 3 or lst_tensor.shape[0] != 1:
                  logging.warning(f"Unexpected LST tensor shape {lst_tensor.shape} when LST is included. Using zeros.")
                  lst_tensor = np.zeros((1, self.sat_H, self.sat_W), dtype=np.float32)
-        # Restore sequence dimension T=1 -> (1, 1, H, W)
-        lst_seq = lst_tensor[np.newaxis, ...] # Shape (1, 1, H, W)
 
-        # Retrieve precomputed target and mask using the timestamp key
-        target = self.target_grids[timestamp]
-        mask = self.valid_masks[timestamp].astype(np.float32)
-        target = np.nan_to_num(target)
-
-        # Return the original full-resolution mosaic
-        cloudless_mosaic = self.cloudless_mosaic.astype(np.float32)
+        # Restore sequence dimension T=1 for weather, time, lst
+        weather_seq = weather_grid[np.newaxis, ...]       # Shape (1, C_weather, H, W)
+        time_map_seq = time_embedding[np.newaxis, ...]        # Shape (1, C_time, H, W)
+        lst_seq = lst_tensor[np.newaxis, ...]             # Shape (1, 1, H, W)
 
         return {
-            "cloudless_mosaic": cloudless_mosaic,
-            "weather": weather_seq.astype(np.float32),         # Shape (1, C_weather, H, W)
-            "time_emb": time_map_seq.astype(np.float32),           # Shape (1, C_time, H, W) - Minute-based
-            "lst": lst_seq.astype(np.float32),              # Shape (1, C_lst, H, W)
-            "target": target.astype(np.float32),
-            "mask": mask.astype(np.float32),
-            # --- ADDED tensors for Clay dynamic metadata ---
-            "norm_time_tensor": norm_time_tensor,          # Shape (4,)
-            "norm_latlon_tensor": norm_latlon_tensor        # Shape (4,)
+            # Static/Input Features
+            "cloudless_mosaic": cloudless_mosaic,           # Shape (C_static, H, W)
+            "norm_latlon": norm_latlon_tensor.astype(np.float32), # Shape (2, H, W) - ADDED (Static Grid)
+            # Dynamic Features (Sequence Length T=1)
+            "weather_seq": weather_seq.astype(np.float32),  # Shape (1, C_weather, H, W)
+            "time_emb_seq": time_map_seq.astype(np.float32),# Shape (1, C_time, H, W)
+            "lst_seq": lst_seq.astype(np.float32),          # Shape (1, 1, H, W) - Channel dim might be squeezed later if needed
+            "norm_time": norm_time_vector.astype(np.float32), # Shape (4,) - ADDED (Dynamic Vector per Timestamp)
+            # Target and Mask
+            "target": target.astype(np.float32),            # Shape (H, W)
+            "mask": mask.astype(np.float32),                # Shape (H, W)
         }

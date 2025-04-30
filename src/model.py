@@ -41,42 +41,129 @@ class ClayFeatureExtractor(nn.Module):
             freeze_backbone (bool): If True, freezes the Clay backbone weights during training.
         """
         super().__init__()
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.checkpoint_path = Path(checkpoint_path)
         self.metadata_path = Path(metadata_path)
-        self.model_size = model_size
+        # self.model_size = model_size # Store for reference, but don't pass to init directly
         self.bands = bands
         self.platform = platform
         self.gsd = gsd
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.patch_size = None # Will be set after model load
-        self.embed_dim = None  # Will be set after model load
-        self.freeze_backbone = freeze_backbone # Store the flag
+        self.freeze_backbone = freeze_backbone
 
         if not self.checkpoint_path.exists():
             raise FileNotFoundError(f"Clay checkpoint not found at {self.checkpoint_path}")
         if not self.metadata_path.exists():
-            raise FileNotFoundError(f"Metadata file not found at {self.metadata_path}")
+            raise FileNotFoundError(f"Clay metadata not found at {self.metadata_path}")
 
-        # Load metadata
-        self.metadata = Box(yaml.safe_load(open(self.metadata_path)))
+        # Load metadata (Box allows attribute-style access)
+        self.metadata_config = Box(yaml.safe_load(open(self.metadata_path)))
 
-        # Load the model from checkpoint
-        self.model = ClayMAEModule.load_from_checkpoint(
-            self.checkpoint_path,
-            map_location=self.device, # Explicitly load to target device
-            model_size=self.model_size,
-            metadata_path=str(self.metadata_path.resolve()),
-            mask_ratio=0.0,
-            shuffle=False,
-        )
+        # --- Re-applying Manual Checkpoint Loading --- 
+        print(f"Manually loading checkpoint: {self.checkpoint_path}")
+        checkpoint = torch.load(self.checkpoint_path, map_location='cpu') # Load to CPU first
+
+        if "hyper_parameters" not in checkpoint:
+            raise KeyError("Checkpoint does not contain 'hyper_parameters' key.")
+        if "state_dict" not in checkpoint:
+            raise KeyError("Checkpoint does not contain 'state_dict' key.")
+            
+        hparams = checkpoint["hyper_parameters"]
+        state_dict = checkpoint["state_dict"]
+
+        # Prepare arguments for ClayMAEModule constructor from hyperparameters
+        model_args = hparams.copy() # Start with all hparams
+        
+        # Override metadata_path with the absolute one
+        model_args["metadata_path"] = str(self.metadata_path.resolve())
+        
+        # Remove internal Lightning instantiator key
+        model_args.pop("_instantiator", None)
+
+        # Instantiate the model using arguments from the checkpoint
+        print("Instantiating ClayMAEModule manually...")
+        self.model = ClayMAEModule(**model_args)
+        
+        # Load the state dictionary
+        adjusted_state_dict = {}
+        for k, v in state_dict.items():
+            # Remove 'model.' prefix for loading into the nested model
+            if k.startswith("model."):
+                 name = k[len("model."):] 
+                 adjusted_state_dict[name] = v
+            # else: # Optionally handle keys that don't start with model. if needed
+            #     adjusted_state_dict[k] = v 
+        
+        print("Loading state_dict manually into self.model.model...")
+        # --- MODIFIED: Load into self.model.model --- 
+        missing_keys, unexpected_keys = self.model.model.load_state_dict(adjusted_state_dict, strict=False)
+        # -------------------------------------------
+        if missing_keys:
+            print(f"Warning: Missing keys in state_dict (relative to self.model.model): {missing_keys}")
+        if unexpected_keys:
+            print(f"Warning: Unexpected keys in state_dict (relative to self.model.model): {unexpected_keys}")
+
+        self.model.to(self.device) # Move model to target device
         self.model.eval()
-        # self.model.to(self.device) # Already loaded to device with map_location
-        print(f"Clay model loaded from {self.checkpoint_path} to {self.device}")
+        # ----------------------------------------
 
-        # Store embed_dim and patch_size after loading
-        self.embed_dim = self.model.model.encoder.dim
-        self.patch_size = self.model.model.encoder.patch_size
-        print(f"Clay model properties: embed_dim={self.embed_dim}, patch_size={self.patch_size}")
+        # --- Freeze Backbone --- 
+        if self.freeze_backbone:
+            for param in self.model.parameters():
+                param.requires_grad = False
+            logging.info("Clay backbone frozen.")
+            self.model.eval() # Ensure model is in eval mode if frozen
+        else:
+            logging.info("Clay backbone NOT frozen (trainable).")
+            self.model.train() # Set to train mode if not frozen
+
+        # Get embed_dim and patch_size from hparams, inferring embed_dim from model_size
+        # --- MODIFIED: Override patch_size based on observed error --- 
+        try:
+            # --- Set patch_size explicitly --- 
+            self.patch_size = 16 # Override based on error: 196 patches from 224x224 -> 16x16 patches
+            print(f"WARNING: Overriding patch size from hparams. Using fixed patch_size = {self.patch_size}")
+            # --------------------------------
+
+            # --- Get model_size and infer embed_dim from hparams --- 
+            self.model_size = hparams.get('model_size')
+            if self.model_size is None:
+                 # Try to get teacher model name if model_size is missing
+                 teacher_name = hparams.get('teacher')
+                 if teacher_name and 'large' in teacher_name.lower():
+                     self.model_size = 'large'
+                     print("Inferred model_size='large' from teacher hyperparameter.")
+                 else:
+                     raise KeyError("'model_size' key not found and could not be inferred from 'teacher' key in checkpoint hyperparameters.")
+                 
+            if self.model_size == 'large':
+                 self.embed_dim = 1024 # Standard for ViT-Large
+            # Add elif for other sizes like 'base' if needed
+            # elif self.model_size == 'base':
+            #     self.embed_dim = 768 
+            else:
+                 # Fallback: Try to get embed_dim from the instantiated model if size is not 'large' or known
+                 try:
+                     vit_backbone = self.model.model.encoder # Or appropriate path
+                     if hasattr(vit_backbone, 'embed_dim'):
+                         self.embed_dim = vit_backbone.embed_dim
+                         print(f"Inferred embed_dim={self.embed_dim} from model structure for model_size '{self.model_size}'.")
+                     elif hasattr(vit_backbone, 'num_features'): # Common in timm
+                         self.embed_dim = vit_backbone.num_features
+                         print(f"Inferred embed_dim={self.embed_dim} (from num_features) for model_size '{self.model_size}'.")
+                     else:
+                         raise ValueError(f"Unsupported model_size '{self.model_size}' and could not infer embed_dim from model structure.")
+                 except Exception as e:
+                      raise ValueError(f"Unsupported model_size '{self.model_size}' found in hparams. Could not infer embed_dim: {e}")
+            # --------------------------------------------------------
+
+            print(f"Clay model properties: model_size={self.model_size}, embed_dim={self.embed_dim}, patch_size={self.patch_size} (patch_size OVERRIDDEN)")
+            
+        except (KeyError, TypeError, ValueError) as e:
+            print(f"Error determining model parameters from hparams/structure: {e}")
+            raise ValueError("Failed to get required model parameters from checkpoint hyperparameters or model structure.") from e
+        except Exception as e: # Catch other potential errors
+             print(f"Unexpected error determining model parameters: {e}")
+             raise
 
         # --- Define Target Input Size for Clay --- 
         self.target_input_size = (224, 224) # Standard ViT size
@@ -89,7 +176,8 @@ class ClayFeatureExtractor(nn.Module):
         mean = []
         std = []
         waves = []
-        platform_meta = self.metadata[self.platform]
+        # Use self.metadata_config now
+        platform_meta = self.metadata_config[self.platform]
         for band_name in self.bands:
             band_name_str = str(band_name)
             if band_name_str not in platform_meta.bands.mean:
@@ -484,11 +572,8 @@ class UHINetCNN(nn.Module):
                  # Clay args (same as UHINet)
                  clay_checkpoint_path: str,
                  clay_metadata_path: str,
-                 freeze_backbone: bool = True,
-                 # Weather args
                  weather_channels: int,
-                 # Time embedding args - REMOVED from CNN input features
-                 # time_embed_dim: int = 2, 
+                 freeze_backbone: bool = True,
                  # --- Args with defaults ---
                  proj_ch: int = 32, # Channels after projecting Clay features
                  clay_model_size: str = "large",
@@ -500,14 +585,15 @@ class UHINetCNN(nn.Module):
                  use_lst: bool = True,
                  # CNN specific args
                  cnn_hidden_dims: List[int] = [64, 32], # Hidden dimensions for CNN layers
-                 cnn_kernel_size: int = 3
+                 cnn_kernel_size: int = 3,
+                 cnn_dropout: float = 0.0 # Add dropout parameter
     ):
         super().__init__()
         self.use_lst = use_lst
         self.proj_ch = proj_ch
         self.weather_channels = weather_channels
-        # self.time_embed_dim = time_embed_dim # Removed
         self.lst_channels = lst_channels
+        self.cnn_dropout = cnn_dropout # Store dropout rate
 
         # --- Dynamic Clay Feature Extraction (Same as UHINet) ---
         self.clay_backbone = ClayFeatureExtractor(
@@ -523,22 +609,27 @@ class UHINetCNN(nn.Module):
         clay_embed_dim = self.clay_backbone.embed_dim
         self.proj = nn.Conv2d(clay_embed_dim, self.proj_ch, kernel_size=1)
 
-        # --- MODIFIED: Calculate CNN Input Channels ---
-        # Projected Dynamic Clay + LST (optional) + Weather
+        # --- Calculate CNN Input Channels ---
         cnn_in_ch = self.proj_ch + self.weather_channels
         if self.use_lst:
-            cnn_in_ch += self.lst_channels # Add raw LST channels before resizing
+            cnn_in_ch += self.lst_channels
         
-        # --- CNN Core --- 
+        # --- CNN Core (Dynamically creates layers with BatchNorm) --- 
         cnn_layers = []
         current_channels = cnn_in_ch
         padding = cnn_kernel_size // 2
-        for hidden_dim in cnn_hidden_dims:
+        for i, hidden_dim in enumerate(cnn_hidden_dims):
             cnn_layers.append(nn.Conv2d(current_channels, hidden_dim, kernel_size=cnn_kernel_size, padding=padding))
+            # Add BatchNorm after Conv2d
+            cnn_layers.append(nn.BatchNorm2d(hidden_dim))
             cnn_layers.append(nn.ReLU(inplace=True))
-            # Maybe add BatchNorm here if needed: nn.BatchNorm2d(hidden_dim)
+            # Dropout is applied *after* the core, before the regressor
             current_channels = hidden_dim
         self.cnn_core = nn.Sequential(*cnn_layers)
+
+        # --- Add BatchNorm before the final regressor --- 
+        self.final_bn = nn.BatchNorm2d(current_channels)
+        # -------------------------------------------------
 
         # --- Prediction Head --- 
         self.regressor = nn.Conv2d(current_channels, 1, kernel_size=1)
@@ -547,15 +638,15 @@ class UHINetCNN(nn.Module):
         logging.info(f"  Clay Embed Dim: {clay_embed_dim} -> Proj Dim: {self.proj_ch}")
         logging.info(f"  Use LST: {self.use_lst} (Channels: {self.lst_channels if self.use_lst else 0})")
         logging.info(f"  CNN Input Dim (Proj Dyn Clay [+ LST] + Weather): {cnn_in_ch}")
-        logging.info(f"  CNN Hidden Dims: {cnn_hidden_dims}")
-        logging.info(f"  CNN Output Dim (Regressor In): {current_channels}")
+        logging.info(f"  CNN Hidden Dims: {cnn_hidden_dims} (with BatchNorm)")
+        logging.info(f"  CNN Dropout Rate: {self.cnn_dropout}") # Log dropout
+        logging.info(f"  CNN Output Dim (Before Final BN/Regressor): {current_channels}")
 
     # --- MODIFIED forward method ---
     def forward(self, cloudless_mosaic: torch.Tensor,
                 norm_time_tensor: torch.Tensor,  # Added
                 norm_latlon_tensor: torch.Tensor, # Added
                 weather: torch.Tensor,
-                # time_emb: torch.Tensor, # REMOVED from input
                 target_h_w: Tuple[int, int], 
                 static_lst: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
@@ -581,28 +672,36 @@ class UHINetCNN(nn.Module):
 
         # Squeeze the time dimension (T=1) from dynamic inputs
         weather = weather.squeeze(1) # (B, C_weather, H_orig, W_orig)
-        # time_emb = time_emb.squeeze(1) # Removed
-        if self.use_lst:
-            static_lst = static_lst.squeeze(1) # (B, C_lst, H_orig, W_orig)
+        # Remove time dimension from static_lst as well if it's used
+        if self.use_lst and static_lst is not None:
+            if static_lst.ndim == 5 and static_lst.shape[1] == 1:
+                static_lst = static_lst.squeeze(1) # -> (B, C_lst, H_orig, W_orig)
+            elif static_lst.ndim != 4:
+                # If it's already 4D or some other unexpected shape, raise error
+                 raise ValueError(f"static_lst has unexpected shape {static_lst.shape} after potentially squeezing time dim. Expected 4D (B, C, H, W).")
 
         # 1. Encode Clay Features Dynamically
-        with torch.no_grad(): # Keep backbone frozen
+        with torch.no_grad(): # Assume backbone frozen for CNN version
             clay_features = self.clay_backbone(cloudless_mosaic, norm_time_tensor, norm_latlon_tensor)
         B, _, H_feat, W_feat = clay_features.shape
         projected_clay = self.proj(clay_features) # (B, proj_ch, H', W')
 
         # 2. Resize Weather and LST (if used) to match Clay feature map size (H', W')
         weather_resized = F.interpolate(weather, size=(H_feat, W_feat), mode='bilinear', align_corners=False)
-        # time_emb_resized = F.interpolate(time_emb, size=(H_feat, W_feat), mode='bilinear', align_corners=False) # Removed
 
         # Prepare list for concatenation
-        combined_features_list = [projected_clay, weather_resized] # Start with dynamic clay + weather
+        combined_features_list = [projected_clay, weather_resized]
 
         if self.use_lst:
-            # Resize LST to match Clay feature map size (H', W')
-            static_lst_resized = F.interpolate(static_lst, size=(H_feat, W_feat), mode='bilinear', align_corners=False)
-            # Insert LST after projected Clay (or append, order might matter slightly)
-            combined_features_list.insert(1, static_lst_resized) 
+             # static_lst should now be 4D (B, C_lst, H_orig, W_orig)
+             if static_lst.ndim != 4:
+                  # This check should ideally not be needed if squeeze above worked
+                  raise ValueError(f"static_lst has unexpected number of dimensions ({static_lst.ndim}) before interpolation. Expected 4.")
+             
+             # Resize LST to match Clay feature map size (H', W')
+             static_lst_resized = F.interpolate(static_lst, size=(H_feat, W_feat), mode='bilinear', align_corners=False)
+             # Insert LST after projected Clay
+             combined_features_list.insert(1, static_lst_resized)
 
         # 3. Concatenate all features
         combined_features = torch.cat(combined_features_list, dim=1)
@@ -611,12 +710,19 @@ class UHINetCNN(nn.Module):
         # 4. Pass through CNN Core
         cnn_output = self.cnn_core(combined_features)
 
+        # --- Apply Final BatchNorm --- 
+        cnn_output = self.final_bn(cnn_output)
+        # -----------------------------
+
+        # --- Apply Dropout (after BN, before Regressor) --- 
+        if self.cnn_dropout > 0.0 and self.training:
+             cnn_output = F.dropout(cnn_output, p=self.cnn_dropout, training=self.training)
+        # ---------------------------------------------------
+
         # 5. Prediction Head
         prediction = self.regressor(cnn_output) # (B, 1, H', W')
 
         # 6. Resize prediction back to the original target size
         prediction_resized = F.interpolate(prediction, size=target_h_w, mode='bilinear', align_corners=False)
 
-        # Return final prediction
-        # Shape: (B, 1, H_orig, W_orig)
         return prediction_resized
