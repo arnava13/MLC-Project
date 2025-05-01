@@ -192,6 +192,11 @@ Goal for Tuesday the 15th:
       measured. This allows us to mantain a consistent output shape. (Needs modification to the model.)
     - Try to use the model to predict the UHI data for NYC.
 
+- Create a presentation video and slides for the project.
+
+## April 29 2025:
+- New deep learning based model acheives positive R2 scores on the UHI data
+
 ## April 30 2025:
 src/uhi-pipeline
 - Collected and prepared UHI dataset (`uhi.csv`) with latitude, longitude, datetime, and UHI Index
