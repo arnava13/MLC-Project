@@ -225,3 +225,6 @@ src/uhi-pipeline
 - Performed feature importance analysis:
   - Random Forest and XGBoost feature importance
   - SHAP analysis for both Random Forest and XGBoost models
+
+- Next steps:
+  - add band features to the model (not the ND indices)
