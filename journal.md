@@ -191,3 +191,40 @@ Goal for Tuesday the 15th:
     - For the losses we want to mask away losses for missing values and for gridcells that were not
       measured. This allows us to mantain a consistent output shape. (Needs modification to the model.)
     - Try to use the model to predict the UHI data for NYC.
+
+- Create a presentation video and slides for the project.
+
+## April 29 2025:
+- New deep learning based model acheives positive R2 scores on the UHI data
+
+## April 30 2025:
+src/uhi-pipeline
+- Collected and prepared UHI dataset (`uhi.csv`) with latitude, longitude, datetime, and UHI Index
+
+- Extracted environmental features:
+  - NDVI, NDWI, NDBI from Sentinel-2 satellite imagery
+  - LST (Land Surface Temperature) from Landsat-8 imagery
+
+- Integrated weather data (`manhattan_weather.csv`, `bronx_weather.csv`):
+  - Merged Bronx and Manhattan Mesonet station data using inverse distance weighting (IDW)
+  - Included air temperature, relative humidity, wind speed, wind direction (as sin/cos), and solar flux
+
+- Incorporated urban form features (`Building_Footprint.kml`):
+  - Computed building footprint metrics (building count, total area) within 100m buffer around each UHI point using KML data
+
+- Built predictive models:
+  - Random Forest
+  - XGBoost
+  - MLP (Multi-Layer Perceptron) with increasing complexity
+
+- Evaluated model performance:
+  - Random Forest achieved R² ≈ 0.95
+  - XGBoost achieved R² ≈ 0.92
+  - MLP improved from R² ≈ -0.67 to ≈ 0.62 with deeper networks
+
+- Performed feature importance analysis:
+  - Random Forest and XGBoost feature importance
+  - SHAP analysis for both Random Forest and XGBoost models
+
+- Next steps:
+  - add band features to the model (not the ND indices)
