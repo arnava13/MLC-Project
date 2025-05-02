@@ -10,12 +10,15 @@ import json
 import logging
 from tqdm import tqdm
 from datetime import datetime, timedelta
+import rasterio
+from rasterio.warp import calculate_default_transform, reproject, Resampling
+# ---------------------------------------- #
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 class CityDataSet(Dataset):
     """
-    PyTorch Dataset for UHI modeling using locally stored data.
+    Dataset for UHI modeling using locally stored data.
     Loads a cloudless mosaic & optionally a single LST median for static features,
     plus dynamic weather/time data from specific weather stations. 
     Returns a dictionary for the model.
@@ -28,7 +31,13 @@ class CityDataSet(Dataset):
                  cloudless_mosaic_path: str,
                  data_dir: str, city_name: str,
                  include_lst: bool = True,
-                 single_lst_median_path: str = None): # Added path for single LST
+                 single_lst_median_path: str = None,
+                 # --- NEW: DEM/DSM Paths ---
+                 dem_path: str = None,
+                 dsm_path: str = None,
+                 target_crs: str = "EPSG:4326" # Default target CRS
+                 # -------------------------
+                 ):
         """
         Initialize the dataset.
 
@@ -45,6 +54,9 @@ class CityDataSet(Dataset):
             include_lst: Whether to include Land Surface Temperature data.
             single_lst_median_path (str, optional): Path to a pre-generated single LST median .npy file.
                                                     If provided, ignores averaging_window and dynamic loading.
+            dem_path (str, optional): Path to the DEM GeoTIFF file.
+            dsm_path (str, optional): Path to the DSM GeoTIFF file.
+            target_crs (str): The target Coordinate Reference System (e.g., 'EPSG:4326') for resampling.
         """
         # --- Basic Parameters ---
         assert bounds and len(bounds) == 4, "Bounds [min_lon, min_lat, max_lon, max_lat] must be provided."
@@ -94,6 +106,9 @@ class CityDataSet(Dataset):
         self.uhi_data[timestamp_col_name] = all_timestamps # Update column in dataframe to be tz-aware
 
         self.sat_H, self.sat_W = self._determine_target_grid_size()
+        # Store target transform and CRS based on grid size and bounds
+        self.target_transform = rasterio.transform.from_bounds(*self.bounds, self.sat_W, self.sat_H)
+        self.target_crs = rasterio.crs.CRS.from_string(target_crs)
 
         # --- Load Single Static LST Median (if specified and included) ---
         self.single_lst_median = None
@@ -128,7 +143,14 @@ class CityDataSet(Dataset):
 
         if not self.include_lst:
              # Ensure placeholder logic works if LST is disabled
-             self.single_lst_median = np.zeros((1, 1, self.sat_H, self.sat_W), dtype=np.float32)
+             self.single_lst_median = np.zeros((1, self.sat_H, self.sat_W), dtype=np.float32)
+
+        # --- NEW: Load, Reproject, Normalize DEM/DSM --- #
+        self.dem_grid = self._load_process_elevation_grid(dem_path, "DEM", min_val=-100, max_val=1000) # Example range
+        self.dsm_grid = self._load_process_elevation_grid(dsm_path, "DSM", min_val=-100, max_val=1200) # Example range
+        self.include_dem = self.dem_grid is not None
+        self.include_dsm = self.dsm_grid is not None
+        # --- END NEW --- #
 
         # --- Load Weather Station Data ---
         self.bronx_weather = pd.read_csv(bronx_weather_csv)
@@ -199,7 +221,56 @@ class CityDataSet(Dataset):
         self._precompute_uhi_grids()
         
         logging.info(f"Dataset initialized for {self.city_name} with {len(self)} unique timestamps. LST included: {self.include_lst}")
-        logging.info(f"Target grid size (H, W): ({self.sat_H}, {self.sat_W})")
+        logging.info(f"Target grid size (H, W): ({self.sat_H}, {self.sat_W}) CRS: {self.target_crs}")
+        logging.info(f"DEM included: {self.include_dem}")
+        logging.info(f"DSM included: {self.include_dsm}")
+
+    # --- ADDED Helper for DEM/DSM Processing --- #
+    def _load_process_elevation_grid(self, grid_path: str, grid_type: str, min_val: float, max_val: float) -> np.ndarray | None:
+        """Loads, reprojects, resamples, and normalizes DEM/DSM data."""
+        if not grid_path:
+            logging.info(f"{grid_type} path not provided, skipping.")
+            return None
+
+        grid_path_obj = Path(grid_path)
+        if not grid_path_obj.exists():
+            logging.warning(f"{grid_type} file not found at {grid_path}, skipping.")
+            return None
+
+        try:
+            logging.info(f"Loading and processing {grid_type} from {grid_path}")
+            with rasterio.open(grid_path_obj) as src:
+                # Calculate transform and dimensions for reprojection
+                transform, width, height = calculate_default_transform(
+                    src.crs, self.target_crs, src.width, src.height, *src.bounds)
+
+                # Create destination array
+                destination = np.zeros((self.sat_H, self.sat_W), dtype=np.float32)
+
+                reproject(
+                    source=rasterio.band(src, 1),
+                    destination=destination,
+                    src_transform=src.transform,
+                    src_crs=src.crs,
+                    dst_transform=self.target_transform, # Use target transform
+                    dst_crs=self.target_crs,
+                    resampling=Resampling.bilinear)
+
+                # Add channel dimension
+                destination = destination[np.newaxis, :, :]
+
+                # Normalize using provided min/max
+                norm_01 = (destination - min_val) / (max_val - min_val)
+                norm_neg1_pos1 = (norm_01 * 2.0) - 1.0
+                normalized_grid = np.clip(norm_neg1_pos1, -1.0, 1.0)
+
+                logging.info(f"Processed {grid_type} shape: {normalized_grid.shape}")
+                return normalized_grid.astype(np.float32)
+
+        except Exception as e:
+            logging.error(f"Error processing {grid_type} file {grid_path}: {e}")
+            return None
+    # --- END ADDED Helper --- #
 
     # --- ADDED Normalization Helpers for Clay Metadata ---
     def _normalize_clay_timestamp(self, date: pd.Timestamp) -> np.ndarray:
@@ -396,8 +467,8 @@ class CityDataSet(Dataset):
     def _build_weather_grid(self, timestamp):
         """
         Build a normalized weather grid using inverse distance weighted (IDW)
-        interpolation between the two stations. Wind direction is interpolated
-        then converted to sin/cos.
+        interpolation between the two stations. Wind direction sin/cos components
+        are interpolated directly.
 
         Args:
             timestamp: Target timestamp to get weather data for
@@ -451,26 +522,37 @@ class CityDataSet(Dataset):
             channel_idx = channel_map[var_name]
             weather_grid[channel_idx] = interpolated_norm_val
 
-        # Handle Wind Direction: Interpolate degrees, then convert to sin/cos
-        # Note: Interpolating angles directly can be problematic across 0/360 boundary.
-        # A more robust method might involve interpolating sin/cos components directly,
-        # but simple interpolation is used here as a starting point.
-        wd_bronx = bronx_raw['wind_direction']
-        wd_manhattan = manhattan_raw['wind_direction']
+        # --- MODIFIED: Handle Wind Direction ---
+        # Convert station angles to sin/cos first
+        wd_bronx_deg = bronx_raw['wind_direction']
+        wd_manhattan_deg = manhattan_raw['wind_direction']
 
-        # Simple angle interpolation (adjust for circular nature if needed, but IDW might suffice here)
-        # Example: Handle wrap-around (if one angle is near 0 and other near 360)
-        # This basic version doesn't explicitly handle wrap-around, assumes angles are close enough.
-        interpolated_wd_deg = (wd_bronx * norm_weight_bronx +
-                               wd_manhattan * norm_weight_manhattan)
+        wd_bronx_rad = np.deg2rad(wd_bronx_deg)
+        wd_manhattan_rad = np.deg2rad(wd_manhattan_deg)
 
-        # Convert interpolated angle to radians and then sin/cos
-        interpolated_wd_rad = np.deg2rad(interpolated_wd_deg)
-        weather_grid[3] = np.sin(interpolated_wd_rad) # Sin component
-        weather_grid[4] = np.cos(interpolated_wd_rad) # Cos component
+        sin_bronx = np.sin(wd_bronx_rad)
+        cos_bronx = np.cos(wd_bronx_rad)
+        sin_manhattan = np.sin(wd_manhattan_rad)
+        cos_manhattan = np.cos(wd_manhattan_rad)
+
+        # Interpolate sin and cos components using IDW weights
+        interpolated_sin = (sin_bronx * norm_weight_bronx +
+                            sin_manhattan * norm_weight_manhattan)
+        interpolated_cos = (cos_bronx * norm_weight_bronx +
+                            cos_manhattan * norm_weight_manhattan)
+
+        # Normalize the resulting vector [sin, cos] to ensure unit length
+        length = np.sqrt(interpolated_sin**2 + interpolated_cos**2 + epsilon) # Add epsilon for stability
+        norm_interpolated_sin = interpolated_sin / length
+        norm_interpolated_cos = interpolated_cos / length
+
+        # Assign to grid channels
+        weather_grid[3] = norm_interpolated_sin # Sin component (channel 3)
+        weather_grid[4] = norm_interpolated_cos # Cos component (channel 4)
+        # --- END MODIFICATION ---
 
         return weather_grid
-
+    
     def _get_time_embedding(self, timestamp: pd.Timestamp) -> np.ndarray:
         """Computes sin/cos embeddings for minute of day."""
         total_minutes = timestamp.hour * 60 + timestamp.minute
@@ -547,27 +629,44 @@ class CityDataSet(Dataset):
         lst_tensor = self.single_lst_median if self.include_lst else np.zeros((1, self.sat_H, self.sat_W), dtype=np.float32)
         # Ensure lst_tensor is (1, H, W)
         if self.include_lst:
+            # --- Adjusted LST shape check and handling ---
             if lst_tensor.ndim == 4 and lst_tensor.shape[0] == 1 and lst_tensor.shape[1] == 1:
-                 lst_tensor = lst_tensor.squeeze(0) # Handle (1, 1, H, W) -> (1, H, W)
+                lst_tensor = lst_tensor.squeeze(0) # Handle (1, 1, H, W) -> (1, H, W)
+            elif lst_tensor.ndim == 2:
+                 lst_tensor = lst_tensor[np.newaxis, :, :] # Handle (H, W) -> (1, H, W)
             elif lst_tensor.ndim != 3 or lst_tensor.shape[0] != 1:
-                 logging.warning(f"Unexpected LST tensor shape {lst_tensor.shape} when LST is included. Using zeros.")
-                 lst_tensor = np.zeros((1, self.sat_H, self.sat_W), dtype=np.float32)
+                logging.warning(f"Unexpected LST tensor shape {lst_tensor.shape if lst_tensor is not None else 'None'} when LST is included. Using zeros.")
+                lst_tensor = np.zeros((1, self.sat_H, self.sat_W), dtype=np.float32)
+            # --- End Adjustments ---
 
         # Restore sequence dimension T=1 for weather, time, lst
         weather_seq = weather_grid[np.newaxis, ...]       # Shape (1, C_weather, H, W)
         time_map_seq = time_embedding[np.newaxis, ...]        # Shape (1, C_time, H, W)
         lst_seq = lst_tensor[np.newaxis, ...]             # Shape (1, 1, H, W)
 
-        return {
+        # --- Get Static DEM/DSM --- #
+        dem_tensor = self.dem_grid if self.include_dem else np.zeros((1, self.sat_H, self.sat_W), dtype=np.float32)
+        dsm_tensor = self.dsm_grid if self.include_dsm else np.zeros((1, self.sat_H, self.sat_W), dtype=np.float32)
+        # --- END NEW --- #
+
+        sample = {
             # Static/Input Features
             "cloudless_mosaic": cloudless_mosaic,           # Shape (C_static, H, W)
-            "norm_latlon": norm_latlon_tensor.astype(np.float32), # Shape (2, H, W) - ADDED (Static Grid)
+            "norm_latlon": norm_latlon_tensor.astype(np.float32), # Shape (4,) - Vector now
             # Dynamic Features (Sequence Length T=1)
             "weather_seq": weather_seq.astype(np.float32),  # Shape (1, C_weather, H, W)
             "time_emb_seq": time_map_seq.astype(np.float32),# Shape (1, C_time, H, W)
-            "lst_seq": lst_seq.astype(np.float32),          # Shape (1, 1, H, W) - Channel dim might be squeezed later if needed
-            "norm_time": norm_time_vector.astype(np.float32), # Shape (4,) - ADDED (Dynamic Vector per Timestamp)
+            "lst_seq": lst_seq.astype(np.float32),          # Shape (1, 1, H, W)
+            "norm_time": norm_time_vector.astype(np.float32), # Shape (4,) - Vector per Timestamp
             # Target and Mask
             "target": target.astype(np.float32),            # Shape (H, W)
             "mask": mask.astype(np.float32),                # Shape (H, W)
         }
+        # --- NEW: Add DEM/DSM conditionally --- #
+        if self.include_dem:
+            sample["dem"] = dem_tensor.astype(np.float32) # Shape (1, H, W)
+        if self.include_dsm:
+            sample["dsm"] = dsm_tensor.astype(np.float32) # Shape (1, H, W)
+        # --- END NEW --- #
+
+        return sample

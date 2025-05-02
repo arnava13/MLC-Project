@@ -1,6 +1,2 @@
-<<<<<<< HEAD
-*.DS_Store
-=======
 *.DS_Store
 ./outputs/*
->>>>>>> 2bb80be (debug + add simpler model)

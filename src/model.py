@@ -24,7 +24,7 @@ class ClayFeatureExtractor(nn.Module):
     Loads a pre-trained Clay model from a local checkpoint and extracts features.
     Uses the encoder part of the model to get embeddings from a Sentinel-2 mosaic.
     Returns spatial patch embeddings.
-    Backbone can optionally be frozen.
+    If freeze_backbone is False, only the final linear layer of the encoder is unfrozen.
     """
 
     def __init__(self, checkpoint_path: str, metadata_path: str, model_size: str = "large", bands: list = ["blue", "green", "red", "nir"], platform: str = "sentinel-2-l2a", gsd: int = 10, freeze_backbone: bool = True):
@@ -38,7 +38,8 @@ class ClayFeatureExtractor(nn.Module):
             bands: List of band names in the input mosaic, matching metadata.yaml.
             platform: Platform name corresponding to the metadata (e.g., "sentinel-2-l2a").
             gsd: Ground sample distance of the input mosaic in meters.
-            freeze_backbone (bool): If True, freezes the Clay backbone weights during training.
+            freeze_backbone (bool): If True, freezes the Clay backbone weights except for the final encoder layer.
+                                    If False, only the final encoder layer is trainable.
         """
         super().__init__()
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -48,7 +49,8 @@ class ClayFeatureExtractor(nn.Module):
         self.bands = bands
         self.platform = platform
         self.gsd = gsd
-        self.freeze_backbone = freeze_backbone
+        # Store the flag, but apply freezing logic below
+        # self.freeze_backbone = freeze_backbone # Original line removed
 
         if not self.checkpoint_path.exists():
             raise FileNotFoundError(f"Clay checkpoint not found at {self.checkpoint_path}")
@@ -103,18 +105,42 @@ class ClayFeatureExtractor(nn.Module):
             print(f"Warning: Unexpected keys in state_dict (relative to self.model.model): {unexpected_keys}")
 
         self.model.to(self.device) # Move model to target device
+        # Set to eval mode initially. Will be set to train mode later if needed.
         self.model.eval()
         # ----------------------------------------
 
-        # --- Freeze Backbone --- 
-        if self.freeze_backbone:
-            for param in self.model.parameters():
-                param.requires_grad = False
-            logging.info("Clay backbone frozen.")
-            self.model.eval() # Ensure model is in eval mode if frozen
+        # --- MODIFIED Freezing Logic ---
+        # Freeze all parameters initially
+        for param in self.model.parameters():
+            param.requires_grad = False
+
+        # Identify the final projection layer within ClayMAE
+        final_encoder_layer = None
+        # Check for self.model.model.proj based on architecture printout
+        if hasattr(self.model.model, 'proj') and isinstance(self.model.model.proj, nn.Linear):
+             final_encoder_layer = self.model.model.proj
+             logging.info("Identified final encoder layer as self.model.model.proj")
+        # Removed previous checks for encoder.fc and encoder.head
+        # elif hasattr(self.model.model, 'encoder') and hasattr(self.model.model.encoder, 'fc'):
+        #     final_encoder_layer = self.model.model.encoder.fc
+        #     logging.info("Identified final encoder layer as self.model.model.encoder.fc")
         else:
-            logging.info("Clay backbone NOT frozen (trainable).")
-            self.model.train() # Set to train mode if not frozen
+             logging.warning("Could not automatically identify final encoder layer ('self.model.model.proj'). Check Clay model structure.")
+             
+
+        if not freeze_backbone:
+            if final_encoder_layer is not None:
+                logging.info("Unfreezing the final encoder layer (self.model.model.proj) of the Clay backbone.")
+                for param in final_encoder_layer.parameters():
+                    param.requires_grad = True
+                self.model.train() # Set model to train mode if part of it is unfrozen
+            else:
+                 logging.warning("freeze_backbone is False, but could not identify final encoder layer (proj) to unfreeze.")
+                 self.model.eval() # Keep in eval if nothing was unfrozen
+        else:
+            logging.info("Keeping Clay backbone frozen.")
+            self.model.eval() # Ensure model is in eval mode if fully frozen
+        # --- END MODIFIED Freezing Logic ---
 
         # Get embed_dim and patch_size from hparams, inferring embed_dim from model_size
         # --- MODIFIED: Override patch_size based on observed error --- 
@@ -265,14 +291,12 @@ class ClayFeatureExtractor(nn.Module):
         pixels_unsqueezed = pixels_normalized.unsqueeze(1) # (B, 1, C, H_resized, W_resized)
 
         spatial_embeddings_list = []
-        # --- MODIFIED: Conditional torch.no_grad() ---
-        context_manager = torch.no_grad() if self.freeze_backbone else torch.enable_grad()
-        with context_manager:
-            # Set model mode based on freeze flag (eval if frozen, train if not)
-            # Note: model.eval() was already called in __init__, but good practice
-            # to ensure correct mode, especially if fine-tuning.
-            self.model.train(not self.freeze_backbone) 
-            
+        # --- MODIFIED: Use model's training state set in __init__ ---
+        # context_manager = torch.no_grad() if self.freeze_backbone else torch.enable_grad() # Original removed
+        # No context manager needed, rely on parameter requires_grad status and model mode
+        # Ensure model is in the correct mode (eval or train) set in __init__
+        # self.model.train(not self.freeze_backbone) # Explicitly set mode based on original flag
+        with torch.set_grad_enabled(self.model.training): # Use model's current training state
             for i in range(batch_size):
                  single_datacube = {
                       "platform": self.platform,
@@ -318,264 +342,188 @@ class ClayFeatureExtractor(nn.Module):
         return spatial_features
 
 # -----------------------------------------------------------------------------
-# 2. CONV GRU CELL ------------------------------------------------------------
+# 4. CNN HEADS ----------------------------------------------------------------
 # -----------------------------------------------------------------------------
 
-class ConvGRUCell(nn.Module):
-    """Single-layer ConvGRU with configurable kernel size.""" # Docstring improved
-
-    def __init__(self, in_ch: int, hid_ch: int, kernel_size: int = 3):
+# --- Added SimpleCNNHead back ---
+class SimpleCNNHead(nn.Module):
+    """Simple multi-layer CNN head with optional dropout."""
+    def __init__(self, in_channels, hidden_dims, kernel_size=3, dropout=0.0):
         super().__init__()
+        self.dropout = dropout
+        
+        cnn_layers = []
+        current_channels = in_channels
         padding = kernel_size // 2
-        self.conv_zr = nn.Conv2d(in_ch + hid_ch, 2 * hid_ch, kernel_size, padding=padding)
-        self.conv_h = nn.Conv2d(in_ch + hid_ch, hid_ch, kernel_size, padding=padding)
+        for i, hidden_dim in enumerate(hidden_dims):
+            cnn_layers.append(nn.Conv2d(current_channels, hidden_dim, kernel_size=kernel_size, padding=padding))
+            cnn_layers.append(nn.BatchNorm2d(hidden_dim))
+            cnn_layers.append(nn.ReLU(inplace=True))
+            current_channels = hidden_dim
+        self.cnn_core = nn.Sequential(*cnn_layers)
+        self.final_bn = nn.BatchNorm2d(current_channels)
+        self.regressor = nn.Conv2d(current_channels, 1, kernel_size=1)
 
-    def forward(self, x: torch.Tensor, h: torch.Tensor) -> torch.Tensor:
-        # x, h: (B, C, H, W) - Process single time step
-        combined = torch.cat([x, h], dim=1)
-        # Reset (r) and Update (z) gates
-        z, r = torch.chunk(torch.sigmoid(self.conv_zr(combined)), 2, dim=1)
-        # Candidate hidden state (h_tilde)
-        combined_r = torch.cat([x, r * h], dim=1) # Use reset gate `r`
-        h_tilde = torch.tanh(self.conv_h(combined_r))
-        # Final hidden state (h_next) using update gate `z`
-        h_next = (1 - z) * h + z * h_tilde
-        return h_next
+        # Log dimensions
+        logging.info(f"SimpleCNNHead initialized: Input Ch={in_channels}, Hidden Dims={hidden_dims}, Kernel={kernel_size}, Dropout={dropout}")
+        logging.info(f"  Output Dim (before final BN/Regressor): {current_channels}")
 
-# Removed UHINetConvGRU class
+    def forward(self, x):
+        x = self.cnn_core(x)
+        x = self.final_bn(x)
+        if self.dropout > 0.0 and self.training:
+            x = F.dropout(x, p=self.dropout, training=self.training)
+        x = self.regressor(x)
+        return x
 
-# -----------------------------------------------------------------------------
-# 3. MAIN UHI NET MODEL -------------------------------------------------------
-# -----------------------------------------------------------------------------
+# --- UNet Helper Blocks ---
+class UNetConvBlock(nn.Module):
+    """Helper: Conv(3x3, padding=1) -> BN -> ReLU -> Conv(3x3, padding=1) -> BN -> ReLU"""
+    def __init__(self, in_channels, out_channels):
+        super().__init__()
+        self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1)
+        self.bn1 = nn.BatchNorm2d(out_channels)
+        self.relu1 = nn.ReLU(inplace=True)
+        self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1)
+        self.bn2 = nn.BatchNorm2d(out_channels)
+        self.relu2 = nn.ReLU(inplace=True)
 
-class UHINetGRU(nn.Module):
+    def forward(self, x):
+        x = self.relu1(self.bn1(self.conv1(x)))
+        x = self.relu2(self.bn2(self.conv2(x)))
+        return x
+
+class UNetUpBlock(nn.Module):
+    """Helper: Upsample(ConvTranspose2d 2x2, stride=2) -> Concat -> UNetConvBlock"""
+    def __init__(self, in_channels, out_channels):
+        super().__init__()
+        # in_channels is channels from previous layer, out_channels is for the ConvBlock
+        # The actual input to ConvBlock will be in_channels//2 (from upsampling) + in_channels//2 (from skip connection) = in_channels
+        # The output from ConvBlock will be out_channels
+        self.up = nn.ConvTranspose2d(in_channels, in_channels // 2, kernel_size=2, stride=2)
+        self.conv = UNetConvBlock(in_channels, out_channels) # Takes combined channels
+
+    def forward(self, x1, x2):
+        """
+        x1: input from previous layer (to be upsampled)
+        x2: input from corresponding skip connection
+        """
+        x1 = self.up(x1)
+        # Input tensors to ConvTranspose2d must have the same spatial size.
+        # Pad x1 if necessary to match x2's spatial dimensions after upsampling
+        # Calculate difference: target_size - current_size
+        diffY = x2.size()[2] - x1.size()[2]
+        diffX = x2.size()[3] - x1.size()[3]
+
+        # Pad x1: (padding_left, padding_right, padding_top, padding_bottom)
+        x1 = F.pad(x1, [diffX // 2, diffX - diffX // 2,
+                        diffY // 2, diffY - diffY // 2])
+
+        x = torch.cat([x2, x1], dim=1) # Concatenate along channel dimension
+        return self.conv(x)
+
+class UNetStyleHead(nn.Module):
     """
-    Main UHI prediction model. Designed for single time step processing,
-    to be used within an external training loop that manages time steps and
-    hidden states. 
-    MODIFIED: Encodes Clay features dynamically at each step using time/latlon metadata.
-    Concatenates dynamic Clay, weather, and time embedding for GRU input.
+    U-Net style head with downsampling, upsampling, and skip connections.
+    Uses ConvTranspose2d for upsampling.
+    Takes combined Clay, weather, and optional LST features.
+    Depth is configurable.
+    """
+    def __init__(self, in_channels: int, base_channels: int = 64, depth: int = 4):
+        super().__init__()
+        if depth < 1:
+            raise ValueError("UNet depth must be at least 1")
+        self.depth = depth
+        features = base_channels
+
+        self.downs = nn.ModuleList()
+        self.ups = nn.ModuleList()
+
+        # Initial Convolution
+        self.inc = UNetConvBlock(in_channels, features)
+
+        # Downsampling Path
+        current_channels = features
+        for i in range(depth):
+            self.downs.append(
+                nn.Sequential(
+                    nn.MaxPool2d(2),
+                    UNetConvBlock(current_channels, current_channels * 2)
+                )
+            )
+            current_channels *= 2
+        # Bottleneck is implicitly the last downsampling block's output
+        self.bottleneck_channels = current_channels
+
+        # Upsampling Path
+        # Starts from bottleneck channels, goes up to base_channels
+        for i in range(depth):
+            # Input to UpBlock: current_channels (from below), Output: current_channels // 2
+            # Skip connection comes from layer with current_channels // 2
+            self.ups.append(
+                UNetUpBlock(current_channels, current_channels // 2)
+            )
+            current_channels //= 2
+
+        # Final 1x1 convolution
+        self.outc = nn.Conv2d(features, 1, kernel_size=1)
+
+        logging.info(f"UNetStyleHead initialized: Input Ch={in_channels}, Base Ch={base_channels}, Depth={depth}")
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass for the U-Net head.
+
+        Args:
+            x (torch.Tensor): Combined projected input features
+                              (ProjClay+Weather[+LST])
+                              Shape (B, C_in, H_feat, W_feat)
+
+        Returns:
+            torch.Tensor: Predicted UHI map at feature resolution (B, 1, H_out, W_out)
+        """
+        # --- Encoder ---
+        skip_connections = []
+        out = self.inc(x) # Initial Block -> base_channels
+        skip_connections.append(out)
+
+        for i in range(self.depth):
+            out = self.downs[i](out)
+            if i < self.depth - 1: # Don't store bottleneck output as skip
+                skip_connections.append(out)
+
+        # Bottleneck output is `out` after the loop
+
+        # --- Decoder ---
+        # Iterate through upsampling blocks and corresponding skip connections in reverse
+        for i in range(self.depth):
+            skip = skip_connections.pop() # Get corresponding skip connection
+            out = self.ups[i](out, skip)
+
+        # --- Final Output ---
+        logits = self.outc(out) # (B, 1, H_up, W_up)
+
+        # Output is at the resolution determined by U-Net structure
+        return logits
+
+# -----------------------------------------------------------------------------
+# 5. CNN-BASED UHI NET MODEL (USED BY NOTEBOOK) ----------------------------
+# -----------------------------------------------------------------------------
+
+class UHINetCNN(nn.Module):
+    """
+    Feedforward CNN UHI prediction model using a U-Net style head.
+    Uses dynamic Clay features, static LST (optional), and dynamic weather.
+    Upsampling is handled by the UNetStyleHead using ConvTranspose2d.
     """
     def __init__(self,
                  # Clay args
                  clay_checkpoint_path: str,
                  clay_metadata_path: str,
-                 # Weather args
-                 weather_channels: int, # Num channels in weather_seq input
-                 # Time embedding args (minute-based for GRU)
-                 time_embed_dim: int = 2,
-                 # --- Args with defaults ---
-                 proj_ch: int = 32, # Channels after projecting Clay features
-                 clay_model_size: str = "large",
-                 clay_bands: list = ["blue", "green", "red", "nir"], # Bands for Clay input mosaic
-                 clay_platform: str = "sentinel-2-l2a",
-                 clay_gsd: int = 10,
-                 # LST args - LST is treated as static, projected once
-                 lst_channels: int = 1, # Num channels in static LST map
-                 use_lst: bool = True,
-                 # ConvGRU args
-                 gru_hidden_dim: int = 64, # Hidden dimension for ConvGRU cell
-                 gru_kernel_size: int = 3,
-                 freeze_backbone: bool = True,
-    ):
-        super().__init__()
-        self.use_lst = use_lst
-        self.proj_ch = proj_ch
-        self.gru_hidden_dim = gru_hidden_dim
-        self.weather_channels = weather_channels
-        self.time_embed_dim = time_embed_dim # Minute-based embedding
-        self.lst_channels = lst_channels
-
-        # --- Clay Feature Extraction (Initialized but used dynamically) ---
-        self.clay_backbone = ClayFeatureExtractor(
-            checkpoint_path=clay_checkpoint_path,
-            metadata_path=clay_metadata_path,
-            model_size=clay_model_size,
-            bands=clay_bands,
-            platform=clay_platform,
-            gsd=clay_gsd,
-            freeze_backbone=freeze_backbone
-        )
-
-        clay_embed_dim = self.clay_backbone.embed_dim
-        self.proj = nn.Conv2d(clay_embed_dim, self.proj_ch, kernel_size=1)
-
-        # --- LST Projection (if used) ---
-        # Project LST separately if used, as it's static within a sequence
-        self.proj_lst = None
-        if self.use_lst:
-            # Project LST to match proj_ch for easier concatenation later if needed,
-            # or handle channel addition differently. Let's project it.
-            # We might need a different projection size if we concatenate it differently.
-            # For simplicity, let's assume LST is handled before GRU or added separately.
-            # MODIFYING: LST will be handled OUTSIDE the step, pre-projected.
-            self.proj_lst = nn.Conv2d(self.lst_channels, self.proj_ch, kernel_size=1) # Example projection
-
-        # --- MODIFIED: Calculate GRU Input Channels ---
-        # Dynamic Clay (projected) + Weather + Time Embedding (minute-based)
-        # If LST is used, it's added separately in the step method after projection
-        gru_in_ch = self.proj_ch + self.weather_channels + self.time_embed_dim
-        if self.use_lst:
-             # We will concatenate the projected LST within the step method
-             gru_in_ch += self.proj_ch # Add channels for projected LST
-
-
-        # --- Recurrent Core ---
-        self.gru = ConvGRUCell(in_ch=gru_in_ch, hid_ch=self.gru_hidden_dim, kernel_size=gru_kernel_size)
-
-        # --- Prediction Head ---
-        self.regressor = nn.Conv2d(self.gru_hidden_dim, 1, kernel_size=1)
-
-        logging.info(f"UHINet initialized (Dynamic Clay features per step):")
-        logging.info(f"  Clay Embed Dim: {clay_embed_dim} -> Proj Dim: {self.proj_ch}")
-        logging.info(f"  Use LST: {self.use_lst} (Channels: {self.lst_channels if self.use_lst else 0}) - LST processed statically.")
-        # Removed Static/Dynamic log lines as Clay is now dynamic
-        logging.info(f"  GRU Input Dim (Proj Dynamic Clay [+ Proj LST] + Weather + TimeEmb): {gru_in_ch}")
-        logging.info(f"  GRU Hidden Dim: {self.gru_hidden_dim}")
-
-
-    # --- REMOVED encode_and_project_static method ---
-    # def encode_and_project_static(self, ...)
-
-    # +++ ADDED encode_and_project_lst_static +++
-    def encode_and_project_lst_static(self, static_lst: Optional[torch.Tensor], target_feat_h_w: Tuple[int, int]) -> Optional[torch.Tensor]:
-        """
-        Projects static LST map to match feature map size.
-        Should be called once before the time loop if LST is used.
-
-        Args:
-            static_lst (torch.Tensor, optional): Static LST map (B, 1, C_lst, H, W).
-                                                Provide only if self.use_lst is True.
-            target_feat_h_w (Tuple[int, int]): Target spatial dimensions (H', W') from Clay features.
-
-        Returns:
-            torch.Tensor or None: Projected static LST features (B, proj_ch, H', W') or None.
-        """
-        if not self.use_lst or static_lst is None or self.proj_lst is None:
-            return None
-
-        # Squeeze time dimension (T=1)
-        static_lst = static_lst.squeeze(1) # (B, C_lst, H, W)
-
-        # Resize LST to match Clay feature map size (H', W')
-        if static_lst.shape[2:] != target_feat_h_w:
-             static_lst_resized = F.interpolate(static_lst, size=target_feat_h_w, mode='bilinear', align_corners=False)
-        else:
-             static_lst_resized = static_lst
-
-        # Project LST features -> (B, proj_ch, H', W')
-        projected_lst = self.proj_lst(static_lst_resized)
-        return projected_lst
-
-    # --- REVISED step method ---
-    def step(self, 
-             sentinel_mosaic: torch.Tensor, # Static mosaic input (B, C, H, W)
-             norm_time_tensor: torch.Tensor, # Dynamic normalized time for Clay (B, 4)
-             norm_latlon_tensor: torch.Tensor, # Dynamic normalized lat/lon for Clay (B, 4)
-             weather_t: torch.Tensor,       # Weather for current step t (B, C_weather, H, W)
-             time_emb_t: torch.Tensor,      # Minute-based time emb for step t (B, C_time, H, W)
-             h_prev: torch.Tensor,           # Previous hidden state (B, gru_hidden_dim, H', W')
-             projected_lst_static: Optional[torch.Tensor] = None # Pre-projected static LST (B, proj_ch, H', W')
-            ) -> torch.Tensor:
-        """
-        Performs a single ConvGRU step with dynamic Clay feature extraction.
-
-        Args:
-            sentinel_mosaic: The static cloudless mosaic.
-            norm_time_tensor: Normalized time metadata for the current step t.
-            norm_latlon_tensor: Normalized lat/lon metadata (usually fixed for sequence).
-            weather_t: Weather data for the current step t.
-            time_emb_t: Minute-based time embedding for the current step t.
-            h_prev: Hidden state from the previous time step t-1.
-            projected_lst_static: Optional pre-projected static LST features.
-
-        Returns:
-            torch.Tensor: Updated hidden state h_t (B, gru_hidden_dim, H', W').
-        """
-        
-        # 1. Extract Dynamic Clay features using current step's metadata
-        # Warning: This is computationally expensive!
-        with torch.no_grad(): # Keep backbone frozen
-            clay_features_t = self.clay_backbone(sentinel_mosaic, norm_time_tensor, norm_latlon_tensor)
-        B, D_clay, H_feat, W_feat = clay_features_t.shape
-
-        # 2. Project Dynamic Clay features
-        projected_clay_t = self.proj(clay_features_t) # (B, proj_ch, H', W')
-        
-        # 3. Check hidden state dimensions
-        if h_prev.shape[2:] != (H_feat, W_feat):
-             raise ValueError(f"Spatial dimensions of h_prev ({h_prev.shape[2:]}) must match Clay features ({H_feat, W_feat})")
-
-        # 4. Resize weather and time_emb to match Clay feature map size (H', W')
-        if weather_t.shape[2:] != (H_feat, W_feat):
-            weather_t_resized = F.interpolate(weather_t, size=(H_feat, W_feat), mode='bilinear', align_corners=False)
-        else:
-            weather_t_resized = weather_t
-        
-        if time_emb_t.shape[2:] != (H_feat, W_feat):
-            time_emb_t_resized = F.interpolate(time_emb_t, size=(H_feat, W_feat), mode='bilinear', align_corners=False)
-        else:
-            time_emb_t_resized = time_emb_t
-            
-        # 5. Concatenate features for GRU input
-        # Input: Projected Dynamic Clay, Resized Weather, Resized TimeEmb
-        gru_input_list = [projected_clay_t, weather_t_resized, time_emb_t_resized]
-        
-        # --- MODIFIED: Add static projected LST if available --- 
-        if self.use_lst and projected_lst_static is not None:
-           # Ensure LST features have the same spatial dimensions
-           if projected_lst_static.shape[2:] == projected_clay_t.shape[2:]:
-                # Concatenate along the channel dimension (dim=1)
-                # Insert after projected Clay, before weather/time for logical grouping
-                gru_input_list.insert(1, projected_lst_static) 
-           else:
-               # This should ideally not happen if target_feat_h_w was used correctly
-               logging.warning(f"Projected LST static features dimensions mismatch ({projected_lst_static.shape[2:]} vs {projected_clay_t.shape[2:]}), skipping concatenation.")
-        # --- END MODIFIED --- 
-                
-        x_t_combined = torch.cat(gru_input_list, dim=1)
-
-        # 6. Perform GRU step
-        h_next = self.gru(x_t_combined, h_prev)
-        return h_next
-
-    def predict(self, h_final: torch.Tensor) -> torch.Tensor:
-        """
-        Applies the final regression head to the last hidden state.
-
-        Args:
-            h_final (torch.Tensor): The final hidden state after processing all time steps.
-                                    Shape: (B, gru_hidden_dim, H', W').
-
-        Returns:
-            torch.Tensor: Predicted UHI map (B, 1, H', W').
-        """
-        pred = self.regressor(h_final)
-        # Output shape: (B, 1, H', W') - Squeeze channel dim later if needed
-        return pred
-
-
-# Removed WeatherFeatureProcessor dummy class
-
-# -----------------------------------------------------------------------------
-# 4. SIMPLE CNN UHI NET MODEL (FOR DEBUGGING) -------------------------------
-# -----------------------------------------------------------------------------
-
-class UHINetCNN(nn.Module):
-    """
-    Simpler feedforward CNN UHI prediction model for debugging.
-    MODIFIED: Encodes Clay features dynamically using time/latlon metadata.
-    Combines dynamic Clay, static LST (optional), and dynamic weather features,
-    then passes them through a CNN.
-    """
-    def __init__(self,
-                 # Clay args (same as UHINet)
-                 clay_checkpoint_path: str,
-                 clay_metadata_path: str,
                  weather_channels: int,
                  freeze_backbone: bool = True,
                  # --- Args with defaults ---
-                 proj_ch: int = 32, # Channels after projecting Clay features
+                 proj_ch: int = 32, # RESTORED - Channels after projecting Clay features (for SimpleCNNHead)
                  clay_model_size: str = "large",
                  clay_bands: list = ["blue", "green", "red", "nir"],
                  clay_platform: str = "sentinel-2-l2a",
@@ -583,19 +531,24 @@ class UHINetCNN(nn.Module):
                  # LST args
                  lst_channels: int = 1,
                  use_lst: bool = True,
-                 # CNN specific args
-                 cnn_hidden_dims: List[int] = [64, 32], # Hidden dimensions for CNN layers
+                 # --- Head Selection & Args ---
+                 head_type: str = 'unet', # 'unet' or 'simple_cnn'
+                 # SimpleCNN Head Args
+                 cnn_hidden_dims: List[int] = [64, 32],
                  cnn_kernel_size: int = 3,
-                 cnn_dropout: float = 0.0 # Add dropout parameter
+                 cnn_dropout: float = 0.0,
+                 # UNet Head Args
+                 unet_base_channels: int = 64, # Base channels for U-Net Head
+                 unet_depth: int = 4           # Depth of the U-Net
     ):
         super().__init__()
         self.use_lst = use_lst
-        self.proj_ch = proj_ch
+        self.proj_ch = proj_ch # Restored for SimpleCNNHead
         self.weather_channels = weather_channels
         self.lst_channels = lst_channels
-        self.cnn_dropout = cnn_dropout # Store dropout rate
+        self.head_type = head_type
 
-        # --- Dynamic Clay Feature Extraction (Same as UHINet) ---
+        # --- Dynamic Clay Feature Extraction (No projection layer here) ---
         self.clay_backbone = ClayFeatureExtractor(
             checkpoint_path=clay_checkpoint_path,
             metadata_path=clay_metadata_path,
@@ -603,54 +556,67 @@ class UHINetCNN(nn.Module):
             bands=clay_bands,
             platform=clay_platform,
             gsd=clay_gsd,
-            freeze_backbone=freeze_backbone
+            freeze_backbone=freeze_backbone # Pass flag here
         )
 
         clay_embed_dim = self.clay_backbone.embed_dim
+        # --- RESTORED: Projection layer (used by *both* head types now) ---
         self.proj = nn.Conv2d(clay_embed_dim, self.proj_ch, kernel_size=1)
 
-        # --- Calculate CNN Input Channels ---
-        cnn_in_ch = self.proj_ch + self.weather_channels
+        # --- Instantiate Selected Head ---
+        # Calculate Head Input Channels: Projected Clay + Weather [+ LST]
+        head_in_ch = self.proj_ch + self.weather_channels
         if self.use_lst:
-            cnn_in_ch += self.lst_channels
+            head_in_ch += self.lst_channels
         
-        # --- CNN Core (Dynamically creates layers with BatchNorm) --- 
-        cnn_layers = []
-        current_channels = cnn_in_ch
-        padding = cnn_kernel_size // 2
-        for i, hidden_dim in enumerate(cnn_hidden_dims):
-            cnn_layers.append(nn.Conv2d(current_channels, hidden_dim, kernel_size=cnn_kernel_size, padding=padding))
-            # Add BatchNorm after Conv2d
-            cnn_layers.append(nn.BatchNorm2d(hidden_dim))
-            cnn_layers.append(nn.ReLU(inplace=True))
-            # Dropout is applied *after* the core, before the regressor
-            current_channels = hidden_dim
-        self.cnn_core = nn.Sequential(*cnn_layers)
+        if self.head_type == 'unet':
+            self.head = UNetStyleHead(
+                in_channels=head_in_ch, # Takes projected features now
+                base_channels=unet_base_channels,
+                depth=unet_depth # Pass depth
+            )
+            logging.info(f"UHINetCNN initialized (Feedforward with UNetStyleHead):")
+            logging.info(f"  Clay Backbone Frozen (except maybe last layer): {freeze_backbone}")
+            logging.info(f"  Clay Embed Dim: {clay_embed_dim} -> Proj Dim: {self.proj_ch}")
+            logging.info(f"  Use LST: {self.use_lst} (Channels: {self.lst_channels if self.use_lst else 0})")
+            logging.info(f"  Weather Channels: {self.weather_channels}")
+            logging.info(f"  UNet Head Input Channels (ProjClay+Weather[+LST]): {head_in_ch}")
+            logging.info(f"  UNet Head Base Channels: {unet_base_channels}")
+            logging.info(f"  UNet Head Depth: {unet_depth}")
 
-        # --- Add BatchNorm before the final regressor --- 
-        self.final_bn = nn.BatchNorm2d(current_channels)
-        # -------------------------------------------------
-
-        # --- Prediction Head --- 
-        self.regressor = nn.Conv2d(current_channels, 1, kernel_size=1)
-
-        logging.info(f"UHINetCNN initialized (Feedforward CNN with Dynamic Clay):")
+        elif self.head_type == 'simple_cnn':
+            self.head = SimpleCNNHead(
+                in_channels=head_in_ch,
+                hidden_dims=cnn_hidden_dims,
+                kernel_size=cnn_kernel_size,
+                dropout=cnn_dropout
+            )
+            # Logging info for SimpleCNNHead is done within its __init__
+            logging.info(f"UHINetCNN initialized (Feedforward with SimpleCNNHead):")
+        logging.info(f"  Clay Backbone Frozen (except maybe last layer): {freeze_backbone}")
         logging.info(f"  Clay Embed Dim: {clay_embed_dim} -> Proj Dim: {self.proj_ch}")
         logging.info(f"  Use LST: {self.use_lst} (Channels: {self.lst_channels if self.use_lst else 0})")
-        logging.info(f"  CNN Input Dim (Proj Dyn Clay [+ LST] + Weather): {cnn_in_ch}")
-        logging.info(f"  CNN Hidden Dims: {cnn_hidden_dims} (with BatchNorm)")
-        logging.info(f"  CNN Dropout Rate: {self.cnn_dropout}") # Log dropout
-        logging.info(f"  CNN Output Dim (Before Final BN/Regressor): {current_channels}")
+            logging.info(f"  Weather Channels: {self.weather_channels}")
+            logging.info(f"  SimpleCNN Head Input Channels (ProjClay+Weather[+LST]): {head_in_ch}")
+            # SimpleCNNHead logs its own details
 
-    # --- MODIFIED forward method ---
+        else:
+            raise ValueError(f"Unknown head_type: {self.head_type}. Choose 'unet' or 'simple_cnn'.")
+
+        # Projection layer is always trainable as it feeds into the selected head.
+        for param in self.proj.parameters():
+            param.requires_grad = True
+        logging.info("  Projection layer (self.proj) set to trainable.")
+
     def forward(self, cloudless_mosaic: torch.Tensor,
-                norm_time_tensor: torch.Tensor,  # Added
-                norm_latlon_tensor: torch.Tensor, # Added
+                norm_time_tensor: torch.Tensor,
+                norm_latlon_tensor: torch.Tensor,
                 weather: torch.Tensor,
                 target_h_w: Tuple[int, int], 
                 static_lst: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
-        Performs a forward pass through the CNN model using dynamic Clay features.
+        Performs a forward pass through the CNN model using dynamic Clay features
+        and the UNetStyleHead.
 
         Args:
             cloudless_mosaic (torch.Tensor): Cloudless mosaic (B, C_clay, H_orig, W_orig).
@@ -662,7 +628,7 @@ class UHINetCNN(nn.Module):
                                                 Provide only if self.use_lst is True.
 
         Returns:
-            torch.Tensor: Predicted UHI map (B, 1, H_orig, W_orig).
+            torch.Tensor: Predicted UHI map at feature resolution (B, 1, H_out, W_out)
         """
         # 0. Input Checks and Preparation
         if self.use_lst and static_lst is None:
@@ -670,59 +636,63 @@ class UHINetCNN(nn.Module):
         if not self.use_lst and static_lst is not None:
             logging.warning("`static_lst` provided but `use_lst` is False. LST will be ignored.")
 
-        # Squeeze the time dimension (T=1) from dynamic inputs
-        weather = weather.squeeze(1) # (B, C_weather, H_orig, W_orig)
-        # Remove time dimension from static_lst as well if it's used
+        # Squeeze the time dimension (T=1) from dynamic inputs if present
+        if weather.ndim == 5 and weather.shape[1] == 1:
+            weather = weather.squeeze(1) # (B, C_weather, H_orig, W_orig)
+        elif weather.ndim != 4:
+            raise ValueError(f"Weather tensor has unexpected shape {weather.shape}. Expected 4D or 5D with T=1.")
+
+        # Remove time dimension from static_lst as well if it's used and has T=1
         if self.use_lst and static_lst is not None:
             if static_lst.ndim == 5 and static_lst.shape[1] == 1:
                 static_lst = static_lst.squeeze(1) # -> (B, C_lst, H_orig, W_orig)
             elif static_lst.ndim != 4:
-                # If it's already 4D or some other unexpected shape, raise error
-                 raise ValueError(f"static_lst has unexpected shape {static_lst.shape} after potentially squeezing time dim. Expected 4D (B, C, H, W).")
+                 raise ValueError(f"static_lst has unexpected shape {static_lst.shape}. Expected 4D or 5D with T=1.")
 
         # 1. Encode Clay Features Dynamically
-        with torch.no_grad(): # Assume backbone frozen for CNN version
-            clay_features = self.clay_backbone(cloudless_mosaic, norm_time_tensor, norm_latlon_tensor)
-        B, _, H_feat, W_feat = clay_features.shape
+        # Respects frozen status set in ClayFeatureExtractor.__init__
+        clay_features = self.clay_backbone(cloudless_mosaic, norm_time_tensor, norm_latlon_tensor)
+        B, D_clay, H_feat, W_feat = clay_features.shape
+        # Project Clay features (always done now before the head)
         projected_clay = self.proj(clay_features) # (B, proj_ch, H', W')
 
         # 2. Resize Weather and LST (if used) to match Clay feature map size (H', W')
         weather_resized = F.interpolate(weather, size=(H_feat, W_feat), mode='bilinear', align_corners=False)
 
-        # Prepare list for concatenation
-        combined_features_list = [projected_clay, weather_resized]
+        # Prepare list for concatenation - Content depends on head type
+        combined_features_list = []
+        # Always use projected clay features now
+        combined_features_list.append(projected_clay)
+        # Add resized weather
+        combined_features_list.append(weather_resized)
 
-        if self.use_lst:
-             # static_lst should now be 4D (B, C_lst, H_orig, W_orig)
+        if self.use_lst and static_lst is not None: # Check static_lst exists after potential squeeze
              if static_lst.ndim != 4:
-                  # This check should ideally not be needed if squeeze above worked
                   raise ValueError(f"static_lst has unexpected number of dimensions ({static_lst.ndim}) before interpolation. Expected 4.")
              
              # Resize LST to match Clay feature map size (H', W')
              static_lst_resized = F.interpolate(static_lst, size=(H_feat, W_feat), mode='bilinear', align_corners=False)
-             # Insert LST after projected Clay
+             # Insert LST after Clay features (either raw or projected)
              combined_features_list.insert(1, static_lst_resized)
 
         # 3. Concatenate all features
         combined_features = torch.cat(combined_features_list, dim=1)
         # Shape: (B, proj_ch [+ C_lst] + C_weather, H', W')
 
-        # 4. Pass through CNN Core
-        cnn_output = self.cnn_core(combined_features)
+        # 4. Pass through Selected Head
+        if self.head_type == 'unet':
+            # UNet head outputs at its own feature resolution
+            prediction_feat_res = self.head(combined_features) # (B, 1, H_unet, W_unet)
+        elif self.head_type == 'simple_cnn':
+            # SimpleCNN head outputs at feature map resolution
+            prediction_feat_res = self.head(combined_features) # (B, 1, H', W')
+        else: # Should not happen
+            raise ValueError(f"Invalid head_type {self.head_type} during forward pass.")
 
-        # --- Apply Final BatchNorm --- 
-        cnn_output = self.final_bn(cnn_output)
-        # -----------------------------
-
-        # --- Apply Dropout (after BN, before Regressor) --- 
-        if self.cnn_dropout > 0.0 and self.training:
-             cnn_output = F.dropout(cnn_output, p=self.cnn_dropout, training=self.training)
-        # ---------------------------------------------------
-
-        # 5. Prediction Head
-        prediction = self.regressor(cnn_output) # (B, 1, H', W')
-
-        # 6. Resize prediction back to the original target size
-        prediction_resized = F.interpolate(prediction, size=target_h_w, mode='bilinear', align_corners=False)
+        # 5. Resize prediction back to the original target size (for both head types)
+        if prediction_feat_res.shape[2:] != target_h_w:
+            prediction_resized = F.interpolate(prediction_feat_res, size=target_h_w, mode='bilinear', align_corners=False)
+        else:
+            prediction_resized = prediction_feat_res
 
         return prediction_resized
