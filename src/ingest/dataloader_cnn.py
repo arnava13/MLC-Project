@@ -12,6 +12,7 @@ from tqdm import tqdm
 from datetime import datetime, timedelta
 import rasterio
 from rasterio.warp import calculate_default_transform, reproject, Resampling
+from rasterio.merge import merge
 # ---------------------------------------- #
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -32,11 +33,12 @@ class CityDataSet(Dataset):
                  data_dir: str, city_name: str,
                  include_lst: bool = True,
                  single_lst_median_path: str = None,
-                 # --- NEW: DEM/DSM Paths ---
-                 dem_path: str = None,
-                 dsm_path: str = None,
+                 # --- UPDATED: DEM/DSM Tile Directories ---
+                 dem_tile_dir: str = None, # Directory for DEM tiles
+                 dsm_tile_dir: str = None, # Directory for DSM tiles
+                 elevation_nodata: float = -3.4028235e+38, # Default nodata for NYC LiDAR
                  target_crs: str = "EPSG:4326" # Default target CRS
-                 # -------------------------
+                 # ---------------------------------------
                  ):
         """
         Initialize the dataset.
@@ -54,8 +56,9 @@ class CityDataSet(Dataset):
             include_lst: Whether to include Land Surface Temperature data.
             single_lst_median_path (str, optional): Path to a pre-generated single LST median .npy file.
                                                     If provided, ignores averaging_window and dynamic loading.
-            dem_path (str, optional): Path to the DEM GeoTIFF file.
-            dsm_path (str, optional): Path to the DSM GeoTIFF file.
+            dem_tile_dir (str, optional): Path to the directory containing DEM GeoTIFF tiles.
+            dsm_tile_dir (str, optional): Path to the directory containing DSM GeoTIFF tiles.
+            elevation_nodata (float, optional): Nodata value used in DEM/DSM tiles.
             target_crs (str): The target Coordinate Reference System (e.g., 'EPSG:4326') for resampling.
         """
         # --- Basic Parameters ---
@@ -145,9 +148,19 @@ class CityDataSet(Dataset):
              # Ensure placeholder logic works if LST is disabled
              self.single_lst_median = np.zeros((1, self.sat_H, self.sat_W), dtype=np.float32)
 
-        # --- NEW: Load, Reproject, Normalize DEM/DSM --- #
-        self.dem_grid = self._load_process_elevation_grid(dem_path, "DEM", min_val=-100, max_val=1000) # Example range
-        self.dsm_grid = self._load_process_elevation_grid(dsm_path, "DSM", min_val=-100, max_val=1200) # Example range
+        # --- NEW: Load, Reproject, Normalize DEM/DSM from Tiles --- #
+        self.dem_grid = self._load_process_elevation_tiles(
+            tile_dir=dem_tile_dir,
+            tile_prefix="dem", # Assuming files are named dem_*.tif
+            grid_type="DEM",
+            nodata_val=elevation_nodata
+        )
+        self.dsm_grid = self._load_process_elevation_tiles(
+            tile_dir=dsm_tile_dir,
+            tile_prefix="dsm", # Assuming files are named dsm_*.tif
+            grid_type="DSM",
+            nodata_val=elevation_nodata
+        )
         self.include_dem = self.dem_grid is not None
         self.include_dsm = self.dsm_grid is not None
         # --- END NEW --- #
@@ -225,52 +238,111 @@ class CityDataSet(Dataset):
         logging.info(f"DEM included: {self.include_dem}")
         logging.info(f"DSM included: {self.include_dsm}")
 
-    # --- ADDED Helper for DEM/DSM Processing --- #
-    def _load_process_elevation_grid(self, grid_path: str, grid_type: str, min_val: float, max_val: float) -> np.ndarray | None:
-        """Loads, reprojects, resamples, and normalizes DEM/DSM data."""
-        if not grid_path:
-            logging.info(f"{grid_type} path not provided, skipping.")
+    # --- REPLACED Helper for DEM/DSM Processing --- #
+    def _load_process_elevation_tiles(self, tile_dir: str, tile_prefix: str, grid_type: str, nodata_val: float) -> np.ndarray | None:
+        """Loads DEM/DSM tiles, merges, reprojects, resamples, and normalizes them."""
+        if not tile_dir:
+            logging.info(f"{grid_type} tile directory not provided, skipping.")
             return None
 
-        grid_path_obj = Path(grid_path)
-        if not grid_path_obj.exists():
-            logging.warning(f"{grid_type} file not found at {grid_path}, skipping.")
+        tile_dir_path = Path(tile_dir)
+        if not tile_dir_path.is_dir():
+            logging.warning(f"{grid_type} tile directory not found at {tile_dir_path}, skipping.")
             return None
+
+        # Find tiles matching the prefix
+        tile_paths = list(tile_dir_path.glob(f'{tile_prefix}_*.tif'))
+        if not tile_paths:
+            logging.warning(f"No {grid_type} tiles found matching prefix '{tile_prefix}_' in {tile_dir_path}, skipping.")
+            return None
+
+        logging.info(f"Found {len(tile_paths)} {grid_type} tiles in {tile_dir_path}. Merging and processing...")
 
         try:
-            logging.info(f"Loading and processing {grid_type} from {grid_path}")
-            with rasterio.open(grid_path_obj) as src:
-                # Calculate transform and dimensions for reprojection
-                transform, width, height = calculate_default_transform(
-                    src.crs, self.target_crs, src.width, src.height, *src.bounds)
+            # Open tile datasets
+            src_files_to_mosaic = [rasterio.open(fp) for fp in tile_paths]
 
-                # Create destination array
-                destination = np.zeros((self.sat_H, self.sat_W), dtype=np.float32)
+            # Merge tiles - this handles mosaicking and can reproject/resample
+            # Note: Merging large numbers of tiles can be memory intensive.
+            # Bounds are specified in the target CRS for the output extent.
+            # Target resolution is derived from the target transform.
+            mosaic, out_trans = merge(
+                src_files_to_mosaic,
+                bounds=self.bounds, # Target bounds
+                res=(self.resolution_m, self.resolution_m), # Target resolution (approx)
+                nodata=nodata_val,
+                target_aligned_pixels=True, # Align pixels to target bounds
+                dst_crs=self.target_crs, # Reproject to target CRS
+                # Optionally add precision=7 if needed
+            )
+            
+            # Close the source files
+            for src in src_files_to_mosaic:
+                src.close()
 
-                reproject(
-                    source=rasterio.band(src, 1),
-                    destination=destination,
-                    src_transform=src.transform,
-                    src_crs=src.crs,
-                    dst_transform=self.target_transform, # Use target transform
-                    dst_crs=self.target_crs,
-                    resampling=Resampling.bilinear)
+            # At this point, 'mosaic' should be a numpy array (C, H, W) reprojected to target CRS
+            # but might not exactly match self.sat_H, self.sat_W due to merge heuristics.
+            # We need to explicitly resample/warp it to the final target grid.
 
-                # Add channel dimension
-                destination = destination[np.newaxis, :, :]
+            # Create a memory file for the merged data to use with reproject
+            with rasterio.io.MemoryFile() as memfile:
+                profile = { # Profile for the merged data before final warp
+                    'driver': 'GTiff',
+                    'height': mosaic.shape[1],
+                    'width': mosaic.shape[2],
+                    'count': mosaic.shape[0],
+                    'dtype': mosaic.dtype,
+                    'crs': self.target_crs,
+                    'transform': out_trans, # Transform from merge output
+                    'nodata': nodata_val
+                }
+                with memfile.open(**profile) as dataset:
+                    dataset.write(mosaic)
+                
+                # Now open the memory file and reproject exactly to the target grid
+                with memfile.open() as src_dataset:
+                    destination = np.zeros((self.sat_H, self.sat_W), dtype=np.float32)
+                    reproject(
+                        source=rasterio.band(src_dataset, 1), # Reproject band 1
+                        destination=destination,
+                        src_transform=src_dataset.transform,
+                        src_crs=src_dataset.crs,
+                        dst_transform=self.target_transform, # Final target grid transform
+                        dst_crs=self.target_crs,             # Final target grid CRS
+                        dst_nodata=nodata_val,                # Use same nodata for output
+                        resampling=Resampling.bilinear
+                    )
 
-                # Normalize using provided min/max
-                norm_01 = (destination - min_val) / (max_val - min_val)
-                norm_neg1_pos1 = (norm_01 * 2.0) - 1.0
-                normalized_grid = np.clip(norm_neg1_pos1, -1.0, 1.0)
+            # Fill nodata values with 0 after reprojection (or use another strategy)
+            # Check for NaN as well, as bilinear resampling might introduce them
+            mask = np.isnan(destination) | (destination == nodata_val)
+            destination[mask] = 0.0 # Fill nodata/NaN with zero - adjust if needed
 
-                logging.info(f"Processed {grid_type} shape: {normalized_grid.shape}")
-                return normalized_grid.astype(np.float32)
+            # Add channel dimension
+            destination = destination[np.newaxis, :, :]
+
+            # Normalize the final grid (example: min-max to -1 to 1)
+            # Using realistic elevation ranges for NYC (approx -10m to 300m for DSM)
+            # Adjust min/max based on actual data range if known
+            min_elev = -10 if grid_type == "DEM" else -10
+            max_elev = 150 if grid_type == "DEM" else 350 # Higher max for DSM (buildings)
+            
+            norm_01 = (destination - min_elev) / (max_elev - min_elev)
+            norm_neg1_pos1 = (norm_01 * 2.0) - 1.0
+            normalized_grid = np.clip(norm_neg1_pos1, -1.0, 1.0)
+
+            logging.info(f"Processed {grid_type} final shape: {normalized_grid.shape}")
+            return normalized_grid.astype(np.float32)
 
         except Exception as e:
-            logging.error(f"Error processing {grid_type} file {grid_path}: {e}")
+            logging.error(f"Error processing {grid_type} tiles from {tile_dir_path}: {e}", exc_info=True)
+            # Ensure source files are closed even if error occurs mid-process
+            if 'src_files_to_mosaic' in locals():
+                for src in src_files_to_mosaic:
+                    if not src.closed:
+                         src.close()
             return None
-    # --- END ADDED Helper --- #
+    # --- END REPLACED Helper --- #
 
     # --- ADDED Normalization Helpers for Clay Metadata ---
     def _normalize_clay_timestamp(self, date: pd.Timestamp) -> np.ndarray:
@@ -575,98 +647,47 @@ class CityDataSet(Dataset):
         # Get the unique timestamp corresponding to the index
         timestamp = self.unique_timestamps[idx]
 
-        # --- Get Clay norm_time (Dynamic per sample) ---
-        # This returns a (4,) array for sin/cos week/hour
-        norm_time_vector = self._normalize_clay_timestamp(timestamp)
-
-        # --- Get Clay norm_latlon (Static, computed once if needed) ---
-        # Compute this once during init or retrieve if already computed
-        # For simplicity here, we retrieve the precomputed grid coords
-        # The helper function _normalize_clay_latlon computes the final (2, H, W) tensor
-        if not hasattr(self, 'norm_latlon_grid_tensor'):
-             # Compute and store if it doesn't exist
-             self.norm_latlon_grid_tensor = self._normalize_clay_latlon()
-        norm_latlon_tensor = self.norm_latlon_grid_tensor # Shape (2, H, W)
-
-        # Get weather data using IDW interpolation for this timestamp
-        weather_grid = self._build_weather_grid(timestamp) # Shape (C_weather, H, W)
-        # Restore the time sequence dimension T=1
-        weather_seq = weather_grid[np.newaxis, ...]       # Shape (1, C_weather, H, W)
-
-        # Ensure weather_grid is not None (or handle appropriately)
-        if weather_grid is None:
-            # Use the initial timestamp for the error message, not target_dt_str which might not exist
-            logging.error(f"Failed to build weather grid for timestamp {timestamp}. Skipping this item.")
-            # --- MODIFIED: Return None to be skipped by DataLoader --- 
-            return None
-            # ---------------------------------------------------------
-            
-        # --- Get Time Embedding (Dynamic per timestamp) ---
-        # Ensure target_timestamp is valid before proceeding
-        if not isinstance(timestamp, pd.Timestamp):
-             # Use the correct variable 'timestamp' in the error message
-             print(f"ERROR: timestamp is not a valid Timestamp object at this point for idx {idx}! Type: {type(timestamp)}. Skipping item.")
-             return None
-
-        # Call _get_time_embedding with the correct timestamp variable
-        time_embedding = self._get_time_embedding(timestamp) # (C_time, H, W)
-        if time_embedding is None: # Check if the function itself failed
-             print(f"ERROR: _get_time_embedding returned None for {timestamp}. Skipping item.")
-             return None
-        # --- END MODIFICATION ---
-
-        # --- Construct Sample Dictionary ---
-        # Retrieve precomputed target and mask using the timestamp key
+        # --- Retrieve Precomputed UHI Data ---
         target = self.target_grids[timestamp]
-        mask = self.valid_masks[timestamp].astype(np.float32)
-        target = np.nan_to_num(target)
+        mask = self.valid_masks[timestamp]
 
-        # Return the original full-resolution mosaic
-        cloudless_mosaic = self.cloudless_mosaic.astype(np.float32)
+        # --- Prepare Weather Grid ---
+        weather_grid = self._build_weather_grid(timestamp)
 
-        # Get the static LST median (already normalized or zero)
-        # It should have shape (1, H, W)
-        lst_tensor = self.single_lst_median if self.include_lst else np.zeros((1, self.sat_H, self.sat_W), dtype=np.float32)
-        # Ensure lst_tensor is (1, H, W)
-        if self.include_lst:
-            # --- Adjusted LST shape check and handling ---
-            if lst_tensor.ndim == 4 and lst_tensor.shape[0] == 1 and lst_tensor.shape[1] == 1:
-                lst_tensor = lst_tensor.squeeze(0) # Handle (1, 1, H, W) -> (1, H, W)
-            elif lst_tensor.ndim == 2:
-                 lst_tensor = lst_tensor[np.newaxis, :, :] # Handle (H, W) -> (1, H, W)
-            elif lst_tensor.ndim != 3 or lst_tensor.shape[0] != 1:
-                logging.warning(f"Unexpected LST tensor shape {lst_tensor.shape if lst_tensor is not None else 'None'} when LST is included. Using zeros.")
-                lst_tensor = np.zeros((1, self.sat_H, self.sat_W), dtype=np.float32)
-            # --- End Adjustments ---
+        # --- Prepare Time Embedding ---
+        time_embedding = self._get_time_embedding(timestamp)
 
-        # Restore sequence dimension T=1 for weather, time, lst
-        weather_seq = weather_grid[np.newaxis, ...]       # Shape (1, C_weather, H, W)
-        time_map_seq = time_embedding[np.newaxis, ...]        # Shape (1, C_time, H, W)
-        lst_seq = lst_tensor[np.newaxis, ...]             # Shape (1, 1, H, W)
+        # --- Prepare Clay Metadata (Static) ---
+        # Calculate only once if needed, or fetch precalculated
+        norm_latlon_tensor = getattr(self, '_cached_norm_latlon', None)
+        if norm_latlon_tensor is None:
+            norm_latlon_tensor = self._normalize_clay_latlon()
+            self._cached_norm_latlon = norm_latlon_tensor
+        # Normalize timestamp per sample
+        norm_time_tensor = self._normalize_clay_timestamp(timestamp)
 
-        # --- Get Static DEM/DSM --- #
-        dem_tensor = self.dem_grid if self.include_dem else np.zeros((1, self.sat_H, self.sat_W), dtype=np.float32)
-        dsm_tensor = self.dsm_grid if self.include_dsm else np.zeros((1, self.sat_H, self.sat_W), dtype=np.float32)
-        # --- END NEW --- #
-
+        # --- Assemble Sample Dictionary ---
         sample = {
-            # Static/Input Features
-            "cloudless_mosaic": cloudless_mosaic,           # Shape (C_static, H, W)
-            "norm_latlon": norm_latlon_tensor.astype(np.float32), # Shape (4,) - Vector now
-            # Dynamic Features (Sequence Length T=1)
-            "weather_seq": weather_seq.astype(np.float32),  # Shape (1, C_weather, H, W)
-            "time_emb_seq": time_map_seq.astype(np.float32),# Shape (1, C_time, H, W)
-            "lst_seq": lst_seq.astype(np.float32),          # Shape (1, 1, H, W)
-            "norm_time": norm_time_vector.astype(np.float32), # Shape (4,) - Vector per Timestamp
-            # Target and Mask
-            "target": target.astype(np.float32),            # Shape (H, W)
-            "mask": mask.astype(np.float32),                # Shape (H, W)
+            'cloudless_mosaic': torch.from_numpy(self.cloudless_mosaic).float(),
+            'weather_grid': torch.from_numpy(weather_grid).float(),
+            'target': torch.from_numpy(target).float().unsqueeze(0), # Add channel dim
+            'mask': torch.from_numpy(mask).float().unsqueeze(0),      # Add channel dim
+            'time_embedding': torch.from_numpy(time_embedding).float(),
+            # Clay specific metadata (match keys expected by ClayFeatureExtractor)
+            'norm_latlon': torch.from_numpy(norm_latlon_tensor).float(),
+            'norm_timestamp': torch.from_numpy(norm_time_tensor).float(),
         }
-        # --- NEW: Add DEM/DSM conditionally --- #
+
+        # Add LST if included
+        if self.include_lst:
+            # Assume single_lst_median is loaded and normalized in __init__
+            sample['lst_median'] = torch.from_numpy(self.single_lst_median).float()
+
+        # --- ADD DEM/DSM if loaded ---
         if self.include_dem:
-            sample["dem"] = dem_tensor.astype(np.float32) # Shape (1, H, W)
+            sample['dem'] = torch.from_numpy(self.dem_grid).float() # Already has channel dim
         if self.include_dsm:
-            sample["dsm"] = dsm_tensor.astype(np.float32) # Shape (1, H, W)
-        # --- END NEW --- #
+            sample['dsm'] = torch.from_numpy(self.dsm_grid).float() # Already has channel dim
+        # --- END ADD ---
 
         return sample
