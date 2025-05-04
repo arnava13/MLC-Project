@@ -228,3 +228,15 @@ src/uhi-pipeline
 
 - Next steps:
   - add band features to the model (not the ND indices)
+
+
+## May 5 2025:
+
+- Informed by other people's comments on the EY forum and by Shunsuke's implementation of the
+  RF/XGBoost/MLP model, we have worked on a new branched UHI model architecure
+  (dataloader_branched.py , branched_uhi_model.py).
+
+- Processes temporal weather features with a ConvLSTM before concatenating (flag-configurable)
+  static features to channel dimmension of final hidden state from the ConvLSTM. 
+
+- Passes feature cube to a UNet-like architecture to make UHI predictions at each timestamp.

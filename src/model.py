@@ -15,8 +15,7 @@ import pandas as pd # Added for Timestamp check
 from src.Clay.src.module import ClayMAEModule
 
 # -----------------------------------------------------------------------------
-# 1. CLAY FEATURE EXTRACTOR ----------------------------------------------------
-# Use to extract fixed spatial features for each city.
+# Pretrained Feature Extractors -----------------------------------------------
 # -----------------------------------------------------------------------------
 
 class ClayFeatureExtractor(nn.Module):
@@ -24,7 +23,8 @@ class ClayFeatureExtractor(nn.Module):
     Loads a pre-trained Clay model from a local checkpoint and extracts features.
     Uses the encoder part of the model to get embeddings from a Sentinel-2 mosaic.
     Returns spatial patch embeddings.
-    If freeze_backbone is False, only the final linear layer of the encoder is unfrozen.
+    If freeze_backbone is False, only the final identified projection layer ('proj') of the encoder is unfrozen.
+    If freeze_backbone is True, the entire model remains frozen.
     """
 
     def __init__(self, checkpoint_path: str, metadata_path: str, model_size: str = "large", bands: list = ["blue", "green", "red", "nir"], platform: str = "sentinel-2-l2a", gsd: int = 10, freeze_backbone: bool = True):
@@ -38,8 +38,8 @@ class ClayFeatureExtractor(nn.Module):
             bands: List of band names in the input mosaic, matching metadata.yaml.
             platform: Platform name corresponding to the metadata (e.g., "sentinel-2-l2a").
             gsd: Ground sample distance of the input mosaic in meters.
-            freeze_backbone (bool): If True, freezes the Clay backbone weights except for the final encoder layer.
-                                    If False, only the final encoder layer is trainable.
+            freeze_backbone (bool): If True, freezes the entire Clay backbone weights.
+                                    If False, only the final identified projection layer ('proj') is trainable.
         """
         super().__init__()
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -342,7 +342,7 @@ class ClayFeatureExtractor(nn.Module):
         return spatial_features
 
 # -----------------------------------------------------------------------------
-# 4. CNN HEADS ----------------------------------------------------------------
+# CNN HEADS -------------------------------------------------------------------
 # -----------------------------------------------------------------------------
 
 # --- Added SimpleCNNHead back ---
@@ -376,7 +376,7 @@ class SimpleCNNHead(nn.Module):
         x = self.regressor(x)
         return x
 
-# --- UNet Helper Blocks ---
+# --- UNet-style Blocks ---
 class UNetConvBlock(nn.Module):
     """Helper: Conv(3x3, padding=1) -> BN -> ReLU -> Conv(3x3, padding=1) -> BN -> ReLU"""
     def __init__(self, in_channels, out_channels):
@@ -507,7 +507,7 @@ class UNetStyleHead(nn.Module):
         return logits
 
 # -----------------------------------------------------------------------------
-# 5. CNN-BASED UHI NET MODEL (USED BY NOTEBOOK) ----------------------------
+# 5. CNN-BASED UHI NET MODEL  ----------------------------
 # -----------------------------------------------------------------------------
 
 class UHINetCNN(nn.Module):
@@ -593,9 +593,9 @@ class UHINetCNN(nn.Module):
             )
             # Logging info for SimpleCNNHead is done within its __init__
             logging.info(f"UHINetCNN initialized (Feedforward with SimpleCNNHead):")
-        logging.info(f"  Clay Backbone Frozen (except maybe last layer): {freeze_backbone}")
-        logging.info(f"  Clay Embed Dim: {clay_embed_dim} -> Proj Dim: {self.proj_ch}")
-        logging.info(f"  Use LST: {self.use_lst} (Channels: {self.lst_channels if self.use_lst else 0})")
+            logging.info(f"  Clay Backbone Frozen (except maybe last layer): {freeze_backbone}")
+            logging.info(f"  Clay Embed Dim: {clay_embed_dim} -> Proj Dim: {self.proj_ch}")
+            logging.info(f"  Use LST: {self.use_lst} (Channels: {self.lst_channels if self.use_lst else 0})")
             logging.info(f"  Weather Channels: {self.weather_channels}")
             logging.info(f"  SimpleCNN Head Input Channels (ProjClay+Weather[+LST]): {head_in_ch}")
             # SimpleCNNHead logs its own details
