@@ -47,17 +47,10 @@ class CityDataSet(Dataset):
                  data_dir: str, city_name: str,
                  include_lst: bool = True,
                  single_lst_median_path: str = None,
-<<<<<<< HEAD
                  dem_path: Optional[str] = None,
                  dsm_path: Optional[str] = None,
                  high_res_nodata: Optional[float] = None,
                  target_crs: str = "EPSG:4326",
-=======
-                 dem_path: str = None, # Keep for backward compatibility if needed, but use load_process_elevation
-                 dsm_path: str = None, # Keep for backward compatibility if needed, but use load_process_elevation
-                 elevation_nodata: float = -3.4028235e+38,
-                 target_crs: str = "EPSG:4326"
->>>>>>> 448c9806d4ef2cfbd0e746f377b21adbcc7f8df5
                  ):
         """
         Initialize the dataset.
@@ -76,15 +69,9 @@ class CityDataSet(Dataset):
             city_name: Name of the city.
             include_lst: Whether to include Land Surface Temperature data.
             single_lst_median_path (str, optional): Path to a pre-generated single LST median .npy file.
-<<<<<<< HEAD
             dem_path (str, optional): Path to the high-resolution DEM GeoTIFF file.
             dsm_path (str, optional): Path to the high-resolution DSM GeoTIFF file.
             high_res_nodata (float, optional): Nodata value in the high-res DEM/DSM files (e.g., np.nan).
-=======
-            dem_path (str, optional): Path to the directory containing DEM GeoTIFF tiles (passed to load_process_elevation).
-            dsm_path (str, optional): Path to the directory containing DSM GeoTIFF tiles (passed to load_process_elevation).
-            elevation_nodata (float, optional): Nodata value used in DEM/DSM tiles.
->>>>>>> 448c9806d4ef2cfbd0e746f377b21adbcc7f8df5
             target_crs (str): The target Coordinate Reference System (e.g., 'EPSG:4326').
         """
         assert bounds and len(bounds) == 4, "Bounds [min_lon, min_lat, max_lon, max_lat] must be provided."
@@ -155,7 +142,6 @@ class CityDataSet(Dataset):
         if not self.include_lst:
              self.single_lst_median = np.zeros((1, self.sat_H, self.sat_W), dtype=np.float32)
 
-<<<<<<< HEAD
         # --- Load High-Resolution DEM/DSM (No Resampling Yet) --- #
         self.high_res_dem_full = None
         self.include_dem_branch = False
@@ -230,39 +216,6 @@ class CityDataSet(Dataset):
                     logging.error(f"Failed to load/process high-res DSM from {dsm_p}: {e}")
             else:
                 logging.warning(f"High-resolution DSM path specified but not found: {dsm_p}")
-=======
-        # --- Load, Reproject, Normalize DEM/DSM using Util --- #
-        self.dem_grid = None
-        if dem_path:
-            self.dem_grid = load_process_elevation(
-                source_path=dem_path,
-            grid_type="DEM",
-                bounds=self.bounds,
-                resolution_m=self.resolution_m,
-                sat_H=self.sat_H,
-                sat_W=self.sat_W,
-                target_crs_str=self.target_crs_str,
-                target_transform=self.target_transform,
-                elevation_nodata=self.elevation_nodata
-        )
-        self.dsm_grid = None
-        if dsm_path:
-            self.dsm_grid = load_process_elevation(
-                source_path=dsm_path,
-            grid_type="DSM",
-                bounds=self.bounds,
-                resolution_m=self.resolution_m,
-                sat_H=self.sat_H,
-                sat_W=self.sat_W,
-                target_crs_str=self.target_crs_str,
-                target_transform=self.target_transform,
-                elevation_nodata=self.elevation_nodata
-        )
-        self.include_dem = self.dem_grid is not None
-        self.include_dsm = self.dsm_grid is not None
-        logging.info(f"DEM included: {self.include_dem}")
-        logging.info(f"DSM included: {self.include_dsm}")
->>>>>>> 448c9806d4ef2cfbd0e746f377b21adbcc7f8df5
 
         # --- Load Weather Station Data --- #
         self.bronx_weather = pd.read_csv(bronx_weather_csv)
