@@ -7,7 +7,9 @@ netcdf4
 rasterio
 pystac_client
 planetary_computer
+stackstac
 odc-stac
+rioxarray
 tqdm
 matplotlib
 python-box==3.4.5
