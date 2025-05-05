@@ -181,14 +181,8 @@ class ConvLSTM(nn.Module):
         if not self.batch_first:
             layer_output_list = [o.permute(1, 0, 2, 3, 4) for o in layer_output_list]
 
-        # We only need the output sequence of the last layer and the final state
-        # Return format matches LSTM: (output_seq_last_layer, (last_h, last_c))
-        # Note: last_h and last_c will be lists containing the states for each layer
-        last_h_states = [state[0] for state in last_state_list]
-        last_c_states = [state[1] for state in last_state_list]
-
-        # Return last layer's output sequence and tuple of final hidden/cell states (stacked over layers)
-        return layer_output_list[-1], (torch.stack(last_h_states, dim=0), torch.stack(last_c_states, dim=0))
+        # Return only the final state tuple (h, c) of the LAST layer
+        return last_state_list[-1]
 
     def _init_hidden(self, batch_size, image_size):
         init_states = []
@@ -403,9 +397,9 @@ class BranchedUHIModel(nn.Module):
         """
 
         # --- 1. Temporal Branch (ConvLSTM) --- #
-        # Input: (B, T, C, H, W), Output: [(B, T, C_hid, H, W)], [(B, C_hid, H, W)]
-        layer_output_list, last_state_list = self.conv_lstm(weather_seq)
-        temporal_features = last_state_list[-1][0] # Get hidden state h from the last layer: (B, C_hid, H, W)
+        # Input: (B, T, C, H, W), Output is now just the final state tuple (h, c) of the last layer
+        last_state = self.conv_lstm(weather_seq)
+        temporal_features = last_state[0] # Get hidden state h from the last layer state tuple
         temporal_projected = self.temporal_proj(temporal_features)
         B, _, H_feat, W_feat = temporal_projected.shape
 

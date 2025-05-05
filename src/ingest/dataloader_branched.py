@@ -505,19 +505,19 @@ class CityDataSetBranched(Dataset):
         return sample 
 
     def __del__(self):
-        if hasattr(self, 'dem_xr') and self.dem_xr:
+        if hasattr(self, 'dem_xr') and self.dem_xr is not None:
             try:
                 self.dem_xr.close()
                 logging.debug("Closed DEM file handle.")
             except Exception as e:
                 logging.warning(f"Exception closing DEM file handle: {e}")
-        if hasattr(self, 'dsm_xr') and self.dsm_xr:
+        if hasattr(self, 'dsm_xr') and self.dsm_xr is not None:
             try:
                 self.dsm_xr.close()
                 logging.debug("Closed DSM file handle.")
             except Exception as e:
                 logging.warning(f"Exception closing DSM file handle: {e}")
-        if hasattr(self, 'lst_xr') and self.lst_xr:
+        if hasattr(self, 'lst_xr') and self.lst_xr is not None:
             try:
                 self.lst_xr.close()
                 logging.debug("Closed LST file handle.")
