@@ -235,21 +235,21 @@ class CityDataSetBranched(Dataset):
             lst_path = Path(self._single_lst_median_path)
             if lst_path.exists():
                 try:
-                        self.lst_xr = rioxarray.open_rasterio(lst_path, masked=True).load()
-                        # Basic nodata handling
-                        if self.lst_nodata is not None:
-                            self.lst_xr = self.lst_xr.where(self.lst_xr != self.lst_nodata)
-                            self.lst_xr.rio.write_nodata(np.nan, encoded=True, inplace=True)
-                        # Ensure target CRS (assuming it might be different)
-                        if self.lst_xr.rio.crs != self.target_crs:
-                            logging.info(f"Reprojecting LST from {self.lst_xr.rio.crs} to {self.target_crs_str}")
-                            self.lst_xr = self.lst_xr.rio.reproject(self.target_crs_str)
-                            # Clip to bounds (optional, assuming it covers the area)
-                            # self.lst_xr = self.lst_xr.rio.clip_box(...) # Add if needed
-                            logging.info(f"Loaded LST shape (native res): {self.lst_xr.shape}")
+                    self.lst_xr = rioxarray.open_rasterio(lst_path, masked=True).load()
+                    # Basic nodata handling
+                    if self.lst_nodata is not None:
+                        self.lst_xr = self.lst_xr.where(self.lst_xr != self.lst_nodata)
+                        self.lst_xr.rio.write_nodata(np.nan, encoded=True, inplace=True)
+                    # Ensure target CRS (assuming it might be different)
+                    if self.lst_xr.rio.crs != self.target_crs:
+                        logging.info(f"Reprojecting LST from {self.lst_xr.rio.crs} to {self.target_crs_str}")
+                        self.lst_xr = self.lst_xr.rio.reproject(self.target_crs_str)
+                        # Clip to bounds (optional, assuming it covers the area)
+                        # self.lst_xr = self.lst_xr.rio.clip_box(...) # Add if needed
+                        logging.info(f"Loaded LST shape (native res): {self.lst_xr.shape}")
                 except Exception as e:
-                            logging.error(f"Failed LST loading/processing from {lst_path}: {e}")
-                            self.lst_xr = None
+                    logging.error(f"Failed LST loading/processing from {lst_path}: {e}")
+                    self.lst_xr = None
             else: # Path doesn't exist
                 logging.warning(f"LST path specified but not found: {self._single_lst_median_path}")
 
@@ -359,28 +359,28 @@ class CityDataSetBranched(Dataset):
                 mosaic_xr, self.feat_H, self.feat_W, self.feat_transform, self.target_crs
             )
             if mosaic_feat_res is None:
-                 logging.warning(f"Mosaic resampling failed for timestamp {target_timestamp}. Skipping mosaic features.")
-                 needs_mosaic = False # Disable downstream use if resampling failed
+                logging.warning(f"Mosaic resampling failed for timestamp {target_timestamp}. Skipping mosaic features.")
+                needs_mosaic = False # Disable downstream use if resampling failed
             else:
-                 # Add selected bands for composite feature
-                 if self.feature_flags["use_sentinel_composite"]:
-                     selected_indices = []
-                     selected_band_names_ordered = []
-                     for band_name in self.selected_mosaic_bands:
-                         try:
-                             idx = DEFAULT_MOSAIC_BANDS_ORDER.index(band_name)
-                             selected_indices.append(idx)
-                             selected_band_names_ordered.append(band_name)
-                         except ValueError:
-                             logging.warning(f"Requested composite band '{band_name}' not found. Skipping.")
-                     if selected_indices:
-                          mosaic_subset = mosaic_feat_res[selected_indices, :, :]
-                          static_features_list.append(mosaic_subset)
-                          feature_names.extend([f"sentinel_{b}" for b in selected_band_names_ordered])
+                # Add selected bands for composite feature
+                if self.feature_flags["use_sentinel_composite"]:
+                    selected_indices = []
+                    selected_band_names_ordered = []
+                    for band_name in self.selected_mosaic_bands:
+                        try:
+                            idx = DEFAULT_MOSAIC_BANDS_ORDER.index(band_name)
+                            selected_indices.append(idx)
+                            selected_band_names_ordered.append(band_name)
+                        except ValueError:
+                            logging.warning(f"Requested composite band '{band_name}' not found. Skipping.")
+                    if selected_indices:
+                        mosaic_subset = mosaic_feat_res[selected_indices, :, :]
+                        static_features_list.append(mosaic_subset)
+                        feature_names.extend([f"sentinel_{b}" for b in selected_band_names_ordered])
 
-                 # Calculate spectral indices if flagged (using RESAMPLED mosaic)
-                 available_bands_in_resampled = {band: i for i, band in enumerate(DEFAULT_MOSAIC_BANDS_ORDER[:mosaic_feat_res.shape[0]])}
-                 def _calculate_index(index_name, band_num_name, band_den_name):
+                # Calculate spectral indices if flagged (using RESAMPLED mosaic)
+                available_bands_in_resampled = {band: i for i, band in enumerate(DEFAULT_MOSAIC_BANDS_ORDER[:mosaic_feat_res.shape[0]])}
+                def _calculate_index(index_name, band_num_name, band_den_name):
                     num_idx = available_bands_in_resampled.get(band_num_name)
                     den_idx = available_bands_in_resampled.get(band_den_name)
                     if num_idx is None or den_idx is None:
@@ -395,15 +395,15 @@ class CityDataSetBranched(Dataset):
                     index_map = np.clip(index_map, -1.0, 1.0)
                     return index_map[np.newaxis, :, :]
 
-                 if self.feature_flags["use_ndvi"]:
-                     ndvi_map = _calculate_index("ndvi", "nir", "red")
-                     if ndvi_map is not None: static_features_list.append(ndvi_map); feature_names.append("ndvi")
-                 if self.feature_flags["use_ndbi"]:
-                     ndbi_map = _calculate_index("ndbi", "swir16", "nir")
-                     if ndbi_map is not None: static_features_list.append(ndbi_map); feature_names.append("ndbi")
-                 if self.feature_flags["use_ndwi"]:
-                     ndwi_map = _calculate_index("ndwi", "green", "nir")
-                     if ndwi_map is not None: static_features_list.append(ndwi_map); feature_names.append("ndwi")
+                if self.feature_flags["use_ndvi"]:
+                    ndvi_map = _calculate_index("ndvi", "nir", "red")
+                    if ndvi_map is not None: static_features_list.append(ndvi_map); feature_names.append("ndvi")
+                if self.feature_flags["use_ndbi"]:
+                    ndbi_map = _calculate_index("ndbi", "swir16", "nir")
+                    if ndbi_map is not None: static_features_list.append(ndbi_map); feature_names.append("ndbi")
+                if self.feature_flags["use_ndwi"]:
+                    ndwi_map = _calculate_index("ndwi", "green", "nir")
+                    if ndwi_map is not None: static_features_list.append(ndwi_map); feature_names.append("ndwi")
 
         # 2. LST Median (Resample to FEATURE resolution)
         lst_feat_res = None
@@ -412,11 +412,11 @@ class CityDataSetBranched(Dataset):
                 self.lst_xr, self.feat_H, self.feat_W, self.feat_transform, self.target_crs, fill_value=0.0 # Fill with 0
             )
             if lst_feat_res_raw is not None:
-                 lst_feat_res = normalize_lst(lst_feat_res_raw, self.feat_H, self.feat_W)
-                 static_features_list.append(lst_feat_res)
-                 feature_names.append("lst")
+                lst_feat_res = normalize_lst(lst_feat_res_raw, self.feat_H, self.feat_W)
+                static_features_list.append(lst_feat_res)
+                feature_names.append("lst")
             else:
-                 logging.warning(f"LST resampling failed for timestamp {target_timestamp}.")
+                logging.warning(f"LST resampling failed for timestamp {target_timestamp}.")
 
         # 3. DEM (Resample to FEATURE resolution)
         dem_feat_res = None
@@ -425,16 +425,16 @@ class CityDataSetBranched(Dataset):
                 self.dem_xr, self.feat_H, self.feat_W, self.feat_transform, self.target_crs, fill_value=0.0 # Fill nodata with 0
             )
             if dem_feat_res is not None:
-                 # Normalize DEM [0, 1] - specific to this feature resolution grid
-                 min_v, max_v = np.min(dem_feat_res), np.max(dem_feat_res)
-                 if max_v > min_v:
-                     dem_feat_res = (dem_feat_res - min_v) / (max_v - min_v)
-                 else:
-                     dem_feat_res.fill(0.5)
-                 static_features_list.append(dem_feat_res)
-                 feature_names.append("dem")
+                # Normalize DEM [0, 1] - specific to this feature resolution grid
+                min_v, max_v = np.min(dem_feat_res), np.max(dem_feat_res)
+                if max_v > min_v:
+                    dem_feat_res = (dem_feat_res - min_v) / (max_v - min_v)
+                else:
+                    dem_feat_res.fill(0.5)
+                static_features_list.append(dem_feat_res)
+                feature_names.append("dem")
             else:
-                 logging.warning(f"DEM resampling failed for timestamp {target_timestamp}.")
+                logging.warning(f"DEM resampling failed for timestamp {target_timestamp}.")
 
         # 4. DSM (Resample to FEATURE resolution)
         dsm_feat_res = None
@@ -443,16 +443,16 @@ class CityDataSetBranched(Dataset):
                 self.dsm_xr, self.feat_H, self.feat_W, self.feat_transform, self.target_crs, fill_value=0.0
             )
             if dsm_feat_res is not None:
-                 # Normalize DSM [0, 1]
-                 min_v, max_v = np.min(dsm_feat_res), np.max(dsm_feat_res)
-                 if max_v > min_v:
-                     dsm_feat_res = (dsm_feat_res - min_v) / (max_v - min_v)
-                 else:
-                     dsm_feat_res.fill(0.5)
-                 static_features_list.append(dsm_feat_res)
-                 feature_names.append("dsm")
+                # Normalize DSM [0, 1]
+                min_v, max_v = np.min(dsm_feat_res), np.max(dsm_feat_res)
+                if max_v > min_v:
+                    dsm_feat_res = (dsm_feat_res - min_v) / (max_v - min_v)
+                else:
+                    dsm_feat_res.fill(0.5)
+                static_features_list.append(dsm_feat_res)
+                feature_names.append("dsm")
             else:
-                 logging.warning(f"DSM resampling failed for timestamp {target_timestamp}.")
+                logging.warning(f"DSM resampling failed for timestamp {target_timestamp}.")
 
         # Combine ALL static features (excluding Clay mosaic input)
         if not static_features_list:
@@ -465,11 +465,11 @@ class CityDataSetBranched(Dataset):
                 if feat is not None and feat.shape[1:] == (self.feat_H, self.feat_W):
                     valid_static_features.append(feat)
                 else:
-                     logging.warning(f"Static feature '{feature_names[i]}' has incorrect shape or is None. Skipping.")
+                    logging.warning(f"Static feature '{feature_names[i]}' has incorrect shape or is None. Skipping.")
             if valid_static_features:
-                 combined_static_features = np.concatenate(valid_static_features, axis=0).astype(np.float32)
+                combined_static_features = np.concatenate(valid_static_features, axis=0).astype(np.float32)
             else:
-                 combined_static_features = np.zeros((0, self.feat_H, self.feat_W), dtype=np.float32)
+                combined_static_features = np.zeros((0, self.feat_H, self.feat_W), dtype=np.float32)
 
         # --- Prepare Clay Inputs (if needed) --- #
         clay_mosaic_input = None # The mosaic resampled to feature res
@@ -479,18 +479,19 @@ class CityDataSetBranched(Dataset):
             if mosaic_feat_res is None:
                 logging.warning("Clay features enabled, but mosaic could not be loaded/resampled. Skipping Clay.")
             else:
-            # Clay takes specific bands (e.g., RGB+NIR)
+                # Clay takes specific bands (e.g., RGB+NIR)
                 clay_input_band_names = ["blue", "green", "red", "nir"]
                 clay_input_indices = []
                 available_bands_in_resampled = {band: i for i, band in enumerate(DEFAULT_MOSAIC_BANDS_ORDER[:mosaic_feat_res.shape[0]])}
                 try:
                     for band_name in clay_input_band_names:
-                            clay_input_indices.append(available_bands_in_resampled[band_name])
-                            clay_mosaic_input = mosaic_feat_res[clay_input_indices, :, :]
+                        clay_input_indices.append(available_bands_in_resampled[band_name])
+                    clay_mosaic_input = mosaic_feat_res[clay_input_indices, :, :]
+                    norm_latlon_tensor = self._cached_norm_latlon
+                    norm_time_tensor = normalize_clay_timestamp(target_timestamp)
                 except KeyError as e:
-                    raise ValueError(f"Cannot extract required bands for Clay ('{e}') from resampled mosaic bands.")
-                norm_latlon_tensor = self._cached_norm_latlon
-            norm_time_tensor = normalize_clay_timestamp(target_timestamp)
+                    logging.warning(f"Cannot extract required bands for Clay ('{e}') from resampled mosaic bands. Skipping Clay.")
+                    clay_mosaic_input = None
 
         # --- Assemble Sample Dictionary --- #
         sample = {
