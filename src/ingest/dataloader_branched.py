@@ -14,6 +14,7 @@ import rasterio
 from rasterio.warp import calculate_default_transform, reproject, Resampling
 from rasterio.merge import merge
 import warnings
+import rioxarray
 
 # --- Import centralized utils --- #
 from .data_utils import (
@@ -58,10 +59,12 @@ class CityDataSetBranched(Dataset):
     Features:
     - Selectable Sentinel-2 bands for the mosaic.
     - Optional calculation and inclusion of NDVI, NDBI, NDWI.
-    - Optional inclusion of DEM, DSM, LST.
-    - Flexible DEM/DSM input (directory of tiles OR single file).
+    - Optional inclusion of HIGH-RESOLUTION DEM, DSM (loaded directly).
+    - Optional inclusion of LOW-RESOLUTION DEM, DSM (resampled, added to static_features).
+    - Optional inclusion of LST (added to static_features).
     - Weather data is always included.
-    - Returns static features combined into a single tensor.
+    - Returns static features (low-res non-elev) combined into a single tensor.
+    - Returns high-res DEM/DSM as separate tensors.
     """
 
     def __init__(self, bounds: List[float],
@@ -72,35 +75,45 @@ class CityDataSetBranched(Dataset):
                  # --- Feature Flags & Paths (from config) ---
                  feature_flags: Dict[str, bool],
                  sentinel_bands_to_load: List[str],
-                 dem_path: Optional[str] = None, # Dir or file
-                 dsm_path: Optional[str] = None, # Dir or file
+                 # --- LOW-RES Elevation Paths (Optional) --- #
+                 dem_path_low_res: Optional[str] = None, # Dir or file for low-res
+                 dsm_path_low_res: Optional[str] = None, # Dir or file for low-res
+                 # --- HIGH-RES Elevation Paths (Optional) --- #
+                 dem_path_high_res: Optional[str] = None, # File path for high-res
+                 dsm_path_high_res: Optional[str] = None, # File path for high-res
+                 high_res_nodata: Optional[float] = None, # Nodata for high-res files
+                 # ------------------------------------------ #
                  cloudless_mosaic_path: Optional[str] = None,
                  single_lst_median_path: Optional[str] = None,
                  # --- UPDATED DEFAULT: Weather Sequence Length ---
                  weather_seq_length: int = 60, # Default set to 60
                  # --- Other Params --- #
-                 elevation_nodata: Optional[float] = None, # Default changed to None
+                 low_res_elevation_nodata: Optional[float] = None, # Nodata for low-res tiles/files.
                  ):
         """
-        Initialize the branched dataset, supporting weather sequences.
+        Initialize the branched dataset, supporting weather sequences and high-res elevation.
 
         Args:
             bounds: Bounding box [min_lon, min_lat, max_lon, max_lat]. REQUIRED.
-            resolution_m: Target spatial resolution (meters).
+            resolution_m: Target spatial resolution (meters) for LOW-RES features.
             uhi_csv: Path to UHI data CSV.
             bronx_weather_csv: Path to Bronx weather station CSV.
             manhattan_weather_csv: Path to Manhattan weather station CSV.
             data_dir: Base directory for stored data.
             city_name: Name of the city.
             feature_flags (Dict[str, bool]): Dictionary controlling feature inclusion.
+                Expected keys: use_dem_high_res, use_dsm_high_res, use_dem_low_res, use_dsm_low_res,
+                               use_clay, use_sentinel_composite, use_lst, use_ndvi, use_ndbi, use_ndwi
             sentinel_bands_to_load (List[str]): Bands to load if sentinel_composite used.
-            dem_path (Optional[str]): Path to DEM dir or file.
-            dsm_path (Optional[str]): Path to DSM dir or file.
+            dem_path_low_res (Optional[str]): Path to LOW-RES DEM dir or file.
+            dsm_path_low_res (Optional[str]): Path to LOW-RES DSM dir or file.
+            dem_path_high_res (Optional[str]): Path to HIGH-RES DEM GeoTIFF file.
+            dsm_path_high_res (Optional[str]): Path to HIGH-RES DSM GeoTIFF file.
+            high_res_nodata (Optional[float]): Nodata value for high-res files (e.g., np.nan).
             cloudless_mosaic_path (Optional[str]): Path to mosaic .npy file.
             single_lst_median_path (Optional[str]): Path to LST median .npy file.
             weather_seq_length (int): Number of weather time steps (Default: 60).
-            elevation_nodata: Nodata value used in DEM/DSM tiles/files. MUST match source data if DEM/DSM enabled.
-            # target_crs: Target Coordinate Reference System. Removed, derived internally.
+            low_res_elevation_nodata: Nodata value used in LOW-RES DEM/DSM tiles/files.
         """
         # --- Basic Parameters ---
         assert bounds and len(bounds) == 4, "Bounds [min_lon, min_lat, max_lon, max_lat] must be provided."
@@ -108,24 +121,25 @@ class CityDataSetBranched(Dataset):
         self.resolution_m = resolution_m
         self.data_dir = Path(data_dir)
         self.city_name = city_name
-        # self.target_crs_str = target_crs # Removed assignment
         # Determine target CRS implicitly from bounds (assuming WGS84 / EPSG:4326 for lat/lon bounds)
         # If bounds were in a different CRS, this might need adjustment, but EPSG:4326 is standard.
         self.target_crs_str = "EPSG:4326"
         self.target_crs = rasterio.crs.CRS.from_string(self.target_crs_str)
-        self.elevation_nodata = elevation_nodata
+        self.low_res_elevation_nodata = low_res_elevation_nodata
+        self.high_res_nodata = high_res_nodata
         self.weather_seq_length = weather_seq_length
 
         # Store feature flags and related paths from the dictionary
         self.feature_flags = feature_flags
         self.selected_mosaic_bands = sentinel_bands_to_load
-        self._dem_path = dem_path
-        self._dsm_path = dsm_path
+        self._dem_path_low_res = dem_path_low_res
+        self._dsm_path_low_res = dsm_path_low_res
+        self._dem_path_high_res = dem_path_high_res
+        self._dsm_path_high_res = dsm_path_high_res
         self._cloudless_mosaic_path = cloudless_mosaic_path
         self._single_lst_median_path = single_lst_median_path
 
         # --- Load UHI Data & Determine Target Grid Size --- #
-        # (Same logic as original dataloader)
         self.uhi_data = pd.read_csv(uhi_csv)
         timestamp_col_name = 'datetime'
         if timestamp_col_name not in self.uhi_data.columns:
@@ -152,6 +166,84 @@ class CityDataSetBranched(Dataset):
         # --- Feature Loading & Processing --- #
         self.static_features_list = []
         self.feature_names = []
+
+        # --- NEW: High-Resolution Elevation Loading (No Resampling) --- #
+        self.high_res_dem_full = None
+        if self.feature_flags.get("use_dem_high_res", False):
+            if not self._dem_path_high_res: raise ValueError("dem_path_high_res required if use_dem_high_res is True.")
+            dem_p = Path(self._dem_path_high_res)
+            if dem_p.exists():
+                logging.info(f"Loading HIGH-RESOLUTION DEM from: {dem_p}")
+                try:
+                    rds = rioxarray.open_rasterio(dem_p)
+                    if self.high_res_nodata is not None:
+                        rds = rds.where(rds != self.high_res_nodata)
+                        rds.rio.write_nodata(np.nan, encoded=True, inplace=True)
+
+                    if rds.rio.crs != self.target_crs:
+                       logging.info(f"Reprojecting HIGH-RES DEM from {rds.rio.crs} to {self.target_crs_str}")
+                       rds = rds.rio.reproject(self.target_crs_str)
+
+                    logging.info(f"Clipping HIGH-RES DEM to bounds: {self.bounds}")
+                    min_lon, min_lat, max_lon, max_lat = self.bounds
+                    clipped_rds = rds.rio.clip_box(minx=min_lon, miny=min_lat, maxx=max_lon, maxy=max_lat)
+
+                    self.high_res_dem_full = clipped_rds.astype(np.float32).to_numpy()
+                    if self.high_res_dem_full.ndim == 2:
+                        self.high_res_dem_full = self.high_res_dem_full[np.newaxis, :, :]
+                    elif self.high_res_dem_full.ndim == 3 and self.high_res_dem_full.shape[0] != 1:
+                         logging.warning(f"Loaded high-res DEM has unexpected band dim {self.high_res_dem_full.shape[0]}, taking first band.")
+                         self.high_res_dem_full = self.high_res_dem_full[[0], :, :]
+
+                    self.high_res_dem_full = np.nan_to_num(self.high_res_dem_full, nan=0.0) # Fill any remaining NaNs
+                    logging.info(f"Loaded HIGH-RES DEM shape: {self.high_res_dem_full.shape}")
+                    rds.close(); del rds; del clipped_rds
+                except Exception as e:
+                    logging.error(f"Failed to load/process high-res DEM from {dem_p}: {e}")
+                    self.high_res_dem_full = None # Ensure it's None if loading fails
+                    self.feature_flags["use_dem_high_res"] = False # Disable flag if failed
+            else:
+                logging.warning(f"High-resolution DEM path specified but not found: {dem_p}")
+                self.feature_flags["use_dem_high_res"] = False
+
+        self.high_res_dsm_full = None
+        if self.feature_flags.get("use_dsm_high_res", False):
+            if not self._dsm_path_high_res: raise ValueError("dsm_path_high_res required if use_dsm_high_res is True.")
+            dsm_p = Path(self._dsm_path_high_res)
+            if dsm_p.exists():
+                logging.info(f"Loading HIGH-RESOLUTION DSM from: {dsm_p}")
+                try:
+                    rds = rioxarray.open_rasterio(dsm_p)
+                    if self.high_res_nodata is not None:
+                        rds = rds.where(rds != self.high_res_nodata)
+                        rds.rio.write_nodata(np.nan, encoded=True, inplace=True)
+
+                    if rds.rio.crs != self.target_crs:
+                       logging.info(f"Reprojecting HIGH-RES DSM from {rds.rio.crs} to {self.target_crs_str}")
+                       rds = rds.rio.reproject(self.target_crs_str)
+
+                    logging.info(f"Clipping HIGH-RES DSM to bounds: {self.bounds}")
+                    min_lon, min_lat, max_lon, max_lat = self.bounds
+                    clipped_rds = rds.rio.clip_box(minx=min_lon, miny=min_lat, maxx=max_lon, maxy=max_lat)
+
+                    self.high_res_dsm_full = clipped_rds.astype(np.float32).to_numpy()
+                    if self.high_res_dsm_full.ndim == 2:
+                        self.high_res_dsm_full = self.high_res_dsm_full[np.newaxis, :, :]
+                    elif self.high_res_dsm_full.ndim == 3 and self.high_res_dsm_full.shape[0] != 1:
+                         logging.warning(f"Loaded high-res DSM has unexpected band dim {self.high_res_dsm_full.shape[0]}, taking first band.")
+                         self.high_res_dsm_full = self.high_res_dsm_full[[0], :, :]
+
+                    self.high_res_dsm_full = np.nan_to_num(self.high_res_dsm_full, nan=0.0) # Fill any remaining NaNs
+                    logging.info(f"Loaded HIGH-RES DSM shape: {self.high_res_dsm_full.shape}")
+                    rds.close(); del rds; del clipped_rds
+                except Exception as e:
+                    logging.error(f"Failed to load/process high-res DSM from {dsm_p}: {e}")
+                    self.high_res_dsm_full = None # Ensure it's None if loading fails
+                    self.feature_flags["use_dsm_high_res"] = False # Disable flag if failed
+            else:
+                logging.warning(f"High-resolution DSM path specified but not found: {dsm_p}")
+                self.feature_flags["use_dsm_high_res"] = False
+        # --- END High-Res Elevation Loading --- #
 
         # 1. Cloudless Mosaic & Derived Indices (Based on Flags)
         self.cloudless_mosaic_full = None
@@ -242,21 +334,19 @@ class CityDataSetBranched(Dataset):
                 logging.error(f"Failed LST loading/processing from {lst_path}: {e}. Disabling LST.")
                 self.feature_flags["use_lst"] = False # Update flag if failed
 
-        # 3. DEM (Based on Flag)
-        if self.feature_flags["use_dem"]:
-            if not self._dem_path: raise ValueError("dem_path required if use_dem is True.")
-            # Ensure nodata value is provided if DEM is used - REMOVED CHECK, handled by util
-            dem_grid = load_process_elevation(self._dem_path, "DEM", self.bounds, self.resolution_m, self.sat_H, self.sat_W, self.target_crs_str, self.target_transform, self.elevation_nodata)
-            if dem_grid is not None: self.static_features_list.append(dem_grid); self.feature_names.append("dem")
-            else: logging.warning("DEM loading failed. Feature disabled."); self.feature_flags["use_dem"] = False
+        # 3. LOW-RES DEM (Based on Flag, Added to static_features)
+        if self.feature_flags.get("use_dem_low_res", False):
+            if not self._dem_path_low_res: raise ValueError("dem_path_low_res required if use_dem_low_res is True.")
+            dem_grid = load_process_elevation(self._dem_path_low_res, "DEM", self.bounds, self.resolution_m, self.sat_H, self.sat_W, self.target_crs_str, self.target_transform, self.low_res_elevation_nodata)
+            if dem_grid is not None: self.static_features_list.append(dem_grid); self.feature_names.append("dem_low_res")
+            else: logging.warning("LOW-RES DEM loading failed. Feature disabled."); self.feature_flags["use_dem_low_res"] = False
 
-        # 4. DSM (Based on Flag)
-        if self.feature_flags["use_dsm"]:
-            if not self._dsm_path: raise ValueError("dsm_path required if use_dsm is True.")
-            # Ensure nodata value is provided if DSM is used - REMOVED CHECK, handled by util
-            dsm_grid = load_process_elevation(self._dsm_path, "DSM", self.bounds, self.resolution_m, self.sat_H, self.sat_W, self.target_crs_str, self.target_transform, self.elevation_nodata)
-            if dsm_grid is not None: self.static_features_list.append(dsm_grid); self.feature_names.append("dsm")
-            else: logging.warning("DSM loading failed. Feature disabled."); self.feature_flags["use_dsm"] = False
+        # 4. LOW-RES DSM (Based on Flag, Added to static_features)
+        if self.feature_flags.get("use_dsm_low_res", False):
+            if not self._dsm_path_low_res: raise ValueError("dsm_path_low_res required if use_dsm_low_res is True.")
+            dsm_grid = load_process_elevation(self._dsm_path_low_res, "DSM", self.bounds, self.resolution_m, self.sat_H, self.sat_W, self.target_crs_str, self.target_transform, self.low_res_elevation_nodata)
+            if dsm_grid is not None: self.static_features_list.append(dsm_grid); self.feature_names.append("dsm_low_res")
+            else: logging.warning("LOW-RES DSM loading failed. Feature disabled."); self.feature_flags["use_dsm_low_res"] = False
 
         # --- Combine Static Features (Non-Clay) --- #
         if not self.static_features_list:
@@ -270,7 +360,6 @@ class CityDataSetBranched(Dataset):
             logging.info(f"Non-Clay static channels: {self.feature_names}")
 
         # --- Load Weather Station Data --- #
-        # (Same logic as original dataloader)
         self.bronx_weather = pd.read_csv(bronx_weather_csv)
         self.manhattan_weather = pd.read_csv(manhattan_weather_csv)
         target_timezone = 'US/Eastern'
@@ -311,6 +400,8 @@ class CityDataSetBranched(Dataset):
         logging.info(f"Weather sequence length T = {self.weather_seq_length}")
         logging.info(f"Enabled features (flags): {json.dumps(self.feature_flags)}")
         logging.info(f"Total NON-CLAY static feature channels: {self.combined_static_features.shape[0]}")
+        logging.info(f" High-res DEM loaded: {self.high_res_dem_full is not None} (shape: {self.high_res_dem_full.shape if self.high_res_dem_full is not None else 'N/A'})")
+        logging.info(f" High-res DSM loaded: {self.high_res_dsm_full is not None} (shape: {self.high_res_dsm_full.shape if self.high_res_dsm_full is not None else 'N/A'})")
 
     def _precompute_weather_grids(self):
         """Precomputes the weather grid for every unique timestamp using util function."""
@@ -406,5 +497,12 @@ class CityDataSetBranched(Dataset):
             sample['cloudless_mosaic'] = torch.from_numpy(cloudless_mosaic_for_clay).float()
             sample['norm_latlon'] = torch.from_numpy(norm_latlon_tensor).float()
             sample['norm_timestamp'] = torch.from_numpy(norm_time_tensor).float()
+
+        # --- ADD High-Res DEM/DSM if loaded --- #
+        if self.feature_flags.get("use_dem_high_res", False) and self.high_res_dem_full is not None:
+            sample['high_res_dem'] = torch.from_numpy(self.high_res_dem_full).float()
+        if self.feature_flags.get("use_dsm_high_res", False) and self.high_res_dsm_full is not None:
+            sample['high_res_dsm'] = torch.from_numpy(self.high_res_dsm_full).float()
+        # --- END ADD --- #
 
         return sample 
