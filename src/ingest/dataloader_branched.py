@@ -400,8 +400,8 @@ class CityDataSetBranched(Dataset):
         logging.info(f"Weather sequence length T = {self.weather_seq_length}")
         logging.info(f"Enabled features (flags): {json.dumps(self.feature_flags)}")
         logging.info(f"Total NON-CLAY static feature channels: {self.combined_static_features.shape[0]}")
-        logging.info(f" High-res DEM loaded: {self.high_res_dem_full is not None} (shape: {self.high_res_dem_full.shape if self.high_res_dem_full is not None else 'N/A'})\")
-        logging.info(f" High-res DSM loaded: {self.high_res_dsm_full is not None} (shape: {self.high_res_dsm_full.shape if self.high_res_dsm_full is not None else 'N/A'})\")
+        logging.info(f" High-res DEM loaded: {self.high_res_dem_full is not None} (shape: {self.high_res_dem_full.shape if self.high_res_dem_full is not None else 'N/A'})")
+        logging.info(f" High-res DSM loaded: {self.high_res_dsm_full is not None} (shape: {self.high_res_dsm_full.shape if self.high_res_dsm_full is not None else 'N/A'})")
 
     def _precompute_weather_grids(self):
         """Precomputes the weather grid for every unique timestamp using util function."""
