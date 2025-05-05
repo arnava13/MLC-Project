@@ -250,8 +250,8 @@ class CityDataSetBranched(Dataset):
                 except Exception as e:
                             logging.error(f"Failed LST loading/processing from {lst_path}: {e}")
                             self.lst_xr = None
-        else:
-                logging.warning(f"LST path specified but not found: {lst_path}")
+            else: # Path doesn't exist
+                logging.warning(f"LST path specified but not found: {self._single_lst_median_path}")
 
         # --- Load Weather Station Data --- #
         self.bronx_weather = pd.read_csv(bronx_weather_csv)
