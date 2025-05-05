@@ -171,10 +171,10 @@ class CityDataSet(Dataset):
                     min_lon, min_lat, max_lon, max_lat = self.bounds
                     self.dem_xr = self.dem_xr.rio.clip_box(minx=min_lon, miny=min_lat, maxx=max_lon, maxy=max_lat, crs=self.target_crs_str)
                     logging.info(f"Loaded DEM shape (native res, clipped): {self.dem_xr.shape}")
-                    except Exception as e:
+                except Exception as e:
                     logging.error(f"Failed to load/process DEM from {dem_p}: {e}")
                     self.dem_xr = None
-                else:
+            else:
                 logging.warning(f"DEM path specified but not found: {dem_p}")
 
         # 2. DSM (Load with rioxarray, keep as object)

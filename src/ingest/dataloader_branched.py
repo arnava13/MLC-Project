@@ -234,23 +234,22 @@ class CityDataSetBranched(Dataset):
             if not self._single_lst_median_path: raise ValueError("single_lst_median_path required if use_lst is True.")
             lst_path = Path(self._single_lst_median_path)
             if lst_path.exists():
-            logging.info(f"Loading LST median from: {lst_path}")
-            try:
-                    self.lst_xr = rioxarray.open_rasterio(lst_path, masked=True).load()
-                    # Basic nodata handling
-                    if self.lst_nodata is not None:
-                        self.lst_xr = self.lst_xr.where(self.lst_xr != self.lst_nodata)
-                        self.lst_xr.rio.write_nodata(np.nan, encoded=True, inplace=True)
-                    # Ensure target CRS (assuming it might be different)
-                    if self.lst_xr.rio.crs != self.target_crs:
-                        logging.info(f"Reprojecting LST from {self.lst_xr.rio.crs} to {self.target_crs_str}")
-                        self.lst_xr = self.lst_xr.rio.reproject(self.target_crs_str)
-                        # Clip to bounds (optional, assuming it covers the area)
-                        # self.lst_xr = self.lst_xr.rio.clip_box(...) # Add if needed
-                        logging.info(f"Loaded LST shape (native res): {self.lst_xr.shape}")
-            except Exception as e:
-                        logging.error(f"Failed LST loading/processing from {lst_path}: {e}")
-                        self.lst_xr = None
+                try:
+                        self.lst_xr = rioxarray.open_rasterio(lst_path, masked=True).load()
+                        # Basic nodata handling
+                        if self.lst_nodata is not None:
+                            self.lst_xr = self.lst_xr.where(self.lst_xr != self.lst_nodata)
+                            self.lst_xr.rio.write_nodata(np.nan, encoded=True, inplace=True)
+                        # Ensure target CRS (assuming it might be different)
+                        if self.lst_xr.rio.crs != self.target_crs:
+                            logging.info(f"Reprojecting LST from {self.lst_xr.rio.crs} to {self.target_crs_str}")
+                            self.lst_xr = self.lst_xr.rio.reproject(self.target_crs_str)
+                            # Clip to bounds (optional, assuming it covers the area)
+                            # self.lst_xr = self.lst_xr.rio.clip_box(...) # Add if needed
+                            logging.info(f"Loaded LST shape (native res): {self.lst_xr.shape}")
+                except Exception as e:
+                            logging.error(f"Failed LST loading/processing from {lst_path}: {e}")
+                            self.lst_xr = None
         else:
                 logging.warning(f"LST path specified but not found: {lst_path}")
 
@@ -482,15 +481,14 @@ class CityDataSetBranched(Dataset):
             else:
             # Clay takes specific bands (e.g., RGB+NIR)
                 clay_input_band_names = ["blue", "green", "red", "nir"]
-            clay_input_indices = []
+                clay_input_indices = []
                 available_bands_in_resampled = {band: i for i, band in enumerate(DEFAULT_MOSAIC_BANDS_ORDER[:mosaic_feat_res.shape[0]])}
-            try:
-                for band_name in clay_input_band_names:
-                        clay_input_indices.append(available_bands_in_resampled[band_name])
-                    clay_mosaic_input = mosaic_feat_res[clay_input_indices, :, :]
+                try:
+                    for band_name in clay_input_band_names:
+                            clay_input_indices.append(available_bands_in_resampled[band_name])
+                            clay_mosaic_input = mosaic_feat_res[clay_input_indices, :, :]
                 except KeyError as e:
                     raise ValueError(f"Cannot extract required bands for Clay ('{e}') from resampled mosaic bands.")
-
                 norm_latlon_tensor = self._cached_norm_latlon
             norm_time_tensor = normalize_clay_timestamp(target_timestamp)
 
