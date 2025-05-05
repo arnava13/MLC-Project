@@ -161,22 +161,18 @@ class CityDataSetBranched(Dataset):
             if dem_p.exists():
                 logging.info(f"Loading DEM from: {dem_p}")
                 try:
-                    self.dem_xr = rioxarray.open_rasterio(dem_p, masked=True).load() # Load into memory
-                    # Basic nodata handling
+                    self.dem_xr = rioxarray.open_rasterio(dem_p, masked=True)
                     if self.elevation_nodata is not None:
                          self.dem_xr = self.dem_xr.where(self.dem_xr != self.elevation_nodata)
                          self.dem_xr.rio.write_nodata(np.nan, encoded=True, inplace=True)
-                    # Ensure target CRS
                     if self.dem_xr.rio.crs != self.target_crs:
                        logging.info(f"Reprojecting DEM from {self.dem_xr.rio.crs} to {self.target_crs_str}")
-                       self.dem_xr = self.dem_xr.rio.reproject(self.target_crs_str)
-                    # Clip to bounds
                     logging.info(f"Clipping DEM to bounds: {self.bounds}")
                     min_lon, min_lat, max_lon, max_lat = self.bounds
-                    self.dem_xr = self.dem_xr.rio.clip_box(minx=min_lon, miny=min_lat, maxx=max_lon, maxy=max_lat, crs=self.target_crs_str)
-                    logging.info(f"Loaded DEM shape (native res, clipped): {self.dem_xr.shape}")
+                    logging.info(f"Opened DEM (lazy load). Native shape (approx): {self.dem_xr.shape}")
                 except Exception as e:
-                    logging.error(f"Failed to load/process DEM from {dem_p}: {e}")
+                    logging.error(f"Failed to open/process DEM from {dem_p}: {e}")
+                    if self.dem_xr: self.dem_xr.close()
                     self.dem_xr = None
             else:
                 logging.warning(f"DEM path specified but not found: {dem_p}")
@@ -189,19 +185,18 @@ class CityDataSetBranched(Dataset):
             if dsm_p.exists():
                 logging.info(f"Loading DSM from: {dsm_p}")
                 try:
-                    self.dsm_xr = rioxarray.open_rasterio(dsm_p, masked=True).load()
+                    self.dsm_xr = rioxarray.open_rasterio(dsm_p, masked=True)
                     if self.elevation_nodata is not None:
                          self.dsm_xr = self.dsm_xr.where(self.dsm_xr != self.elevation_nodata)
                          self.dsm_xr.rio.write_nodata(np.nan, encoded=True, inplace=True)
                     if self.dsm_xr.rio.crs != self.target_crs:
                        logging.info(f"Reprojecting DSM from {self.dsm_xr.rio.crs} to {self.target_crs_str}")
-                       self.dsm_xr = self.dsm_xr.rio.reproject(self.target_crs_str)
                     logging.info(f"Clipping DSM to bounds: {self.bounds}")
                     min_lon, min_lat, max_lon, max_lat = self.bounds
-                    self.dsm_xr = self.dsm_xr.rio.clip_box(minx=min_lon, miny=min_lat, maxx=max_lon, maxy=max_lat, crs=self.target_crs_str)
-                    logging.info(f"Loaded DSM shape (native res, clipped): {self.dsm_xr.shape}")
+                    logging.info(f"Opened DSM (lazy load). Native shape (approx): {self.dsm_xr.shape}")
                 except Exception as e:
-                    logging.error(f"Failed to load/process DSM from {dsm_p}: {e}")
+                    logging.error(f"Failed to open/process DSM from {dsm_p}: {e}")
+                    if self.dsm_xr: self.dsm_xr.close()
                     self.dsm_xr = None
             else:
                 logging.warning(f"DSM path specified but not found: {dsm_p}")
@@ -221,8 +216,9 @@ class CityDataSetBranched(Dataset):
                 raise ValueError("cloudless_mosaic_path required if using Sentinel composite, indices, or Clay.")
             mosaic_path = Path(self._cloudless_mosaic_path)
             if not mosaic_path.exists(): raise FileNotFoundError(f"Cloudless mosaic file not found: {mosaic_path}")
-            logging.info(f"Loading cloudless mosaic from {mosaic_path}")
-            self.cloudless_mosaic_full_np = np.load(mosaic_path)
+            logging.info(f"Loading cloudless mosaic from {mosaic_path} with memory mapping")
+            # USE mmap_mode='r'
+            self.cloudless_mosaic_full_np = np.load(mosaic_path, mmap_mode='r')
             # Determine mosaic transform (assuming it matches UHI grid originally)
             mosaic_h_orig, mosaic_w_orig = self.cloudless_mosaic_full_np.shape[1:]
             self.mosaic_transform = rasterio.transform.from_bounds(*self.bounds, mosaic_w_orig, mosaic_h_orig)
@@ -235,20 +231,16 @@ class CityDataSetBranched(Dataset):
             lst_path = Path(self._single_lst_median_path)
             if lst_path.exists():
                 try:
-                    self.lst_xr = rioxarray.open_rasterio(lst_path, masked=True).load()
-                    # Basic nodata handling
+                    self.lst_xr = rioxarray.open_rasterio(lst_path, masked=True)
                     if self.lst_nodata is not None:
                         self.lst_xr = self.lst_xr.where(self.lst_xr != self.lst_nodata)
                         self.lst_xr.rio.write_nodata(np.nan, encoded=True, inplace=True)
-                    # Ensure target CRS (assuming it might be different)
                     if self.lst_xr.rio.crs != self.target_crs:
                         logging.info(f"Reprojecting LST from {self.lst_xr.rio.crs} to {self.target_crs_str}")
-                        self.lst_xr = self.lst_xr.rio.reproject(self.target_crs_str)
-                        # Clip to bounds (optional, assuming it covers the area)
-                        # self.lst_xr = self.lst_xr.rio.clip_box(...) # Add if needed
-                        logging.info(f"Loaded LST shape (native res): {self.lst_xr.shape}")
+                    logging.info(f"Opened LST (lazy load). Native shape (approx): {self.lst_xr.shape}")
                 except Exception as e:
                     logging.error(f"Failed LST loading/processing from {lst_path}: {e}")
+                    if self.lst_xr: self.lst_xr.close()
                     self.lst_xr = None
             else: # Path doesn't exist
                 logging.warning(f"LST path specified but not found: {self._single_lst_median_path}")
@@ -511,3 +503,23 @@ class CityDataSetBranched(Dataset):
             sample['norm_timestamp'] = torch.from_numpy(norm_time_tensor).float()
 
         return sample 
+
+    def __del__(self):
+        if hasattr(self, 'dem_xr') and self.dem_xr:
+            try:
+                self.dem_xr.close()
+                logging.debug("Closed DEM file handle.")
+            except Exception as e:
+                logging.warning(f"Exception closing DEM file handle: {e}")
+        if hasattr(self, 'dsm_xr') and self.dsm_xr:
+            try:
+                self.dsm_xr.close()
+                logging.debug("Closed DSM file handle.")
+            except Exception as e:
+                logging.warning(f"Exception closing DSM file handle: {e}")
+        if hasattr(self, 'lst_xr') and self.lst_xr:
+            try:
+                self.lst_xr.close()
+                logging.debug("Closed LST file handle.")
+            except Exception as e:
+                logging.warning(f"Exception closing LST file handle: {e}") 

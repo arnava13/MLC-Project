@@ -160,19 +160,18 @@ class CityDataSet(Dataset):
             if dem_p.exists():
                 logging.info(f"Loading DEM from: {dem_p}")
                 try:
-                    self.dem_xr = rioxarray.open_rasterio(dem_p, masked=True).load() # Load into memory
+                    self.dem_xr = rioxarray.open_rasterio(dem_p, masked=True)
                     if self.elevation_nodata is not None:
                         self.dem_xr = self.dem_xr.where(self.dem_xr != self.elevation_nodata)
                         self.dem_xr.rio.write_nodata(np.nan, encoded=True, inplace=True)
                     if self.dem_xr.rio.crs != self.target_crs:
                        logging.info(f"Reprojecting DEM from {self.dem_xr.rio.crs} to {self.target_crs_str}")
-                       self.dem_xr = self.dem_xr.rio.reproject(self.target_crs_str)
                     logging.info(f"Clipping DEM to bounds: {self.bounds}")
                     min_lon, min_lat, max_lon, max_lat = self.bounds
-                    self.dem_xr = self.dem_xr.rio.clip_box(minx=min_lon, miny=min_lat, maxx=max_lon, maxy=max_lat, crs=self.target_crs_str)
-                    logging.info(f"Loaded DEM shape (native res, clipped): {self.dem_xr.shape}")
+                    logging.info(f"Opened DEM (lazy load). Native shape (approx): {self.dem_xr.shape}")
                 except Exception as e:
-                    logging.error(f"Failed to load/process DEM from {dem_p}: {e}")
+                    logging.error(f"Failed to open/process DEM from {dem_p}: {e}")
+                    if self.dem_xr: self.dem_xr.close()
                     self.dem_xr = None
             else:
                 logging.warning(f"DEM path specified but not found: {dem_p}")
@@ -185,19 +184,18 @@ class CityDataSet(Dataset):
             if dsm_p.exists():
                 logging.info(f"Loading DSM from: {dsm_p}")
                 try:
-                    self.dsm_xr = rioxarray.open_rasterio(dsm_p, masked=True).load()
+                    self.dsm_xr = rioxarray.open_rasterio(dsm_p, masked=True)
                     if self.elevation_nodata is not None:
                          self.dsm_xr = self.dsm_xr.where(self.dsm_xr != self.elevation_nodata)
                          self.dsm_xr.rio.write_nodata(np.nan, encoded=True, inplace=True)
                     if self.dsm_xr.rio.crs != self.target_crs:
                        logging.info(f"Reprojecting DSM from {self.dsm_xr.rio.crs} to {self.target_crs_str}")
-                       self.dsm_xr = self.dsm_xr.rio.reproject(self.target_crs_str)
                     logging.info(f"Clipping DSM to bounds: {self.bounds}")
                     min_lon, min_lat, max_lon, max_lat = self.bounds
-                    self.dsm_xr = self.dsm_xr.rio.clip_box(minx=min_lon, miny=min_lat, maxx=max_lon, maxy=max_lat, crs=self.target_crs_str)
-                    logging.info(f"Loaded DSM shape (native res, clipped): {self.dsm_xr.shape}")
+                    logging.info(f"Opened DSM (lazy load). Native shape (approx): {self.dsm_xr.shape}")
                 except Exception as e:
-                    logging.error(f"Failed to load/process DSM from {dsm_p}: {e}")
+                    logging.error(f"Failed to open/process DSM from {dsm_p}: {e}")
+                    if self.dsm_xr: self.dsm_xr.close()
                     self.dsm_xr = None
             else:
                 logging.warning(f"DSM path specified but not found: {dsm_p}")
@@ -217,8 +215,8 @@ class CityDataSet(Dataset):
                 raise ValueError("cloudless_mosaic_path required if using Sentinel composite, indices, or Clay.")
             mosaic_path = Path(self._cloudless_mosaic_path)
             if not mosaic_path.exists(): raise FileNotFoundError(f"Cloudless mosaic file not found: {mosaic_path}")
-            logging.info(f"Loading cloudless mosaic from {mosaic_path}")
-            self.cloudless_mosaic_full_np = np.load(mosaic_path)
+            logging.info(f"Loading cloudless mosaic from {mosaic_path} with memory mapping")
+            self.cloudless_mosaic_full_np = np.load(mosaic_path, mmap_mode='r')
             mosaic_h_orig, mosaic_w_orig = self.cloudless_mosaic_full_np.shape[1:]
             self.mosaic_transform = rasterio.transform.from_bounds(*self.bounds, mosaic_w_orig, mosaic_h_orig)
             logging.info(f"Loaded mosaic shape (native res): {self.cloudless_mosaic_full_np.shape}")
@@ -229,18 +227,18 @@ class CityDataSet(Dataset):
             if not self._single_lst_median_path: raise ValueError("single_lst_median_path required if use_lst is True.")
             lst_path = Path(self._single_lst_median_path)
             if lst_path.exists():
-                logging.info(f"Loading LST median from: {lst_path}")
+                logging.info(f"Loading LST from: {lst_path}")
                 try:
-                    self.lst_xr = rioxarray.open_rasterio(lst_path, masked=True).load()
+                    self.lst_xr = rioxarray.open_rasterio(lst_path, masked=True)
                     if self.lst_nodata is not None:
                          self.lst_xr = self.lst_xr.where(self.lst_xr != self.lst_nodata)
                          self.lst_xr.rio.write_nodata(np.nan, encoded=True, inplace=True)
                     if self.lst_xr.rio.crs != self.target_crs:
                        logging.info(f"Reprojecting LST from {self.lst_xr.rio.crs} to {self.target_crs_str}")
-                       self.lst_xr = self.lst_xr.rio.reproject(self.target_crs_str)
-                    logging.info(f"Loaded LST shape (native res): {self.lst_xr.shape}")
+                    logging.info(f"Opened LST (lazy load). Native shape (approx): {self.lst_xr.shape}")
                 except Exception as e:
                     logging.error(f"Failed LST loading/processing from {lst_path}: {e}")
+                    if self.lst_xr: self.lst_xr.close()
                     self.lst_xr = None
             else:
                 logging.warning(f"LST path specified but not found: {lst_path}")
@@ -271,9 +269,6 @@ class CityDataSet(Dataset):
         self.weather_grid_coords = compute_grid_cell_coordinates(self.bounds, self.feat_H, self.feat_W)
         # --- Precompute Static Clay Lat/Lon Embedding --- #
         self._cached_norm_latlon = normalize_clay_latlon(self.bounds)
-        # --- Precompute Weather Grids for all timestamps (at FEATURE resolution) --- #
-        self.weather_grids = {} # Dict to store precomputed grids
-        self._precompute_weather_grids()
 
         # --- Final Log --- #
         logging.info(f"Dataset initialized for {self.city_name} with {len(self)} unique timestamps.")
@@ -282,22 +277,6 @@ class CityDataSet(Dataset):
         logging.info(f"DSM loaded: {self.dsm_xr is not None}")
         logging.info(f"LST loaded: {self.lst_xr is not None}")
         logging.info(f"Mosaic loaded: {self.cloudless_mosaic_full_np is not None}")
-
-    def _precompute_weather_grids(self):
-        """Precomputes the weather grid for every unique timestamp at FEATURE resolution."""
-        logging.info("Precomputing weather grids for all unique timestamps...")
-        for timestamp in tqdm(self.unique_timestamps, desc="Precomputing weather grids"):
-            self.weather_grids[timestamp] = build_weather_grid(
-                timestamp=timestamp,
-                bronx_weather=self.bronx_weather,
-                manhattan_weather=self.manhattan_weather,
-                bronx_coords=self.bronx_coords,
-                manhattan_coords=self.manhattan_coords,
-                grid_coords=self.weather_grid_coords, # Use feature res coords
-                sat_H=self.feat_H, # Use feature res dimensions
-                sat_W=self.feat_W
-            )
-        logging.info("Finished precomputing weather grids.")
 
     def __len__(self):
         return len(self.unique_timestamps)
@@ -309,16 +288,25 @@ class CityDataSet(Dataset):
         target_grid = self.target_grids[target_timestamp]
         valid_mask = self.valid_masks[target_timestamp]
 
-        # --- Retrieve Precomputed Weather Grid for target timestamp (at FEATURE resolution) --- #
-        weather_grid_feat_res = self.weather_grids.get(target_timestamp)
+        # --- Build Weather Grid for target timestamp (at FEATURE resolution) ON THE FLY --- #
+        weather_grid_feat_res = build_weather_grid(
+            timestamp=target_timestamp,
+            bronx_weather=self.bronx_weather,
+            manhattan_weather=self.manhattan_weather,
+            bronx_coords=self.bronx_coords,
+            manhattan_coords=self.manhattan_coords,
+            grid_coords=self.weather_grid_coords, # Use feature res coords
+            sat_H=self.feat_H, # Use feature res dimensions
+            sat_W=self.feat_W
+        )
         if weather_grid_feat_res is None:
-            # Fallback if precomputation failed or wasn't run (should not happen)
-            logging.warning(f"Precomputed weather grid missing for {target_timestamp}. Building on the fly.")
-            weather_grid_feat_res = build_weather_grid(
-                target_timestamp, self.bronx_weather, self.manhattan_weather,
-                self.bronx_coords, self.manhattan_coords,
-                self.weather_grid_coords, self.feat_H, self.feat_W
-            )
+            # This might happen if weather data is missing for the exact timestamp
+            # Handle this case, e.g., by logging and returning a zero grid or raising an error
+            logging.error(f"Failed to build weather grid for {target_timestamp}. Weather data might be missing.")
+            # Option 1: Raise error
+            # raise RuntimeError(f"Failed to build weather grid for {target_timestamp}")
+            # Option 2: Return a zero grid (ensure dimensions match)
+            weather_grid_feat_res = np.zeros((6, self.feat_H, self.feat_W), dtype=np.float32) # Assuming 6 weather channels
 
         # --- Prepare Static Features (resampled to FEATURE resolution) --- #
         static_features_list = [] # For non-Clay, non-Elev features
@@ -479,3 +467,20 @@ class CityDataSet(Dataset):
         # REMOVE HIGH-RES ELEVATION OUTPUT
 
         return sample
+
+    def __del__(self):
+        if hasattr(self, 'dem_xr') and self.dem_xr:
+            try:
+                self.dem_xr.close()
+            except Exception as e:
+                logging.warning(f"Exception closing DEM file handle: {e}")
+        if hasattr(self, 'dsm_xr') and self.dsm_xr:
+            try:
+                self.dsm_xr.close()
+            except Exception as e:
+                logging.warning(f"Exception closing DSM file handle: {e}")
+        if hasattr(self, 'lst_xr') and self.lst_xr:
+            try:
+                self.lst_xr.close()
+            except Exception as e:
+                logging.warning(f"Exception closing LST file handle: {e}")
