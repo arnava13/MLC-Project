@@ -675,7 +675,7 @@ class UHINetCNN(nn.Module):
                 norm_time_tensor: torch.Tensor,
                 norm_latlon_tensor: torch.Tensor,
                 weather: torch.Tensor,
-                target_h_w: Tuple[int, int],
+                target_h_w: Tuple[int, int], 
                 static_lst: Optional[torch.Tensor] = None,
                 high_res_dem: Optional[torch.Tensor] = None,
                 high_res_dsm: Optional[torch.Tensor] = None) -> torch.Tensor:
