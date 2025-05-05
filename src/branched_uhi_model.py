@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
 import math
 from pathlib import Path
-from typing import List, Tuple, Optional
+from typing import List, Tuple, Optional, Dict, Union
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import logging
 
-from src.model import UNetConvBlock, ClayFeatureExtractor, HighResElevationBranch # Re-use UNetConvBlock, ClayExtractor AND HighResElevationBranch
+from src.model import UNetConvBlock, ClayFeatureExtractor
+from src.ingest.data_utils import determine_target_grid_size
 
 # -----------------------------------------------------------------------------
 # ConvLSTM Implementation -----------------------------------------------------
@@ -92,7 +93,7 @@ class ConvLSTM(nn.Module):
     (https://arxiv.org/abs/1506.04214)
     """
 
-    def __init__(self, input_dim, hidden_dim, kernel_size, num_layers, batch_first=True, bias=True):
+    def __init__(self, input_dim, hidden_dim, kernel_size, num_layers, batch_first=True, bias=True, return_all_layers=False):
         """
         Args:
             input_dim (int): Number of channels in input
@@ -103,6 +104,7 @@ class ConvLSTM(nn.Module):
             num_layers (int): Number of ConvLSTM layers
             batch_first (bool): If True, then Input/Output shape = (b, t, c, h, w)
             bias (bool): Bias bool.
+            return_all_layers (bool): If True, return all layer outputs.
         """
         super().__init__()
 
@@ -121,6 +123,7 @@ class ConvLSTM(nn.Module):
         self.num_layers = num_layers
         self.batch_first = batch_first
         self.bias = bias
+        self.return_all_layers = return_all_layers
 
         cell_list = []
         for i in range(0, self.num_layers):
@@ -233,299 +236,328 @@ class BranchedUHIModel(nn.Module):
     UHI prediction model with separate branches for temporal (weather) and
     static features, fused before a U-Net style head.
     Uses ConvLSTM for weather processing.
-    Optionally includes high-resolution elevation branches processed separately.
+    Accepts ALL spatial features (weather, clay, lst, dem, dsm, indices) at a
+    common feature resolution.
     """
     def __init__(self,
+                 # --- Weather Branch Config --- #
                  weather_input_channels: int,
                  convlstm_hidden_dims: List[int],
                  convlstm_kernel_sizes: List[Tuple[int, int]],
                  convlstm_num_layers: int,
-                 static_channels: int, # Number of NON-ELEVATION, NON-CLAY static channels
+                 # --- Static Feature Config --- #
+                 feature_flags: Dict[str, bool],
+                 # --- Head Config --- #
+                 proj_static_ch: int, # Projection channels for combined static feats
+                 proj_temporal_ch: int, # Projection channels for ConvLSTM output
                  unet_base_channels: int,
                  unet_depth: int,
-                 convlstm_batch_first: bool = True,
-                 include_clay_features: bool = False,
-                 clay_checkpoint_path: Optional[str] = None,
-                 clay_metadata_path: Optional[str] = None,
-                 freeze_clay_backbone: bool = True,
-                 clay_embed_dim: Optional[int] = 1024,
-                 proj_static_ch: int = 32, # For projecting non-clay, non-elevation static features
-                 proj_temporal_ch: int = 32,
-                 # --- NEW: High-Resolution Elevation Branch Args --- #
-                 include_dem_branch: bool = False,
-                 include_dsm_branch: bool = False,
-                 elevation_branch_start_channels: int = 16,
-                 elevation_branch_out_channels: int = 32,
-                 elevation_branch_downsample_layers: int = 4,
-                 elevation_branch_kernel_size: int = 3,
-                 # ---------------------------------------------------- #
-                 **clay_kwargs
-                 ):
+                 # --- Target Grid Info ---
+                 uhi_grid_resolution_m: int,
+                 bounds: List[float],
+                 # Optional arguments (can have defaults)
+                 sentinel_bands_to_load: Optional[List[str]] = None,
+                 # Clay Specific (optional, defaults handled internally if use_clay is False)
+                 clay_model_size: Optional[str] = None,
+                 clay_bands: Optional[List[str]] = None,
+                 clay_platform: Optional[str] = None,
+                 clay_gsd: Optional[int] = None,
+                 freeze_backbone: bool = True,
+                 clay_checkpoint_path: Optional[Union[str, Path]] = None,
+                 clay_metadata_path: Optional[Union[str, Path]] = None):
+        """
+        Initializes the Branched UHI Model with common feature resolution.
+
+        Args:
+            weather_input_channels (int): Number of input channels for weather data.
+            convlstm_hidden_dims (List[int]): List of hidden dimensions for ConvLSTM layers.
+            convlstm_kernel_sizes (List[Tuple[int, int]]): List of kernel sizes for ConvLSTM layers.
+            convlstm_num_layers (int): Number of ConvLSTM layers.
+            feature_flags (Dict[str, bool]): Controls inclusion of static features (use_dem, use_dsm, etc.).
+            sentinel_bands_to_load (Optional[List[str]]): Bands if using sentinel_composite.
+            clay_model_size (Optional[str]): Size of Clay model if use_clay is True.
+            clay_bands (Optional[List[str]]): Bands for Clay if use_clay is True.
+            clay_platform (Optional[str]): Platform for Clay if use_clay is True.
+            clay_gsd (Optional[int]): GSD for Clay if use_clay is True.
+            freeze_backbone (bool): Whether to freeze Clay backbone weights.
+            clay_checkpoint_path (Optional[str]): Path to Clay checkpoint if use_clay is True.
+            clay_metadata_path (Optional[str]): Path to Clay metadata if use_clay is True.
+            proj_static_ch (int): Output channels for static feature projection layer.
+            proj_temporal_ch (int): Output channels for temporal feature projection layer.
+            unet_base_channels (int): Base number of channels for the U-Net decoder.
+            unet_depth (int): Number of down/up sampling blocks in the U-Net decoder.
+            uhi_grid_resolution_m (int): The resolution of the final target UHI grid.
+            bounds (List[float]): The geographic bounds [min_lon, min_lat, max_lon, max_lat].
+        """
         super().__init__()
-        self.weather_input_channels = weather_input_channels
-        self.static_channels = static_channels # Non-elev, non-clay
-        self.include_clay_features = include_clay_features and clay_checkpoint_path and clay_metadata_path
-        self.clay_embed_dim = clay_embed_dim
-        # --- Store elevation flags --- #
-        self.include_dem_branch = include_dem_branch
-        self.include_dsm_branch = include_dsm_branch
-        self.elevation_out_channels = elevation_branch_out_channels
-        # ---------------------------- #
+        self.feature_flags = feature_flags
+        self.bounds = bounds
+        self.uhi_grid_resolution_m = uhi_grid_resolution_m
 
-        # --- Weather Branch (ConvLSTM) ---
-        # Small spatial feature extractor applied before ConvLSTM
-        self.weather_feature_extractor = nn.Sequential(
-            nn.Conv2d(weather_input_channels, weather_input_channels, kernel_size=3, padding=1),
-            nn.BatchNorm2d(weather_input_channels),
-            nn.ReLU(inplace=True)
+        # Calculate and store target output dimensions
+        self.target_H, self.target_W = determine_target_grid_size(
+            self.bounds, self.uhi_grid_resolution_m
         )
-        convlstm_input_dim = weather_input_channels
+        logging.info(f"Model configured for target output grid size: ({self.target_H}, {self.target_W})")
 
-        self.convlstm = ConvLSTM(
-            input_dim=convlstm_input_dim,
+        # --- Weather Branch (ConvLSTM) --- #
+        self.conv_lstm = ConvLSTM(
+            input_dim=weather_input_channels,
             hidden_dim=convlstm_hidden_dims,
             kernel_size=convlstm_kernel_sizes,
             num_layers=convlstm_num_layers,
-            batch_first=convlstm_batch_first,
-            bias=True
+            batch_first=True, # Expect input (B, T, C, H, W)
+            bias=True,
+            return_all_layers=False
         )
-        # Output channels from the weather branch is the hidden dim of the last ConvLSTM layer
-        temporal_output_channels = convlstm_hidden_dims[-1]
 
-        # --- Static Branch ---
-        self.clay_backbone = None
-        if self.include_clay_features:
-            if self.clay_embed_dim is None:
-                 raise ValueError("clay_embed_dim must be provided if include_clay_features is True")
-            self.clay_backbone = ClayFeatureExtractor(
+        # --- Static Feature Processing --- #
+
+        # Clay Backbone (Optional)
+        self.clay_model = None
+        clay_output_channels = 0
+        if self.feature_flags.get("use_clay", False):
+            if not all([clay_checkpoint_path, clay_metadata_path, clay_model_size, clay_bands, clay_platform, clay_gsd]):
+                 raise ValueError("Missing required Clay configuration parameters when use_clay=True.")
+            self.clay_model = ClayFeatureExtractor(
+                model_size=clay_model_size,
+                bands=clay_bands,
+                platform=clay_platform,
+                gsd=clay_gsd,
+                freeze_backbone=freeze_backbone,
                 checkpoint_path=clay_checkpoint_path,
                 metadata_path=clay_metadata_path,
-                freeze_backbone=freeze_clay_backbone,
-                **clay_kwargs
             )
-            # Ensure Clay embed dim matches if provided
-            if self.clay_embed_dim != self.clay_backbone.embed_dim:
-                logging.warning(f"Provided clay_embed_dim ({self.clay_embed_dim}) does not match inferred dim ({self.clay_backbone.embed_dim}) from Clay model. Using inferred dim.")
-                self.clay_embed_dim = self.clay_backbone.embed_dim
+            clay_output_channels = self.clay_model.output_channels
+            logging.info(f"Initialized Clay model ({clay_model_size}), output channels: {clay_output_channels}")
 
-        # Projection layer for NON-ELEVATION static features (Original Static + Optional Clay)
-        non_elevation_static_input_ch = static_channels + (self.clay_embed_dim if self.include_clay_features else 0)
-        self.proj_non_elev_static = nn.Conv2d(non_elevation_static_input_ch, proj_static_ch, kernel_size=1) if non_elevation_static_input_ch > 0 else None
+        # Calculate number of input channels for the static projection layer
+        # This depends on which static features are enabled IN ADDITION to Clay output
+        static_input_channels = clay_output_channels
+        if self.feature_flags.get("use_lst", False): static_input_channels += 1
+        if self.feature_flags.get("use_dem", False): static_input_channels += 1
+        if self.feature_flags.get("use_dsm", False): static_input_channels += 1
+        if self.feature_flags.get("use_ndvi", False): static_input_channels += 1
+        if self.feature_flags.get("use_ndbi", False): static_input_channels += 1
+        if self.feature_flags.get("use_ndwi", False): static_input_channels += 1
+        if self.feature_flags.get("use_sentinel_composite", False):
+            if not sentinel_bands_to_load: raise ValueError("sentinel_bands_to_load required if use_sentinel_composite=True")
+            static_input_channels += len(sentinel_bands_to_load)
 
-        # --- NEW: High-Resolution Elevation Branches ---
-        self.dem_branch = None
-        if self.include_dem_branch:
-            self.dem_branch = HighResElevationBranch(
-                in_channels=1,
-                start_channels=elevation_branch_start_channels,
-                out_channels=self.elevation_out_channels,
-                num_downsample_layers=elevation_branch_downsample_layers,
-                kernel_size=elevation_branch_kernel_size
-            )
-        self.dsm_branch = None
-        if self.include_dsm_branch:
-            self.dsm_branch = HighResElevationBranch(
-                in_channels=1,
-                start_channels=elevation_branch_start_channels,
-                out_channels=self.elevation_out_channels,
-                num_downsample_layers=elevation_branch_downsample_layers,
-                kernel_size=elevation_branch_kernel_size
-            )
-        # --- END NEW ---
+        logging.info(f"Total calculated input channels for STATIC projection: {static_input_channels}")
 
-        # --- Fusion & Head Projections ---
-        self.proj_temporal_output = nn.Conv2d(temporal_output_channels, proj_temporal_ch, kernel_size=1)
+        if static_input_channels > 0:
+            self.static_proj = nn.Conv2d(static_input_channels, proj_static_ch, kernel_size=1)
+        else:
+            self.static_proj = None
+            logging.warning("No static features enabled or Clay model not used. Static projection layer will be None.")
+            if proj_static_ch > 0:
+                 logging.warning(f"proj_static_ch ({proj_static_ch}) > 0 but no static features are input.")
+                 proj_static_ch = 0 # Ensure it reflects no static input
 
-        # --- U-Net Head ---
-        head_in_ch = proj_temporal_ch
-        if self.proj_non_elev_static:
-             head_in_ch += proj_static_ch
-        if self.include_dem_branch:
-             head_in_ch += self.elevation_out_channels
-        if self.include_dsm_branch:
-             head_in_ch += self.elevation_out_channels
+        # --- Temporal Feature Projection --- #
+        # Project the last hidden state of the ConvLSTM
+        temporal_input_channels = convlstm_hidden_dims[-1]
+        self.temporal_proj = nn.Conv2d(temporal_input_channels, proj_temporal_ch, kernel_size=1)
 
-        features = unet_base_channels
-        self.unet_depth = unet_depth
+        # --- U-Net Decoder Head --- #
+        unet_input_channels = proj_static_ch + proj_temporal_ch
+        if unet_input_channels == 0:
+            raise ValueError("No features projected for U-Net head (static_ch=0, temporal_ch=0). Check feature flags and projections.")
 
-        self.unet_inc = UNetConvBlock(head_in_ch, features)
-        self.unet_downs = nn.ModuleList()
-        self.unet_ups = nn.ModuleList()
+        # Use the new decoder that handles target resizing
+        self.unet_decoder = UNetDecoderWithTargetResize(
+            in_channels=unet_input_channels,
+            base_channels=unet_base_channels,
+            depth=unet_depth,
+            target_h=self.target_H,
+            target_w=self.target_W
+        )
+        self.final_conv = nn.Conv2d(unet_base_channels, 1, kernel_size=1)
 
-        # Downsampling Path
-        current_channels = features
-        for _ in range(unet_depth):
-            self.unet_downs.append(
-                nn.Sequential(
-                    nn.MaxPool2d(2),
-                    UNetConvBlock(current_channels, current_channels * 2)
-                )
-            )
-            current_channels *= 2
+        logging.info(f"BranchedUHIModel initialized. Static Proj In: {static_input_channels}, Out: {proj_static_ch}. Temporal Proj In: {temporal_input_channels}, Out: {proj_temporal_ch}. UNet In: {unet_input_channels}")
 
-        # Upsampling Path (Using Interpolate + Conv Block)
-        for _ in range(unet_depth):
-            self.unet_ups.append(
-                 UNetUpBlockInterpolate(current_channels, current_channels // 2, scale_factor=2)
-            )
-            current_channels //= 2
 
-        # Final 1x1 convolution
-        self.unet_outc = nn.Conv2d(features, 1, kernel_size=1)
-
-        logging.info(f"BranchedUHIModel (ConvLSTM) initialized:")
-        logging.info(f"  Weather Branch (ConvLSTM): Input Ch={weather_input_channels}, Hidden={convlstm_hidden_dims}, Kernels={convlstm_kernel_sizes}, Layers={convlstm_num_layers} -> Proj Ch={proj_temporal_ch}")
-        logging.info(f"  Static Branch: Input Ch (Raw Static Non-Elev/Clay)={static_channels}")
-        if self.include_clay_features:
-            logging.info(f"    -> Including Clay Features: Embed Dim={self.clay_embed_dim}")
-            logging.info(f"    -> Clay Backbone Frozen: {freeze_clay_backbone}")
-        logging.info(f"  Combined NON-ELEV Static Input Ch: {non_elevation_static_input_ch} -> Proj Ch={proj_static_ch if self.proj_non_elev_static else 'N/A'}")
-        logging.info(f"  DEM Branch Included: {self.include_dem_branch} (Output Ch: {self.elevation_out_channels if self.include_dem_branch else 'N/A'}) ")
-        logging.info(f"  DSM Branch Included: {self.include_dsm_branch} (Output Ch: {self.elevation_out_channels if self.include_dsm_branch else 'N/A'}) ")
-        logging.info(f"  UNet Head: Input Ch={head_in_ch}, Base Ch={unet_base_channels}, Depth={unet_depth}")
-
-    def forward(self,
-                weather_seq: torch.Tensor,      # (B, T, C_weather, H, W)
-                # --- UPDATED STATIC INPUT --- #
-                static_features: Optional[torch.Tensor] = None, # (B, C_static_raw, H, W) - Non-Clay, Non-Elev Static
-                cloudless_mosaic: Optional[torch.Tensor] = None, # (B, C_clay, H, W)
-                norm_time_tensor: Optional[torch.Tensor] = None, # (B, 4)
-                norm_latlon_tensor: Optional[torch.Tensor] = None, # (B, 4)
-                # --- NEW: HIGH-RES INPUTS --- #
-                high_res_dem: Optional[torch.Tensor] = None, # (B, 1, H_high, W_high)
-                high_res_dsm: Optional[torch.Tensor] = None, # (B, 1, H_high, W_high)
-                # ---------------------------- #
-                # --- Target Size --- #
-                target_h_w: Optional[Tuple[int, int]] = None # Target output spatial size (H_orig, W_orig)
+    def forward(self, weather_seq: torch.Tensor,
+                # --- Optional Static Features (All at feature resolution) --- #
+                static_features: Optional[torch.Tensor] = None,
+                # --- Optional Clay Inputs (All at feature resolution) --- #
+                clay_mosaic: Optional[torch.Tensor] = None,
+                norm_latlon: Optional[torch.Tensor] = None,
+                norm_timestamp: Optional[torch.Tensor] = None,
                 ) -> torch.Tensor:
         """
-        Forward pass using ConvLSTM for weather and optional high-res elevation branches.
+        Forward pass through the Branched UHI Model.
 
         Args:
-            weather_seq (torch.Tensor): Sequence of weather grids (B, T, C_in, H, W).
-            static_features (Optional[torch.Tensor]): Concatenated non-Clay, non-elevation static features (B, C_stat_raw, H, W).
-            cloudless_mosaic (Optional[torch.Tensor]): Input for Clay branch (B, C_clay, H, W).
-            norm_time_tensor (Optional[torch.Tensor]): Normalized time for Clay (B, 4).
-            norm_latlon_tensor (Optional[torch.Tensor]): Normalized lat/lon for Clay (B, 4).
-            high_res_dem (Optional[torch.Tensor]): High-resolution DEM map (B, 1, H_high, W_high).
-                                                 Provide only if self.include_dem_branch is True.
-            high_res_dsm (Optional[torch.Tensor]): High-resolution DSM map (B, 1, H_high, W_high).
-                                                 Provide only if self.include_dsm_branch is True.
-            target_h_w (Optional[Tuple[int, int]]): Target output spatial size. If None, output size matches feature map size.
+            weather_seq (torch.Tensor): Weather sequence (B, T, C_weather, H_feat, W_feat).
+            static_features (Optional[torch.Tensor]): Combined low-res static features
+                                                    (LST, DEM, DSM, Indices, Composite)
+                                                    (B, C_static_other, H_feat, W_feat).
+            clay_mosaic (Optional[torch.Tensor]): Input mosaic for Clay (B, C_clay_in, H_feat, W_feat).
+            norm_latlon (Optional[torch.Tensor]): Normalized lat/lon for Clay (B, 2, H_feat, W_feat).
+            norm_timestamp (Optional[torch.Tensor]): Normalized timestamp for Clay (B, 1).
 
         Returns:
-            torch.Tensor: Predicted UHI map (B, 1, H_out, W_out).
+            torch.Tensor: Predicted UHI grid (B, 1, H_uhi, W_uhi).
         """
-        B, T, C_w, H, W = weather_seq.shape
 
-        # --- Input Checks --- #
-        if self.include_dem_branch and high_res_dem is None:
-            raise ValueError("`high_res_dem` must be provided when `include_dem_branch` is True.")
-        if self.include_dsm_branch and high_res_dsm is None:
-            raise ValueError("`high_res_dsm` must be provided when `include_dsm_branch` is True.")
-        # ------------------- #
+        # --- 1. Temporal Branch (ConvLSTM) --- #
+        # Input: (B, T, C, H, W), Output: [(B, T, C_hid, H, W)], [(B, C_hid, H, W)]
+        layer_output_list, last_state_list = self.conv_lstm(weather_seq)
+        temporal_features = last_state_list[-1][0] # Get hidden state h from the last layer: (B, C_hid, H, W)
+        temporal_projected = self.temporal_proj(temporal_features)
+        B, _, H_feat, W_feat = temporal_projected.shape
 
-        # --- Weather Branch ---
-        # 1. Optional spatial feature extraction per timestep
-        # Reshape for 2D conv: (B, T, C, H, W) -> (B*T, C, H, W)
-        weather_seq_flat = weather_seq.view(B * T, C_w, H, W)
-        weather_features_flat = self.weather_feature_extractor(weather_seq_flat)
-        # Reshape back: (B*T, C_feat, H_feat, W_feat) -> (B, T, C_feat, H_feat, W_feat)
-        _, C_w_feat, H_feat, W_feat = weather_features_flat.shape
-        weather_features_seq = weather_features_flat.view(B, T, C_w_feat, H_feat, W_feat)
+        # --- 2. Static Branch --- #
+        all_static_features_list = []
 
-        # 2. Apply ConvLSTM
-        # Input: (B, T, C_w_feat, H_feat, W_feat)
-        layer_output_seq, last_state = self.convlstm(weather_features_seq)
-        # We need the output features of the *last* time step from the *last* layer
-        # layer_output_seq is the output of the last layer: (B, T, C_hidden_last, H_feat, W_feat)
-        convlstm_last_step_features = layer_output_seq[:, -1, :, :, :] # (B, C_hidden_last, H_feat, W_feat)
-        _, _, H_feat, W_feat = convlstm_last_step_features.shape # Get feature map size
+        # Clay Features (Optional)
+        if self.clay_model is not None:
+            if clay_mosaic is None or norm_latlon is None or norm_timestamp is None:
+                raise ValueError("Clay inputs (mosaic, latlon, timestamp) required when Clay model is enabled.")
+            # Clay expects (B, C, H, W), norm_latlon (B, 2, H, W), norm_timestamp (B, 1)
+            # Ensure norm_timestamp is broadcastable if needed, Clay handles it internally
+            clay_features = self.clay_model(clay_mosaic, norm_latlon, norm_timestamp)
+            # clay_features shape: (B, C_clay_out, H_feat, W_feat)
+            all_static_features_list.append(clay_features)
 
-        # 3. Project ConvLSTM output
-        projected_temporal = self.proj_temporal_output(convlstm_last_step_features)
-
-        # --- Static Branch (Non-Elevation) ---
-        all_static_inputs_resized = []
-        # 1. Add non-Clay, non-Elev static features (if provided)
+        # Other Static Features (Optional)
         if static_features is not None:
-            if static_features.shape[2:] != (H_feat, W_feat):
-                static_features_resized = F.interpolate(static_features, size=(H_feat, W_feat), mode='bilinear', align_corners=False)
-            else:
-                static_features_resized = static_features
-            all_static_inputs_resized.append(static_features_resized)
-        elif not self.include_clay_features: # If no static and no clay, raise error or warning
-             logging.warning("No static features (non-Clay or Clay) provided to the model.")
-             # Create a dummy zero tensor for projection? Or handle in U-Net?
-             # For now, continue, proj_non_elev_static might handle 0 channels if initialized correctly
+             # static_features shape: (B, C_static_other, H_feat, W_feat)
+             # Ensure it matches the feature resolution spatial dimensions
+             if static_features.shape[-2:] != (H_feat, W_feat):
+                 raise ValueError(f"Static features spatial dim {static_features.shape[-2:]} != Temporal branch dim {(H_feat, W_feat)}")
+             all_static_features_list.append(static_features)
 
-        # 2. Get and add Clay features if included
-        if self.include_clay_features:
-            if cloudless_mosaic is None or norm_time_tensor is None or norm_latlon_tensor is None:
-                raise ValueError("cloudless_mosaic, norm_time, norm_latlon required for Clay branch.")
-            # Ensure Clay backbone is in correct mode (eval or train)
-            # self.clay_backbone.model.train(not self.clay_backbone.freeze_backbone) # Handled in Clay init
-            with torch.set_grad_enabled(self.clay_backbone.model.training):
-                clay_features_native = self.clay_backbone(cloudless_mosaic, norm_time_tensor, norm_latlon_tensor)
-
-            if clay_features_native.shape[2:] != (H_feat, W_feat):
-                 clay_features_resized = F.interpolate(clay_features_native, size=(H_feat, W_feat), mode='bilinear', align_corners=False)
-            else:
-                 clay_features_resized = clay_features_native
-            all_static_inputs_resized.append(clay_features_resized)
-
-        # 3. Concatenate and Project NON-ELEVATION Static Features
-        projected_non_elev_static = None
-        if all_static_inputs_resized and self.proj_non_elev_static:
-            combined_non_elev_static = torch.cat(all_static_inputs_resized, dim=1)
-            projected_non_elev_static = self.proj_non_elev_static(combined_non_elev_static)
-        elif not all_static_inputs_resized:
-             logging.warning("No non-Clay or Clay static features were provided or enabled.")
-
-        # --- Process High-Res Elevation Branches ---
-        dem_features_resized = None
-        if self.include_dem_branch and self.dem_branch is not None:
-            dem_features = self.dem_branch(high_res_dem) # (B, C_elev_out, H_elev_feat, W_elev_feat)
-            # Resize to match ConvLSTM feature map size
-            dem_features_resized = F.interpolate(dem_features, size=(H_feat, W_feat), mode='bilinear', align_corners=False)
-
-        dsm_features_resized = None
-        if self.include_dsm_branch and self.dsm_branch is not None:
-            dsm_features = self.dsm_branch(high_res_dsm) # (B, C_elev_out, H_elev_feat, W_elev_feat)
-            # Resize to match ConvLSTM feature map size
-            dsm_features_resized = F.interpolate(dsm_features, size=(H_feat, W_feat), mode='bilinear', align_corners=False)
-
-        # --- Fusion ---
-        fused_features_list = [projected_temporal]
-        # Add projected non-elevation static features (if they exist)
-        if projected_non_elev_static is not None:
-            fused_features_list.append(projected_non_elev_static)
-        # Add resized DEM features (if they exist)
-        if dem_features_resized is not None:
-            fused_features_list.append(dem_features_resized)
-        # Add resized DSM features (if they exist)
-        if dsm_features_resized is not None:
-            fused_features_list.append(dsm_features_resized)
-
-        fused_features = torch.cat(fused_features_list, dim=1)
-
-        # --- U-Net Head ---
-        skip_connections = []
-        unet_out = self.unet_inc(fused_features)
-        skip_connections.append(unet_out)
-        for i in range(self.unet_depth):
-            unet_out = self.unet_downs[i](unet_out)
-            if i < self.unet_depth - 1:
-                skip_connections.append(unet_out)
-        for i in range(self.unet_depth):
-            skip = skip_connections.pop()
-            unet_out = self.unet_ups[i](unet_out, skip)
-        prediction_head_res = self.unet_outc(unet_out) # (B, 1, H_feat, W_feat)
-
-        # --- Final Resizing (Optional) ---
-        if target_h_w is not None and prediction_head_res.shape[2:] != target_h_w:
-            prediction_final = F.interpolate(prediction_head_res, size=target_h_w, mode='bilinear', align_corners=False)
+        # Concatenate all available static features
+        if not all_static_features_list:
+             # If no static features are provided or enabled, and static_proj exists (input_ch > 0),
+             # this indicates a configuration mismatch. The check in init should prevent this.
+             # If static_proj is None, we proceed with only temporal features.
+             if self.static_proj is not None:
+                  raise ValueError("Static projection layer exists, but no static features were provided to forward pass.")
+             static_projected = torch.zeros(B, 0, H_feat, W_feat, device=temporal_projected.device) # Empty static tensor
         else:
-            prediction_final = prediction_head_res # (B, 1, H_out, W_out)
+             combined_static = torch.cat(all_static_features_list, dim=1)
+             if self.static_proj is None:
+                 # This case should ideally not happen if init checks pass
+                 raise ValueError("Static features provided, but static projection layer is None. Check config.")
+             static_projected = self.static_proj(combined_static)
 
-        return prediction_final 
+        # --- 3. Fusion & U-Net Decoder --- #
+        # Concatenate projected features
+        fused_features = torch.cat([static_projected, temporal_projected], dim=1)
+
+        # U-Net Decoder expects (B, C_fused, H_feat, W_feat)
+        unet_output = self.unet_decoder(fused_features)
+        # unet_output shape: (B, unet_base_channels, H_feat, W_feat)
+
+        # Final 1x1 Convolution
+        prediction = self.final_conv(unet_output)
+        # prediction shape: (B, 1, H_uhi, W_uhi) - ensured by UNetDecoderWithTargetResize
+
+        return prediction
+
+
+# --- U-Net Decoder Implementation (Original, potentially used by CNN) ---
+class UNetDecoder(nn.Module):
+    def __init__(self, in_channels, base_channels, depth):
+        super().__init__()
+        self.depth = depth
+        ch = in_channels
+        self.downs = nn.ModuleList()
+        for i in range(depth):
+            self.downs.append(UNetConvBlock(ch, base_channels * (2**i)))
+            ch = base_channels * (2**i)
+
+        self.middle_conv = UNetConvBlock(ch, ch)
+
+        self.ups = nn.ModuleList()
+        for i in reversed(range(depth)):
+            # Input channels = current level channels + skip connection channels
+            # Output channels = skip connection channels (channels at the shallower level)
+            upsample_in_ch = base_channels * (2**(i+1)) # Channels from deeper layer
+            skip_ch = base_channels * (2**i)        # Channels from skip connection
+            self.ups.append(UNetUpBlockInterpolate(upsample_in_ch, skip_ch))
+
+        # Final output channels will be base_channels after the last up-block
+
+    def forward(self, x):
+        skips = []
+        # Down path
+        for i, down_block in enumerate(self.downs):
+            x = down_block(x)
+            if i < self.depth - 1:
+                skips.append(x)
+                x = F.max_pool2d(x, 2)
+            else:
+                # No max pool after the last down block
+                skips.append(x)
+
+        # Middle
+        x = self.middle_conv(skips.pop()) # Use the deepest feature map
+
+        # Up path
+        for up_block in self.ups:
+            skip_connection = skips.pop()
+            x = up_block(x, skip_connection) # x is from deeper layer, skip_connection is from down path
+
+        return x
+
+# --- NEW U-Net Decoder with Target Size Resizing (for Branched Model) ---
+class UNetDecoderWithTargetResize(nn.Module):
+    """U-Net Decoder that ensures output matches target H, W using interpolation if needed."""
+    def __init__(self, in_channels, base_channels, depth, target_h, target_w):
+        super().__init__()
+        self.depth = depth
+        self.target_h = target_h
+        self.target_w = target_w
+
+        ch = in_channels
+        self.downs = nn.ModuleList()
+        self.down_pools = nn.ModuleList()
+        for i in range(depth):
+            out_ch = base_channels * (2**i)
+            self.downs.append(UNetConvBlock(ch, out_ch))
+            if i < depth - 1: # Don't add pool after last down block
+                self.down_pools.append(nn.MaxPool2d(2))
+            ch = out_ch
+
+        self.middle_conv = UNetConvBlock(ch, ch) # Middle block uses final down channels
+
+        self.ups = nn.ModuleList()
+        for i in reversed(range(depth)):
+            # Input channels for up-block: channels from deeper layer (x1)
+            # Skip channels for up-block: channels from corresponding down layer (x2)
+            upsample_in_ch = base_channels * (2**(i+1)) if i < depth - 1 else ch # Handle middle block output
+            skip_ch = base_channels * (2**i)
+            self.ups.append(UNetUpBlockInterpolate(upsample_in_ch, skip_ch))
+
+        # Final output channels will be base_channels after the last up-block
+        logging.info(f"Initialized UNetDecoderWithTargetResize. Target: ({target_h}, {target_w})")
+
+    def forward(self, x):
+        skips = []
+        # Down path
+        for i in range(self.depth):
+            x = self.downs[i](x)
+            skips.append(x)
+            if i < self.depth - 1:
+                x = self.down_pools[i](x)
+
+        # Middle (use the last element of skips, which is the output of the last down conv)
+        x = self.middle_conv(x)
+
+        # Up path (iterate through skips in reverse, starting from second-to-last)
+        for i, up_block in enumerate(self.ups):
+            skip_connection = skips[self.depth - 1 - i]
+            x = up_block(x, skip_connection)
+
+        # --- Final Resize Check --- #
+        _, _, current_h, current_w = x.shape
+        if current_h != self.target_h or current_w != self.target_w:
+            logging.debug(f"UNetDecoder output ({current_h}, {current_w}) != target ({self.target_h}, {self.target_w}). Interpolating.")
+            x = F.interpolate(x, size=(self.target_h, self.target_w), mode='bilinear', align_corners=False)
+
+        return x 

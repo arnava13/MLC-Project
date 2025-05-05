@@ -1,6 +1,6 @@
 import math
 from pathlib import Path
-from typing import List, Tuple, Optional
+from typing import List, Tuple, Optional, Dict
 
 import torch
 import torch.nn as nn
@@ -560,226 +560,179 @@ class UNetStyleHead(nn.Module):
 
 class UHINetCNN(nn.Module):
     """
-    Feedforward CNN UHI prediction model using a U-Net style head.
-    Uses dynamic Clay features, static LST (optional), and dynamic weather.
-    Upsampling is handled by the UNetStyleHead using ConvTranspose2d.
+    UHI Prediction CNN model with optional Clay integration.
+    Accepts ALL spatial features (weather, clay, lst, dem, dsm, indices) at a
+    common feature resolution.
     """
     def __init__(self,
-                 # Clay args
-                 clay_checkpoint_path: str,
-                 clay_metadata_path: str,
-                 weather_channels: int,
+                 # --- Input Feature Config --- #
+                 feature_flags: Dict[str, bool], # To determine input channels
+                 weather_channels: int, # Number of weather channels
+                 sentinel_bands_to_load: Optional[List[str]] = None, # For composite
+                 # Clay Specific (if feature_flags["use_clay"])
+                 clay_model_size: Optional[str] = None,
+                 clay_bands: Optional[List[str]] = None,
+                 clay_platform: Optional[str] = None,
+                 clay_gsd: Optional[int] = None,
                  freeze_backbone: bool = True,
-                 # --- Args with defaults ---
-                 proj_ch: int = 32, # RESTORED - Channels after projecting Clay features (for SimpleCNNHead)
-                 clay_model_size: str = "large",
-                 clay_bands: list = ["blue", "green", "red", "nir"],
-                 clay_platform: str = "sentinel-2-l2a",
-                 clay_gsd: int = 10,
-                 # LST args
-                 lst_channels: int = 1,
-                 use_lst: bool = True,
-                 # --- Head Selection & Args ---
-                 head_type: str = 'unet', # 'unet' or 'simple_cnn'
-                 # SimpleCNN Head Args
-                 cnn_hidden_dims: List[int] = [64, 32],
-                 cnn_kernel_size: int = 3,
-                 cnn_dropout: float = 0.0,
-                 # UNet Head Args
-                 unet_base_channels: int = 64, # Base channels for U-Net Head
-                 unet_depth: int = 4,           # Depth of the U-Net
-                 # High-Res Elevation Branch Args
-                 include_dem_branch: bool = False,
-                 elevation_out_channels: int = 32,
-                 include_dsm_branch: bool = False
-    ):
-        super().__init__()
-        self.use_lst = use_lst
-        self.proj_ch = proj_ch # Restored for SimpleCNNHead
-        self.weather_channels = weather_channels
-        self.lst_channels = lst_channels
-        self.head_type = head_type
-        self.include_dem_branch = include_dem_branch
-        self.include_dsm_branch = include_dsm_branch
-        self.elevation_out_channels = elevation_out_channels
+                 clay_checkpoint_path: Optional[str] = None,
+                 clay_metadata_path: Optional[str] = None,
+                 # --- CNN Backbone Config --- #
+                 base_channels: int = 64,
+                 depth: int = 4,
+                 # --- REMOVED Elevation Branch Config --- #
+                ):
+        """
+        Initializes the UHINetCNN Model with common feature resolution.
 
-        # --- Dynamic Clay Feature Extraction (No projection layer here) ---
-        self.clay_backbone = ClayFeatureExtractor(
-            checkpoint_path=clay_checkpoint_path,
-            metadata_path=clay_metadata_path,
+        Args:
+            feature_flags (Dict[str, bool]): Controls inclusion of input features.
+            weather_channels (int): Number of channels in the weather grid input.
+            sentinel_bands_to_load (Optional[List[str]]): Bands if using sentinel_composite.
+            clay_model_size (Optional[str]): Size of Clay model if use_clay is True.
+            clay_bands (Optional[List[str]]): Bands for Clay if use_clay is True.
+            clay_platform (Optional[str]): Platform for Clay if use_clay is True.
+            clay_gsd (Optional[int]): GSD for Clay if use_clay is True.
+            freeze_backbone (bool): Whether to freeze Clay backbone weights.
+            clay_checkpoint_path (Optional[str]): Path to Clay checkpoint if use_clay is True.
+            clay_metadata_path (Optional[str]): Path to Clay metadata if use_clay is True.
+            base_channels (int): Base number of channels for the U-Net.
+            depth (int): Depth of the U-Net.
+        """
+        super().__init__()
+        self.feature_flags = feature_flags
+        self.depth = depth
+
+        # --- Clay Backbone (Optional) --- #
+        self.clay_model = None
+        clay_output_channels = 0
+        if self.feature_flags.get("use_clay", False):
+            if not CLAY_AVAILABLE: raise ImportError("Clay features requested but Clay library not installed.")
+            if not all([clay_checkpoint_path, clay_metadata_path, clay_model_size, clay_bands, clay_platform, clay_gsd]):
+                 raise ValueError("Missing required Clay configuration parameters when use_clay=True.")
+            self.clay_model = ClayFeatureExtractor(
             model_size=clay_model_size,
             bands=clay_bands,
             platform=clay_platform,
             gsd=clay_gsd,
-            freeze_backbone=freeze_backbone # Pass flag here
-        )
-
-        clay_embed_dim = self.clay_backbone.embed_dim
-        # --- RESTORED: Projection layer (used by *both* head types now) ---
-        self.proj = nn.Conv2d(clay_embed_dim, self.proj_ch, kernel_size=1)
-
-        # --- Instantiate Selected Head ---
-        # Calculate Head Input Channels: Projected Clay + Weather [+ LST] [+ DEM] [+ DSM]
-        head_in_ch = self.proj_ch + self.weather_channels
-        if self.use_lst:
-            head_in_ch += self.lst_channels
-        if self.include_dem_branch:
-            head_in_ch += self.elevation_out_channels
-        if self.include_dsm_branch:
-            head_in_ch += self.elevation_out_channels
-        
-        if self.head_type == 'unet':
-            self.head = UNetStyleHead(
-                in_channels=head_in_ch, # Takes projected features now
-                base_channels=unet_base_channels,
-                depth=unet_depth # Pass depth
+                freeze_backbone=freeze_backbone,
+                checkpoint_path=clay_checkpoint_path,
+                metadata_path=clay_metadata_path,
             )
-            logging.info(f"UHINetCNN initialized (Feedforward with UNetStyleHead):")
-            logging.info(f"  Clay Backbone Frozen (except maybe last layer): {freeze_backbone}")
-            logging.info(f"  Clay Embed Dim: {clay_embed_dim} -> Proj Dim: {self.proj_ch}")
-            logging.info(f"  Use LST: {self.use_lst} (Channels: {self.lst_channels if self.use_lst else 0})")
-            logging.info(f"  Weather Channels: {self.weather_channels}")
-            logging.info(f"  UNet Head Input Channels (ProjClay+Weather[+LST]): {head_in_ch}")
-            logging.info(f"  UNet Head Base Channels: {unet_base_channels}")
-            logging.info(f"  UNet Head Depth: {unet_depth}")
-            logging.info(f"  Include DEM Branch: {self.include_dem_branch}")
-            logging.info(f"  Include DSM Branch: {self.include_dsm_branch}")
+            clay_output_channels = self.clay_model.embed_dim
+            logging.info(f"Initialized Clay model ({clay_model_size}), output channels: {clay_output_channels}")
 
-        elif self.head_type == 'simple_cnn':
-            self.head = SimpleCNNHead(
-                in_channels=head_in_ch,
-                hidden_dims=cnn_hidden_dims,
-                kernel_size=cnn_kernel_size,
-                dropout=cnn_dropout
+        # --- Calculate Input Channels for U-Net --- #
+        # Start with weather channels
+        input_channels = weather_channels
+        # Add Clay output channels (if used)
+        input_channels += clay_output_channels
+        # Add channels for other enabled static features
+        if self.feature_flags.get("use_lst", False): input_channels += 1
+        if self.feature_flags.get("use_dem", False): input_channels += 1
+        if self.feature_flags.get("use_dsm", False): input_channels += 1
+        if self.feature_flags.get("use_ndvi", False): input_channels += 1
+        if self.feature_flags.get("use_ndbi", False): input_channels += 1
+        if self.feature_flags.get("use_ndwi", False): input_channels += 1
+        if self.feature_flags.get("use_sentinel_composite", False):
+            if not sentinel_bands_to_load: raise ValueError("sentinel_bands_to_load required if use_sentinel_composite=True")
+            input_channels += len(sentinel_bands_to_load)
+
+        if input_channels == 0:
+             raise ValueError("No input features selected for UHINetCNN (weather, clay, static features all disabled/zero channels).")
+        logging.info(f"Total calculated input channels for U-Net: {input_channels}")
+
+        # --- U-Net Architecture --- #
+        self.inc = UNetConvBlock(input_channels, base_channels)
+        self.downs = nn.ModuleList()
+        self.ups = nn.ModuleList()
+
+        # Downsampling Path
+        current_channels = base_channels
+        for _ in range(depth):
+            self.downs.append(
+                nn.Sequential(
+                    nn.MaxPool2d(2),
+                    UNetConvBlock(current_channels, current_channels * 2)
+                )
             )
-            # Logging info for SimpleCNNHead is done within its __init__
-            logging.info(f"UHINetCNN initialized (Feedforward with SimpleCNNHead):")
-            logging.info(f"  Include DEM Branch: {self.include_dem_branch}")
-            logging.info(f"  Include DSM Branch: {self.include_dsm_branch}")
-            logging.info(f"  Clay Backbone Frozen (except maybe last layer): {freeze_backbone}")
-            logging.info(f"  Clay Embed Dim: {clay_embed_dim} -> Proj Dim: {self.proj_ch}")
-            logging.info(f"  Use LST: {self.use_lst} (Channels: {self.lst_channels if self.use_lst else 0})")
-            logging.info(f"  Weather Channels: {self.weather_channels}")
-            logging.info(f"  SimpleCNN Head Input Channels (ProjClay+Weather[+LST]): {head_in_ch}")
-            # SimpleCNNHead logs its own details
+            current_channels *= 2
 
-        else:
-            raise ValueError(f"Unknown head_type: {self.head_type}. Choose 'unet' or 'simple_cnn'.")
+        # Upsampling Path (Using Interpolate + Conv Block)
+        for _ in range(depth):
+            self.ups.append(
+                UNetUpBlock(current_channels, current_channels // 2)
+            )
+            current_channels //= 2
 
-        # Projection layer is always trainable as it feeds into the selected head.
-        for param in self.proj.parameters():
-            param.requires_grad = True
-        logging.info("  Projection layer (self.proj) set to trainable.")
+        # Final 1x1 convolution
+        self.outc = nn.Conv2d(base_channels, 1, kernel_size=1)
 
-    def forward(self, cloudless_mosaic: torch.Tensor,
-                norm_time_tensor: torch.Tensor,
-                norm_latlon_tensor: torch.Tensor,
-                weather: torch.Tensor,
-                target_h_w: Tuple[int, int], 
-                static_lst: Optional[torch.Tensor] = None,
-                high_res_dem: Optional[torch.Tensor] = None,
-                high_res_dsm: Optional[torch.Tensor] = None) -> torch.Tensor:
+        logging.info(f"UHINetCNN initialized. U-Net Input Ch: {input_channels}, Base Ch: {base_channels}, Depth: {depth}")
+
+    def forward(self, weather: torch.Tensor,
+                # --- Optional Static Features (All at feature resolution) --- #
+                static_features: Optional[torch.Tensor] = None,
+                # --- Optional Clay Inputs (All at feature resolution) --- #
+                clay_mosaic: Optional[torch.Tensor] = None,
+                norm_latlon: Optional[torch.Tensor] = None,
+                norm_timestamp: Optional[torch.Tensor] = None,
+               ) -> torch.Tensor:
         """
-        Performs a forward pass through the CNN model using dynamic Clay features
-        and the selected head, incorporating optional high-resolution elevation features.
+        Forward pass through the UHINetCNN Model.
 
         Args:
-            cloudless_mosaic (torch.Tensor): Cloudless mosaic (B, C_clay, H_orig, W_orig).
-            norm_time_tensor (torch.Tensor): Normalized time tensor for Clay (B, 4).
-            norm_latlon_tensor (torch.Tensor): Normalized lat/lon tensor for Clay (B, 4).
-            weather (torch.Tensor): Weather data for the time step (B, 1, C_weather, H_orig, W_orig).
-            target_h_w (Tuple[int, int]): The desired output height and width (H_orig, W_orig).
-            static_lst (torch.Tensor, optional): Static LST map (B, 1, C_lst, H_low_res, W_low_res).
-                                                Provide only if self.use_lst is True.
-            high_res_dem (torch.Tensor, optional): High-resolution DEM map (B, 1, H_high_res, W_high_res).
-                                                Provide only if self.include_dem_branch is True.
-            high_res_dsm (torch.Tensor, optional): High-resolution DSM map (B, 1, H_high_res, W_high_res).
-                                                Provide only if self.include_dsm_branch is True.
+            weather (torch.Tensor): Weather grid (B, C_weather, H_feat, W_feat).
+            static_features (Optional[torch.Tensor]): Combined low-res static features
+                                                    (LST, DEM, DSM, Indices, Composite)
+                                                    (B, C_static_other, H_feat, W_feat).
+            clay_mosaic (Optional[torch.Tensor]): Input mosaic for Clay (B, C_clay_in, H_feat, W_feat).
+            norm_latlon (Optional[torch.Tensor]): Normalized lat/lon for Clay (B, 2, H_feat, W_feat).
+            norm_timestamp (Optional[torch.Tensor]): Normalized timestamp for Clay (B, 1).
 
         Returns:
-            torch.Tensor: Predicted UHI map at feature resolution (B, 1, H_out, W_out)
+            torch.Tensor: Predicted UHI grid (B, 1, H_uhi, W_uhi).
         """
-        # 0. Input Checks and Preparation
-        if self.use_lst and static_lst is None:
-            raise ValueError("`static_lst` must be provided when `use_lst` is True.")
-        if not self.use_lst and static_lst is not None:
-            logging.warning("`static_lst` provided but `use_lst` is False. LST will be ignored.")
+        B, _, H_feat, W_feat = weather.shape
+        all_features_list = [weather]
 
-        # Check DEM/DSM inputs match config flags
-        if self.include_dem_branch and high_res_dem is None:
-            raise ValueError("`high_res_dem` must be provided when `include_dem_branch` is True.")
-        if self.include_dsm_branch and high_res_dsm is None:
-            raise ValueError("`high_res_dsm` must be provided when `include_dsm_branch` is True.")
+        # --- Clay Features (Optional) --- #
+        if self.clay_model is not None:
+            if clay_mosaic is None or norm_latlon is None or norm_timestamp is None:
+                raise ValueError("Clay inputs (mosaic, latlon, timestamp) required when Clay model is enabled.")
+            if clay_mosaic.shape[-2:] != (H_feat, W_feat):
+                 raise ValueError(f"Clay mosaic spatial dim {clay_mosaic.shape[-2:]} != Weather dim {(H_feat, W_feat)}")
+            clay_features = self.clay_model(clay_mosaic, norm_latlon, norm_timestamp)
+            all_features_list.append(clay_features)
 
-        # Squeeze the time dimension (T=1) from dynamic inputs if present
-        if weather.ndim == 5 and weather.shape[1] == 1:
-            weather = weather.squeeze(1) # (B, C_weather, H_orig, W_orig)
-        elif weather.ndim != 4:
-            raise ValueError(f"Weather tensor has unexpected shape {weather.shape}. Expected 4D or 5D with T=1.")
+        # --- Other Static Features (Optional) --- #
+        if static_features is not None:
+             if static_features.shape[-2:] != (H_feat, W_feat):
+                 raise ValueError(f"Static features spatial dim {static_features.shape[-2:]} != Weather dim {(H_feat, W_feat)}")
+             all_features_list.append(static_features)
 
-        # Remove time dimension from static_lst as well if it's used and has T=1
-        if self.use_lst and static_lst is not None:
-            if static_lst.ndim == 5 and static_lst.shape[1] == 1:
-                static_lst = static_lst.squeeze(1) # -> (B, C_lst, H_low_res, W_low_res)
-            elif static_lst.ndim != 4:
-                 raise ValueError(f"static_lst has unexpected shape {static_lst.shape}. Expected 4D or 5D with T=1.")
+        # --- Combine all features --- #
+        x = torch.cat(all_features_list, dim=1)
 
-        # 1. Encode Clay Features Dynamically
-        # Respects frozen status set in ClayFeatureExtractor.__init__
-        clay_features = self.clay_backbone(cloudless_mosaic, norm_time_tensor, norm_latlon_tensor)
-        B, D_clay, H_feat, W_feat = clay_features.shape
-        # Project Clay features (always done now before the head)
-        projected_clay = self.proj(clay_features) # (B, proj_ch, H', W')
+        # --- U-Net Forward --- #
+        skip_connections = []
+        x1 = self.inc(x)
+        skip_connections.append(x1)
 
-        # 2. Resize Weather and LST (if used) to match Clay feature map size (H', W')
-        weather_resized = F.interpolate(weather, size=(H_feat, W_feat), mode='bilinear', align_corners=False)
+        # Downsampling
+        xi = x1
+        for i in range(self.depth):
+            xi = self.downs[i](xi)
+            if i < self.depth - 1: # Don't store the bottleneck features as skip
+                skip_connections.append(xi)
 
-        # Prepare list for concatenation - Content depends on head type
-        combined_features_list = []
-        # Always use projected clay features now
-        combined_features_list.append(projected_clay)
-        # Add resized weather
-        combined_features_list.append(weather_resized)
+        # Upsampling
+        for i in range(self.depth):
+            skip = skip_connections.pop()
+            xi = self.ups[i](xi, skip)
 
-        if self.use_lst and static_lst is not None: # Check static_lst exists after potential squeeze
-             if static_lst.ndim != 4:
-                  raise ValueError(f"static_lst has unexpected number of dimensions ({static_lst.ndim}) before interpolation. Expected 4.")
-             
-             # Resize LOW-RES LST to match Clay feature map size (H', W')
-             static_lst_resized = F.interpolate(static_lst, size=(H_feat, W_feat), mode='bilinear', align_corners=False)
-             combined_features_list.append(static_lst_resized) # Append low-res LST
+        # Final output
+        prediction = self.outc(xi) # (B, 1, H_feat, W_feat)
 
-        # 2b. Process High-Res Elevation Branches (if included)
-        if self.include_dem_branch and high_res_dem is not None:
-            dem_features = self.dem_branch(high_res_dem) # (B, C_elev_out, H_elev_feat, W_elev_feat)
-            # Resize to match Clay feature map size
-            dem_features_resized = F.interpolate(dem_features, size=(H_feat, W_feat), mode='bilinear', align_corners=False)
-            combined_features_list.append(dem_features_resized)
-            
-        if self.include_dsm_branch and high_res_dsm is not None:
-            dsm_features = self.dsm_branch(high_res_dsm) # (B, C_elev_out, H_elev_feat, W_elev_feat)
-            # Resize to match Clay feature map size
-            dsm_features_resized = F.interpolate(dsm_features, size=(H_feat, W_feat), mode='bilinear', align_corners=False)
-            combined_features_list.append(dsm_features_resized)
-
-        # 3. Concatenate all features
-        combined_features = torch.cat(combined_features_list, dim=1)
-        # Shape: (B, proj_ch + C_weather [+ C_lst] [+ C_dem] [+ C_dsm], H', W')
-
-        # 4. Pass through Selected Head
-        if self.head_type == 'unet':
-            # UNet head outputs at its own feature resolution
-            prediction_feat_res = self.head(combined_features) # (B, 1, H_unet, W_unet)
-        elif self.head_type == 'simple_cnn':
-            # SimpleCNN head outputs at feature map resolution
-            prediction_feat_res = self.head(combined_features) # (B, 1, H', W')
-        else: # Should not happen
-            raise ValueError(f"Invalid head_type {self.head_type} during forward pass.")
-
-        # 5. Resize prediction back to the original target size (for both head types)
-        if prediction_feat_res.shape[2:] != target_h_w:
-            prediction_resized = F.interpolate(prediction_feat_res, size=target_h_w, mode='bilinear', align_corners=False)
-        else:
-            prediction_resized = prediction_feat_res
-
-        return prediction_resized
+        # Assuming H_feat, W_feat match the target UHI grid size based on dataloader config
+        return prediction

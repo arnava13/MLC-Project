@@ -16,6 +16,7 @@ import requests
 import os
 import subprocess
 import time
+import xarray as xr
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
@@ -564,4 +565,69 @@ def reproject_raster(input_path: Path, output_path: Path, target_crs: str, resam
         str(input_path),
         str(output_path)
     ]
-    run_command(cmd, f"Reprojecting {input_path.name} to {target_crs}") 
+    run_command(cmd, f"Reprojecting {input_path.name} to {target_crs}")
+
+# --- Resampling Utility --- #
+
+def resample_xarray_to_target(
+    data_xr: xr.DataArray,
+    target_height: int,
+    target_width: int,
+    target_transform: Any, # Affine transform
+    target_crs: Any, # CRS object or string
+    resampling_method: Resampling = Resampling.bilinear,
+    fill_value: Optional[float] = None
+) -> Optional[np.ndarray]:
+    """Resamples an xarray.DataArray to a target grid using rioxarray.
+
+    Args:
+        data_xr (xr.DataArray): Input data array with spatial coords and CRS.
+        target_height (int): Target height in pixels.
+        target_width (int): Target width in pixels.
+        target_transform (Affine): Target affine transformation.
+        target_crs: Target Coordinate Reference System (CRS object or string).
+        resampling_method (Resampling): Rasterio resampling method.
+        fill_value (Optional[float]): Value to fill nodata areas after resampling.
+                                    If None, existing nodata or NaN might persist.
+
+    Returns:
+        Optional[np.ndarray]: Resampled data as a NumPy array (C, H, W), or None on failure.
+    """
+    if data_xr is None:
+        logging.warning("Input data_xr is None, cannot resample.")
+        return None
+
+    try:
+        logging.debug(f"Resampling input shape {data_xr.shape} to {(target_height, target_width)}")
+        resampled_xr = data_xr.rio.reproject(
+            dst_crs=target_crs,
+            shape=(target_height, target_width),
+            transform=target_transform,
+            resampling=resampling_method,
+            # Use the source nodata if available, otherwise, it might infer
+            nodata=data_xr.rio.nodata
+        )
+
+        resampled_np = resampled_xr.to_numpy()
+
+        # Handle fill value for potential new nodata areas introduced by resampling
+        if fill_value is not None:
+            # Check if nodata exists and fill if necessary
+            current_nodata = resampled_xr.rio.nodata
+            if current_nodata is not None:
+                 if np.isnan(current_nodata):
+                     resampled_np[np.isnan(resampled_np)] = fill_value
+                 else:
+                     resampled_np[resampled_np == current_nodata] = fill_value
+            # Also fill NaNs that might not be explicitly marked as nodata
+            resampled_np[np.isnan(resampled_np)] = fill_value
+
+        # Ensure channel dimension exists if needed (e.g., for single-band data)
+        if resampled_np.ndim == 2:
+            resampled_np = resampled_np[np.newaxis, :, :]
+
+        return resampled_np.astype(np.float32)
+
+    except Exception as e:
+        logging.error(f"Error during resampling: {e}", exc_info=True)
+        return None 
