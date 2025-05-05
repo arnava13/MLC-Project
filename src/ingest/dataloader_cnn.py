@@ -162,8 +162,8 @@ class CityDataSet(Dataset):
                 try:
                     self.dem_xr = rioxarray.open_rasterio(dem_p, masked=True).load() # Load into memory
                     if self.elevation_nodata is not None:
-                         self.dem_xr = self.dem_xr.where(self.dem_xr != self.elevation_nodata)
-                         self.dem_xr.rio.write_nodata(np.nan, encoded=True, inplace=True)
+                        self.dem_xr = self.dem_xr.where(self.dem_xr != self.elevation_nodata)
+                        self.dem_xr.rio.write_nodata(np.nan, encoded=True, inplace=True)
                     if self.dem_xr.rio.crs != self.target_crs:
                        logging.info(f"Reprojecting DEM from {self.dem_xr.rio.crs} to {self.target_crs_str}")
                        self.dem_xr = self.dem_xr.rio.reproject(self.target_crs_str)

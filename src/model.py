@@ -191,11 +191,16 @@ class ClayFeatureExtractor(nn.Module):
              print(f"Unexpected error determining model parameters: {e}")
              raise
 
-        # --- Define Target Input Size for Clay --- 
+        # --- Define Target Input Size for Clay ---
         self.target_input_size = (224, 224) # Standard ViT size
 
         # Prepare normalization based on metadata and selected bands
         self._prepare_normalization()
+
+        # --- ADDED: Assign output channels ---
+        self.output_channels = self.embed_dim
+        logging.info(f"ClayFeatureExtractor output channels set to: {self.output_channels}")
+        # --- END ADDED ---
 
     def _prepare_normalization(self):
         """Prepares the normalization transform based on loaded metadata."""

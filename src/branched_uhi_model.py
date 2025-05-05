@@ -432,18 +432,18 @@ class BranchedUHIModel(nn.Module):
 
         # Concatenate all available static features
         if not all_static_features_list:
-             # If no static features are provided or enabled, and static_proj exists (input_ch > 0),
-             # this indicates a configuration mismatch. The check in init should prevent this.
-             # If static_proj is None, we proceed with only temporal features.
-             if self.static_proj is not None:
-                  raise ValueError("Static projection layer exists, but no static features were provided to forward pass.")
-             static_projected = torch.zeros(B, 0, H_feat, W_feat, device=temporal_projected.device) # Empty static tensor
+            # If no static features are provided or enabled, and static_proj exists (input_ch > 0),
+            # this indicates a configuration mismatch. The check in init should prevent this.
+            # If static_proj is None, we proceed with only temporal features.
+            if self.static_proj is not None:
+                raise ValueError("Static projection layer exists, but no static features were provided to forward pass.")
+            static_projected = torch.zeros(B, 0, H_feat, W_feat, device=temporal_projected.device) # Empty static tensor
         else:
-             combined_static = torch.cat(all_static_features_list, dim=1)
-             if self.static_proj is None:
-                 # This case should ideally not happen if init checks pass
-                 raise ValueError("Static features provided, but static projection layer is None. Check config.")
-             static_projected = self.static_proj(combined_static)
+            combined_static = torch.cat(all_static_features_list, dim=1)
+            if self.static_proj is None:
+                # This case should ideally not happen if init checks pass
+                raise ValueError("Static features provided, but static projection layer is None. Check config.")
+            static_projected = self.static_proj(combined_static)
 
         # --- 3. Fusion & U-Net Decoder --- #
         # Concatenate projected features
