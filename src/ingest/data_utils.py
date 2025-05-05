@@ -15,6 +15,7 @@ import rasterio.io
 import requests
 import os
 import subprocess
+import time
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
@@ -523,4 +524,44 @@ def unzip_file(zip_path: Path, extract_dir: Path) -> bool:
         return False
     except Exception as e:
         logging.error(f"An unexpected error occurred during unzipping of {zip_path.name}: {e}")
-        return False 
+        return False
+
+# --- Command Execution Helpers --- #
+
+def run_command(command: List[str], description: str, timeout: int = 600):
+    """Runs a subprocess command, logs output, and handles errors."""
+    logging.info(f"Running: {description}...")
+    logging.debug(f"Command: {' '.join(command)}")
+    start_time = time.time()
+    try:
+        result = subprocess.run(command, check=True, capture_output=True, text=True, timeout=timeout)
+        logging.debug(f"STDOUT:\n{result.stdout}")
+        logging.debug(f"STDERR:\n{result.stderr}")
+        elapsed = time.time() - start_time
+        logging.info(f"{description} completed successfully in {elapsed:.2f} seconds.")
+    except subprocess.CalledProcessError as e:
+        logging.error(f"Error running {description}:")
+        logging.error(f"Command: {' '.join(e.cmd)}")
+        logging.error(f"Return Code: {e.returncode}")
+        logging.error(f"STDOUT:\n{e.stdout}")
+        logging.error(f"STDERR:\n{e.stderr}")
+        raise
+    except subprocess.TimeoutExpired:
+        logging.error(f"Error: Command '{' '.join(command)}' timed out after {timeout} seconds.")
+        raise
+    except FileNotFoundError:
+        logging.error(f"Error: Command '{command[0]}' not found. Ensure required tools (e.g., GDAL, PDAL) are installed and in PATH.")
+        raise
+
+def reproject_raster(input_path: Path, output_path: Path, target_crs: str, resampling_method: str ='bilinear', nodata_val: Any = -9999):
+    """Reprojects a raster using gdalwarp."""
+    cmd = [
+        'gdalwarp',
+        '-t_srs', target_crs,
+        '-r', resampling_method,
+        '-overwrite', # Allow overwriting existing output
+        '-dstnodata', str(nodata_val), # Explicitly set nodata for output
+        str(input_path),
+        str(output_path)
+    ]
+    run_command(cmd, f"Reprojecting {input_path.name} to {target_crs}") 
