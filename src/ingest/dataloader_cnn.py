@@ -169,11 +169,11 @@ class CityDataSet(Dataset):
                     logging.info(f"Clipping DEM to bounds: {self.bounds}")
                     min_lon, min_lat, max_lon, max_lat = self.bounds
                     logging.info(f"Opened DEM (lazy load). Native shape (approx): {self.dem_xr.shape}")
-                except Exception as e:
+                    except Exception as e:
                     logging.error(f"Failed to open/process DEM from {dem_p}: {e}")
                     if self.dem_xr: self.dem_xr.close()
                     self.dem_xr = None
-            else:
+                else:
                 logging.warning(f"DEM path specified but not found: {dem_p}")
 
         # 2. DSM (Load with rioxarray, keep as object)
