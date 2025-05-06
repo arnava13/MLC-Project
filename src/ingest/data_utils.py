@@ -579,7 +579,7 @@ def resample_xarray_to_target(
     fill_value: Optional[float] = None
 ) -> Optional[np.ndarray]:
     """Resamples an xarray.DataArray to a target grid using rioxarray.
-
+    
     Args:
         data_xr (xr.DataArray): Input data array with spatial coords and CRS.
         target_height (int): Target height in pixels.
@@ -588,8 +588,8 @@ def resample_xarray_to_target(
         target_crs: Target Coordinate Reference System (CRS object or string).
         resampling_method (Resampling): Rasterio resampling method.
         fill_value (Optional[float]): Value to fill nodata areas after resampling.
-                                    If None, existing nodata or NaN might persist.
-
+                                   If None, existing nodata or NaN might persist.
+        
     Returns:
         Optional[np.ndarray]: Resampled data as a NumPy array (C, H, W), or None on failure.
     """
@@ -599,6 +599,10 @@ def resample_xarray_to_target(
 
     try:
         logging.debug(f"Resampling input shape {data_xr.shape} to {(target_height, target_width)}")
+        # Check if the input data has multiple bands when it should have only one
+        if len(data_xr.shape) > 2 and data_xr.shape[0] > 1:
+            logging.warning(f"Input data has {data_xr.shape[0]} bands before resampling.")
+            
         resampled_xr = data_xr.rio.reproject(
             dst_crs=target_crs,
             shape=(target_height, target_width),
@@ -609,7 +613,7 @@ def resample_xarray_to_target(
         )
 
         resampled_np = resampled_xr.to_numpy()
-
+        
         # Handle fill value for potential new nodata areas introduced by resampling
         if fill_value is not None:
             # Check if nodata exists and fill if necessary
@@ -617,7 +621,7 @@ def resample_xarray_to_target(
             if current_nodata is not None:
                  if np.isnan(current_nodata):
                      resampled_np[np.isnan(resampled_np)] = fill_value
-                 else:
+            else:
                      resampled_np[resampled_np == current_nodata] = fill_value
             # Also fill NaNs that might not be explicitly marked as nodata
             resampled_np[np.isnan(resampled_np)] = fill_value
@@ -625,7 +629,8 @@ def resample_xarray_to_target(
         # Ensure channel dimension exists if needed (e.g., for single-band data)
         if resampled_np.ndim == 2:
             resampled_np = resampled_np[np.newaxis, :, :]
-
+        
+        logging.debug(f"Resampled data shape (after conversion to numpy): {resampled_np.shape}")
         return resampled_np.astype(np.float32)
 
     except Exception as e:

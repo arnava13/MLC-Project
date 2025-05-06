@@ -453,12 +453,6 @@ class BranchedUHIModel(nn.Module):
             static_projected = torch.zeros(B, 0, H_feat, W_feat, device=temporal_projected.device) # Empty static tensor
         else:
             combined_static = torch.cat(all_static_features_list, dim=1)
-            # <<< DEBUG PRINT >>>
-            print(f"[DEBUG MODEL FORWARD] Shapes before static_proj:")
-            for i, t in enumerate(all_static_features_list):
-                 print(f"  - Tensor {i}: {t.shape}")
-            print(f"  - combined_static: {combined_static.shape}")
-            # <<< END DEBUG >>>
             
             if self.static_proj is None:
                 # This case should ideally not happen if init checks pass

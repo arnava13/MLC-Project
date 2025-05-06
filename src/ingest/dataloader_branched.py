@@ -432,11 +432,11 @@ class CityDataSetBranched(Dataset):
             )
             if dem_feat_res is not None:
                 logging.debug(f"DEM after resampling shape: {dem_feat_res.shape}")
-                # Take just the first band if multiple bands exist
-                if dem_feat_res.shape[0] > 1:
-                    logging.warning(f"DEM has {dem_feat_res.shape[0]} bands, using only the first band.")
-                    dem_feat_res = dem_feat_res[0:1]  # Keep as 3D with a single channel
-                    logging.debug(f"DEM after band selection shape: {dem_feat_res.shape}")
+                # ALWAYS force using only the first band, even if shape[0] is 1
+                # This ensures we have consistent behavior regardless of input
+                logging.warning(f"DEM has {dem_feat_res.shape[0]} bands, using only the first band.")
+                dem_feat_res = dem_feat_res[0:1]  # Keep as 3D with a single channel
+                logging.debug(f"DEM after band selection shape: {dem_feat_res.shape}")
                 
                 # Normalize DEM [0, 1] - specific to this feature resolution grid
                 min_v, max_v = np.min(dem_feat_res), np.max(dem_feat_res)
@@ -458,11 +458,11 @@ class CityDataSetBranched(Dataset):
             )
             if dsm_feat_res is not None:
                 logging.debug(f"DSM after resampling shape: {dsm_feat_res.shape}")
-                # Take just the first band if multiple bands exist
-                if dsm_feat_res.shape[0] > 1:
-                    logging.warning(f"DSM has {dsm_feat_res.shape[0]} bands, using only the first band.")
-                    dsm_feat_res = dsm_feat_res[0:1]  # Keep as 3D with a single channel
-                    logging.debug(f"DSM after band selection shape: {dsm_feat_res.shape}")
+                # ALWAYS force using only the first band, even if shape[0] is 1
+                # This ensures we have consistent behavior regardless of input
+                logging.warning(f"DSM has {dsm_feat_res.shape[0]} bands, using only the first band.")
+                dsm_feat_res = dsm_feat_res[0:1]  # Keep as 3D with a single channel
+                logging.debug(f"DSM after band selection shape: {dsm_feat_res.shape}")
                 
                 # Normalize DSM [0, 1]
                 min_v, max_v = np.min(dsm_feat_res), np.max(dsm_feat_res)
@@ -496,11 +496,6 @@ class CityDataSetBranched(Dataset):
             else:
                 combined_static_features = np.zeros((0, self.feat_H, self.feat_W), dtype=np.float32)
                 logging.warning("No valid static features found for concatenation.")
-
-        # <<< DEBUG PRINT >>>
-        print(f"[DEBUG DATALOADER] combined_static_features shape: {combined_static_features.shape}")
-        # <<< END DEBUG >>>
-
         # --- Prepare Clay Inputs (if needed) --- #
         clay_mosaic_input = None # The mosaic resampled to feature res
         norm_latlon_tensor = None

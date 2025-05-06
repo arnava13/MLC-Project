@@ -29,7 +29,7 @@ def masked_mae_loss(pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor
         return torch.tensor(0.0, device=pred.device, requires_grad=True) # Ensure it's on the right device and differentiable
 
     # Return mean absolute error
-    return total_mae 
+    return total_mae / num_valid
 
 def masked_mse_loss(pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
     """Calculates the Mean Squared Error (MSE) only on valid (masked) grid cells.
@@ -49,4 +49,4 @@ def masked_mse_loss(pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor
     num_valid = mask.sum()
     if num_valid == 0:
         return torch.tensor(0.0, device=pred.device, requires_grad=True)
-    return total_mse 
+    return total_mse / num_valid 
