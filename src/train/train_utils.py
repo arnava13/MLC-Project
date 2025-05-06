@@ -205,7 +205,7 @@ def create_dataloaders(train_ds: Subset,
 
     # Calculate val batch size (use full validation set if possible)
     if val_ds and len(val_ds) > 0:
-        val_batch_size = 32 # Use a fixed batch size for validation to manage memory
+        val_batch_size = 1 # Decrease validation batch size to 1
         logging.info(f"Using Validation Batch Size: {val_batch_size}")
         val_loader = DataLoader(
             val_ds,
@@ -272,6 +272,11 @@ def train_epoch_generic(model: nn.Module,
         # --- Forward Pass --- #
         try:
             predictions = model(**model_inputs)
+            # <<< Check for NaN/Inf in predictions >>>
+            if not torch.isfinite(predictions).all():
+                logging.error(f"NaN or Inf detected in model predictions! Skipping batch.")
+                # Optionally log more details about inputs here if needed
+                continue # Skip to next batch
         except TypeError as e:
             logging.error(f"Error during model forward pass: {e}")
             logging.error(f"Model type: {type(model).__name__}, Available keys in batch: {batch.keys()}")
@@ -283,6 +288,15 @@ def train_epoch_generic(model: nn.Module,
             predictions = F.interpolate(predictions, size=target.shape[-2:], mode='bilinear', align_corners=False)
 
         loss = loss_fn(predictions, target, mask)
+
+        # <<< Check for NaN/Inf in loss >>>
+        if not torch.isfinite(loss):
+            logging.error(f"NaN or Inf detected in loss value ({loss.item()})! Skipping batch.")
+            # Log prediction/target stats if helpful
+            # pred_min, pred_max = torch.min(predictions).item(), torch.max(predictions).item()
+            # target_min, target_max = torch.min(target[mask]).item(), torch.max(target[mask]).item()
+            # logging.error(f"Pred range: [{pred_min}, {pred_max}], Target range: [{target_min}, {target_max}]")
+            continue # Skip gradient calculation and step
 
         # --- Backpropagation --- #
         loss.backward()
