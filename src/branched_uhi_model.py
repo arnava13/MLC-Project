@@ -488,13 +488,6 @@ class BranchedUHIModel(nn.Module):
         unet_output = self.unet_decoder(fused_features)
         # unet_output shape: (B, unet_base_channels, H_feat, W_feat)
         
-        # --- DEBUG: Check magnitude before final conv ---
-        if torch.isnan(unet_output).any() or torch.isinf(unet_output).any():
-            logging.warning(f"[DEBUG FORWARD] UNet output contains NaN/Inf! Max: {unet_output.max().item()}, Min: {unet_output.min().item()}")
-        else: 
-            logging.info(f"[DEBUG FORWARD] UNet output stats - Max: {unet_output.max().item():.4e}, Min: {unet_output.min().item():.4e}, Mean: {unet_output.mean().item():.4e}")
-        # --- END DEBUG ---
-
         # Final 1x1 Convolution
         prediction = self.final_conv(unet_output)
         # prediction shape: (B, 1, H_uhi, W_uhi) - ensured by UNetDecoderWithTargetResize
