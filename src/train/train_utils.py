@@ -20,6 +20,11 @@ def save_checkpoint(state: Dict[str, Any], is_best: bool, output_dir: Union[str,
     output_dir.mkdir(parents=True, exist_ok=True)
     filepath = output_dir / filename
     best_filepath = output_dir / best_filename
+    
+    # Always save the current state
+    torch.save(state, filepath)
+    logging.debug(f"Saved current checkpoint to {filepath}")
+
     if is_best:
         shutil.copyfile(filepath, best_filepath)
         logging.info(f"Saved new best model to {best_filepath}")
