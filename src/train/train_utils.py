@@ -10,24 +10,46 @@ from tqdm import tqdm
 from typing import Tuple, Dict, Optional, List, Union, Any
 import torch.nn.functional as F # For interpolation
 from torch.cuda.amp import autocast # For AMP, keep if needed for inference speed only?
+import tempfile # Added for safe saving
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 def save_checkpoint(state: Dict[str, Any], is_best: bool, output_dir: Union[str, Path], filename: str = 'checkpoint.pth.tar', best_filename: str = 'model_best.pth.tar'):
-    """Saves model checkpoint."""
+    """Saves model checkpoint safely using a temporary file."""
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     filepath = output_dir / filename
     best_filepath = output_dir / best_filename
-    
-    # Always save the current state
-    torch.save(state, filepath)
-    logging.debug(f"Saved current checkpoint to {filepath}")
 
-    if is_best:
-        shutil.copyfile(filepath, best_filepath)
-        logging.info(f"Saved new best model to {best_filepath}")
+    # Use tempfile for safer saving
+    tmp_file_path = None # Initialize path variable
+    try:
+        # Create a temporary file in the same directory to ensure atomic rename works
+        with tempfile.NamedTemporaryFile(delete=False, dir=output_dir, suffix='.tmp') as tmp_file_obj:
+            tmp_file_path = Path(tmp_file_obj.name)
+            torch.save(state, tmp_file_path)
+            # logging.debug(f"Successfully saved state to temporary file {tmp_file_path}") # DEBUG
+
+        # Rename the temporary file to the final filename (atomic on most systems)
+        tmp_file_path.rename(filepath)
+        logging.info(f"Saved current checkpoint to {filepath}")
+
+        # If this is the best model, copy the saved checkpoint (which now definitely exists)
+        if is_best:
+            shutil.copyfile(filepath, best_filepath)
+            logging.info(f"Saved new best model to {best_filepath}")
+
+    except Exception as e:
+        logging.error(f"Error during checkpoint saving process for {filepath}: {e}", exc_info=True)
+        # Clean up temporary file if it exists and rename failed or an error occurred after save
+        if tmp_file_path is not None and tmp_file_path.exists():
+            try:
+                tmp_file_path.unlink()
+                logging.info(f"Cleaned up partially saved temporary file {tmp_file_path}")
+            except OSError as unlink_e:
+                logging.error(f"Failed to clean up temporary file {tmp_file_path}: {unlink_e}")
+    # No finally block needed as rename handles the tmp file removal implicitly on success
 
 
 def check_path(relative_path: Optional[Union[str, Path]],
@@ -311,15 +333,11 @@ def train_epoch_generic(model: nn.Module,
         all_targets_flat = np.concatenate(all_targets_unnorm)
         all_preds_flat = np.concatenate(all_preds_unnorm)
         if all_targets_flat.size > 0:
-            rmse_epoch = np.sqrt(np.mean((all_preds_flat - all_targets_flat)**2))
-            # Calculate R2, handle potential division by zero or constant targets
+            mse = np.mean((all_preds_flat - all_targets_flat)**2)
+            rmse_epoch = np.sqrt(mse)
             target_variance = np.var(all_targets_flat)
-            if target_variance > 1e-6:
-                r2_epoch = 1 - (np.mean((all_preds_flat - all_targets_flat)**2) / target_variance)
-            else:
-                 # If variance is near zero (targets are constant), R2 is undefined or 0
-                 # depending on whether predictions perfectly match the constant.
-                 r2_epoch = 1.0 if np.allclose(all_preds_flat, all_targets_flat) else 0.0
+            epsilon = 1e-10
+            r2_epoch = 1 - (mse / (target_variance + epsilon))
 
     return avg_loss, rmse_epoch, r2_epoch
 
@@ -402,17 +420,23 @@ def validate_epoch_generic(model: nn.Module,
 
     # Calculate overall epoch metrics (RMSE, R2)
     rmse_epoch = 0.0
-    r2_epoch = 0.0
+    r2_epoch = 0.0 # Initialize with a default value
     if all_targets_unnorm:
         all_targets_flat = np.concatenate(all_targets_unnorm)
         all_preds_flat = np.concatenate(all_preds_unnorm)
         if all_targets_flat.size > 0:
-            rmse_epoch = np.sqrt(np.mean((all_preds_flat - all_targets_flat)**2))
+            mse = np.mean((all_preds_flat - all_targets_flat)**2)
+            rmse_epoch = np.sqrt(mse)
             target_variance = np.var(all_targets_flat)
-            if target_variance > 1e-6:
-                r2_epoch = 1 - (np.mean((all_preds_flat - all_targets_flat)**2) / target_variance)
-            else:
-                r2_epoch = 1.0 if np.allclose(all_preds_flat, all_targets_flat) else 0.0
+            
+            # Calculate R2 directly, adding epsilon to variance to avoid division by zero
+            # Removed specific handling for target_variance <= 1e-6
+            epsilon = 1e-9
+            r2_epoch = 1 - (mse / (target_variance + epsilon))
+            
+            # Remove debug print from previous step
+            # print(f"[DEBUG R2 VAL] Target Variance: {target_variance:.8e}") 
+            # print(f"[DEBUG R2 VAL] Variance <= 1e-6. Predictions close to targets? {np.allclose(all_preds_flat, all_targets_flat)}. Setting R2 to 1.0 if True else 0.0")
 
     return avg_loss, rmse_epoch, r2_epoch
 
