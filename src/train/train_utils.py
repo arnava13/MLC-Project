@@ -9,7 +9,6 @@ import numpy as np
 from tqdm import tqdm
 from typing import Tuple, Dict, Optional, List, Union, Any
 import torch.nn.functional as F # For interpolation
-from torch.cuda.amp import autocast # For AMP, keep if needed for inference speed only?
 import tempfile # Added for safe saving
 
 # Configure logging
@@ -119,24 +118,13 @@ def calculate_uhi_stats(train_ds: Subset) -> Tuple[float, float]:
         logging.warning("Training dataset is empty, cannot calculate UHI stats. Returning 0.0, 1.0")
         return 0.0, 1.0
 
-    # Access the original dataset and indices from the Subset object
-    if not isinstance(train_ds, Subset):
-        # Handle case where train_ds might be the full dataset (e.g., small dataset scenario)
-        logging.warning("train_ds is not a Subset object. Attempting calculation on full dataset.")
-        original_dataset = train_ds
-        indices_to_process = list(range(len(train_ds)))
-        if not hasattr(original_dataset, 'unique_timestamps') or \
-           not hasattr(original_dataset, 'target_grids') or \
-           not hasattr(original_dataset, 'valid_masks'):
-            raise AttributeError("Full dataset does not have required attributes (unique_timestamps, target_grids, valid_masks) for direct stats calculation.")
-    else:
-        original_dataset = train_ds.dataset
-        indices_to_process = train_ds.indices
-        # Check if the original dataset has the required precomputed grids
-        if not hasattr(original_dataset, 'unique_timestamps') or \
-           not hasattr(original_dataset, 'target_grids') or \
-           not hasattr(original_dataset, 'valid_masks'):
-            raise AttributeError("Original dataset within Subset does not have required attributes (unique_timestamps, target_grids, valid_masks) for stats calculation.")
+    original_dataset = train_ds.dataset
+    indices_to_process = train_ds.indices
+    # Check if the original dataset has the required precomputed grids
+    if not hasattr(original_dataset, 'unique_timestamps') or \
+        not hasattr(original_dataset, 'target_grids') or \
+        not hasattr(original_dataset, 'valid_masks'):
+        raise AttributeError("Original dataset within Subset does not have required attributes (unique_timestamps, target_grids, valid_masks) for stats calculation.")
 
 
     # Iterate through only the required indices
@@ -217,7 +205,7 @@ def create_dataloaders(train_ds: Subset,
 
     # Calculate val batch size (use full validation set if possible)
     if val_ds and len(val_ds) > 0:
-        val_batch_size = len(val_ds) # Validate on full validation set at once
+        val_batch_size = 32 # Use a fixed batch size for validation to manage memory
         logging.info(f"Using Validation Batch Size: {val_batch_size}")
         val_loader = DataLoader(
             val_ds,
@@ -308,9 +296,9 @@ def train_epoch_generic(model: nn.Module,
         # --- Metrics Calculation --- #
         total_loss += loss.item()
 
-        # Unnormalize for evaluation metrics (use item() for loss)
-        targets_unnorm = target.cpu().numpy() * uhi_std + uhi_mean
-        preds_unnorm = predictions.detach().cpu().numpy() * uhi_std + uhi_mean # detach() before numpy()
+        # Convert tensors to numpy for evaluation metrics (no extra scaling)
+        targets_unnorm = target.cpu().numpy()
+        preds_unnorm = predictions.detach().cpu().numpy()
         valid_mask_np = mask.cpu().numpy().astype(bool) # Ensure boolean mask
 
         # Store only valid pixels efficiently
@@ -401,9 +389,9 @@ def validate_epoch_generic(model: nn.Module,
             loss = loss_fn(predictions, target, mask)
             total_loss += loss.item()
 
-            # --- Metrics Calculation --- #
-            targets_unnorm = target.cpu().numpy() * uhi_std + uhi_mean
-            preds_unnorm = predictions.cpu().numpy() * uhi_std + uhi_mean # No detach() needed in no_grad()
+            # --- Metrics Calculation (raw scale) --- #
+            targets_unnorm = target.cpu().numpy()
+            preds_unnorm = predictions.cpu().numpy()
             valid_mask_np = mask.cpu().numpy().astype(bool)
 
             valid_targets = targets_unnorm[valid_mask_np]

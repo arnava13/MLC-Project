@@ -440,10 +440,12 @@ class UNetConvBlock(nn.Module):
         self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1)
         self.bn2 = nn.BatchNorm2d(out_channels)
         self.relu2 = nn.ReLU(inplace=True)
+        self.dropout = nn.Dropout2d(p=0.1)
 
     def forward(self, x):
         x = self.relu1(self.bn1(self.conv1(x)))
         x = self.relu2(self.bn2(self.conv2(x)))
+        x = self.dropout(x)
         return x
 
 class UNetUpBlock(nn.Module):

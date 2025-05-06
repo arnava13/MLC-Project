@@ -593,6 +593,6 @@ class UNetDecoderWithTargetResize(nn.Module):
         _, _, current_h, current_w = x.shape
         if current_h != self.target_h or current_w != self.target_w:
             logging.debug(f"UNetDecoder output ({current_h}, {current_w}) != target ({self.target_h}, {self.target_w}). Interpolating.")
-            x = F.interpolate(x, size=(self.target_h, self.target_w), mode='bilinear', align_corners=False)
+            x = F.interpolate(x, size=(self.target_h, self.target_w), mode='bicubic', align_corners=False)
 
         return x 
