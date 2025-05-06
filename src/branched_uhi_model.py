@@ -489,8 +489,11 @@ class BranchedUHIModel(nn.Module):
         # unet_output shape: (B, unet_base_channels, H_feat, W_feat)
         
         # Final 1x1 Convolution
-        prediction = self.final_conv(unet_output)
+        prediction_raw = self.final_conv(unet_output)
         # prediction shape: (B, 1, H_uhi, W_uhi) - ensured by UNetDecoderWithTargetResize
+
+        # Apply tanh to constrain output range and improve initial stability
+        prediction = torch.tanh(prediction_raw)
 
         return prediction
 
