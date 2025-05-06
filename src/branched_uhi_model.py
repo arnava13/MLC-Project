@@ -325,19 +325,26 @@ class BranchedUHIModel(nn.Module):
             clay_output_channels = self.clay_model.output_channels
             logging.info(f"Initialized Clay model ({clay_model_size}), output channels: {clay_output_channels}")
 
-        # Calculate number of input channels for the static projection layer
-        # This depends on which static features are enabled IN ADDITION to Clay output
-        static_input_channels = clay_output_channels
-        if self.feature_flags.get("use_lst", False): static_input_channels += 1
-        if self.feature_flags.get("use_dem", False): static_input_channels += 1
-        if self.feature_flags.get("use_dsm", False): static_input_channels += 1
-        if self.feature_flags.get("use_ndvi", False): static_input_channels += 1
-        if self.feature_flags.get("use_ndbi", False): static_input_channels += 1
-        if self.feature_flags.get("use_ndwi", False): static_input_channels += 1
+        # Calculate number of channels expected from the dataloader's 'static_features' tensor
+        dataloader_static_channels = 0
+        if self.feature_flags.get("use_lst", False): dataloader_static_channels += 1
+        if self.feature_flags.get("use_dem", False): dataloader_static_channels += 1
+        if self.feature_flags.get("use_dsm", False): dataloader_static_channels += 1
+        if self.feature_flags.get("use_ndvi", False): dataloader_static_channels += 1
+        if self.feature_flags.get("use_ndbi", False): dataloader_static_channels += 1
+        if self.feature_flags.get("use_ndwi", False): dataloader_static_channels += 1
         if self.feature_flags.get("use_sentinel_composite", False):
             if not sentinel_bands_to_load: raise ValueError("sentinel_bands_to_load required if use_sentinel_composite=True")
-            static_input_channels += len(sentinel_bands_to_load)
+            dataloader_static_channels += len(sentinel_bands_to_load)
 
+        # Calculate total input channels for the static projection layer
+        static_input_channels = 0
+        if clay_output_channels > 0:
+            static_input_channels += clay_output_channels # Add Clay channels if used
+        if dataloader_static_channels > 0:
+            static_input_channels += dataloader_static_channels # Add channels from the dataloader tensor
+
+        logging.info(f"Calculated dataloader static channels: {dataloader_static_channels}")
         logging.info(f"Total calculated input channels for STATIC projection: {static_input_channels}")
 
         if static_input_channels > 0:
@@ -451,6 +458,7 @@ class BranchedUHIModel(nn.Module):
                  print(f"  - Tensor {i}: {t.shape}")
             print(f"  - combined_static: {combined_static.shape}")
             # <<< END DEBUG >>>
+            
             if self.static_proj is None:
                 # This case should ideally not happen if init checks pass
                 raise ValueError("Static features provided, but static projection layer is None. Check config.")
