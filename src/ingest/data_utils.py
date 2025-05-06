@@ -586,23 +586,26 @@ def resample_xarray_to_target(
         target_width (int): Target width in pixels.
         target_transform (Affine): Target affine transformation.
         target_crs: Target Coordinate Reference System (CRS object or string).
-        resampling_method (Resampling): Rasterio resampling method.
-        fill_value (Optional[float]): Value to fill nodata areas after resampling.
-                                   If None, existing nodata or NaN might persist.
+        resampling_method (Resampling): Resampling algorithm (default: bilinear).
+        fill_value (Optional[float]): Value to fill nodata areas (default: None).
         
     Returns:
-        Optional[np.ndarray]: Resampled data as a NumPy array (C, H, W), or None on failure.
+        Optional[np.ndarray]: Resampled array with shape [bands, height, width] or None if error.
     """
-    if data_xr is None:
-        logging.warning("Input data_xr is None, cannot resample.")
-        return None
-
     try:
-        logging.debug(f"Resampling input shape {data_xr.shape} to {(target_height, target_width)}")
         # Check if the input data has multiple bands when it should have only one
-        if len(data_xr.shape) > 2 and data_xr.shape[0] > 1:
-            logging.warning(f"Input data has {data_xr.shape[0]} bands before resampling.")
-            
+        if len(data_xr.shape) >= 3:
+            logging.debug(f"Input data has {data_xr.shape[0]} bands before resampling.")
+
+        # Get bounds from transform and dimensions
+        left, top = target_transform.c, target_transform.f
+        right = left + target_transform.a * target_width
+        bottom = top + target_transform.e * target_height  # e is negative
+
+        # Make sure data_xr has a CRS set
+        if not hasattr(data_xr, 'rio') or not hasattr(data_xr.rio, 'crs'):
+            raise ValueError("Input xarray DataArray must have CRS information from rioxarray")
+
         resampled_xr = data_xr.rio.reproject(
             dst_crs=target_crs,
             shape=(target_height, target_width),

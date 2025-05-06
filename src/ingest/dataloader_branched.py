@@ -434,7 +434,7 @@ class CityDataSetBranched(Dataset):
                 logging.debug(f"DEM after resampling shape: {dem_feat_res.shape}")
                 # ALWAYS force using only the first band, even if shape[0] is 1
                 # This ensures we have consistent behavior regardless of input
-                logging.warning(f"DEM has {dem_feat_res.shape[0]} bands, using only the first band.")
+                logging.debug(f"DEM has {dem_feat_res.shape[0]} bands, using only the first band.")
                 dem_feat_res = dem_feat_res[0:1]  # Keep as 3D with a single channel
                 logging.debug(f"DEM after band selection shape: {dem_feat_res.shape}")
                 
@@ -449,22 +449,21 @@ class CityDataSetBranched(Dataset):
             else:
                 logging.warning(f"DEM resampling failed for timestamp {target_timestamp}.")
 
-        # 4. DSM (Resample to FEATURE resolution)
+        # 4. DSM (Resample to FEATURE resolution) - Digital Surface Model (buildings, trees, etc.)
         dsm_feat_res = None
         if self.feature_flags["use_dsm"] and self.dsm_xr is not None:
             logging.debug(f"Resampling DSM with initial shape: {self.dsm_xr.shape}")
             dsm_feat_res = resample_xarray_to_target(
-                self.dsm_xr, self.feat_H, self.feat_W, self.feat_transform, self.target_crs, fill_value=0.0
+                self.dsm_xr, self.feat_H, self.feat_W, self.feat_transform, self.target_crs, fill_value=0.0 # Fill nodata with 0
             )
             if dsm_feat_res is not None:
                 logging.debug(f"DSM after resampling shape: {dsm_feat_res.shape}")
-                # ALWAYS force using only the first band, even if shape[0] is 1
-                # This ensures we have consistent behavior regardless of input
-                logging.warning(f"DSM has {dsm_feat_res.shape[0]} bands, using only the first band.")
+                # Use only first band (multiple bands handled by xarray open_rasterio)
+                logging.debug(f"DSM has {dsm_feat_res.shape[0]} bands, using only the first band.")
                 dsm_feat_res = dsm_feat_res[0:1]  # Keep as 3D with a single channel
                 logging.debug(f"DSM after band selection shape: {dsm_feat_res.shape}")
-                
-                # Normalize DSM [0, 1]
+
+                # Normalize DSM [0, 1] - specific to this feature resolution grid
                 min_v, max_v = np.min(dsm_feat_res), np.max(dsm_feat_res)
                 if max_v > min_v:
                     dsm_feat_res = (dsm_feat_res - min_v) / (max_v - min_v)
@@ -492,7 +491,7 @@ class CityDataSetBranched(Dataset):
                     logging.warning(f"Static feature '{feature_names[i]}' has incorrect shape or is None. Skipping.")
             if valid_static_features:
                 combined_static_features = np.concatenate(valid_static_features, axis=0).astype(np.float32)
-                logging.info(f"Included static features: {valid_feature_names}")
+                #logging.info(f"Included static features: {valid_feature_names}")
             else:
                 combined_static_features = np.zeros((0, self.feat_H, self.feat_W), dtype=np.float32)
                 logging.warning("No valid static features found for concatenation.")

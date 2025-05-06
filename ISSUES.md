@@ -33,25 +33,30 @@ User reported encountering a GPU Out Of Memory error after modifications to inco
 
 ## Resolved Issues
 
-### NaN Loss Values During Training (2023-05-06)
+### NaN Loss Values during Training (2025-05-06)
 
-**Issue Description:**
-During model training, loss values quickly became NaN, causing training to fail. This was observed in the logs: "Training: 2%|▏ | 1/47 [00:09<07:06, 9.28s/it, loss=nan]"
+**Reported:** 2025-05-06
+**Status:** Resolved
+
+**Description:**
+Training runs were resulting in NaN loss values, causing the training to stop after a few iterations. This indicated numerical instability in the model training.
 
 **Root Cause:**
-The loss functions `masked_mse_loss` and `masked_mae_loss` in `src/train/loss.py` were returning the sum of errors instead of the mean. Without dividing by the number of valid elements, the loss values could become very large and lead to numerical instability, especially with larger batch sizes or deeper models.
+Several factors contributed to this issue:
+1. The loss function was calculating mean by dividing a potentially large sum by a small number of valid pixels
+2. The ConvLSTM weights were not properly initialized, potentially leading to exploding gradients
+3. Lack of gradient clipping allowed gradients to grow too large during backpropagation
 
-**Fix:**
-Modified both loss functions to correctly return the mean error by dividing by the number of valid elements:
-```python
-# Before:
-return total_mse  # Just returning sum of all squared errors
+**Affected Files/Modules:**
+- `src/train/loss.py`
+- `src/train/train_utils.py`  
+- `src/branched_uhi_model.py`
 
-# After:
-return total_mse / num_valid  # Properly calculating mean
-```
-
-**Status:** Resolved
+**Solution:**
+1. Fixed the loss functions in `src/train/loss.py` to properly calculate mean values
+2. Added gradient clipping in `train_utils.py` with a max norm of 1.0
+3. Added orthogonal initialization to ConvLSTM cell weights in `branched_uhi_model.py`
+4. Set forget gate bias to 1.0 to improve learning stability
 
 ### Channel mismatch in model input for DEM/DSM data (2023-05-06)
 
@@ -59,27 +64,19 @@ return total_mse / num_valid  # Properly calculating mean
 The model expected 1026 input channels (1024 from Clay features + 2 from DEM/DSM), but was receiving 1030 channels (1024 from Clay + 6 from other features). This caused a shape mismatch error during model forward pass.
 
 **Root Cause:**
-DEM and DSM files were being loaded with 5 bands each instead of 1, resulting in 10 channels where only 2 were expected. This was confirmed by examining the model logs: "[DEBUG DATALOADER] combined_static_features shape: (6, 373, 323)" and "Included static features: ['dem', 'dsm']".
+DEM and DSM files were being loaded with 5 bands each instead of 1, resulting in 10 channels where only 2 were expected. This was confirmed by examining the model logs: "DSM has 5 bands, using only the first band" warning.
 
 **Investigation:**
-1. From the source website https://planetarycomputer.microsoft.com/dataset/3dep-lidar-dsm#overview, both DSM and DEM data should only have one band.
+1. From the source website, both DEM and DSM data should only have a single band.
 2. Examining logs showed: "DSM has 5 bands, using only the first band" warning.
-3. Files were downloaded using stackstac and saved as Cloud Optimized GeoTIFF (COG) files.
+3. In the model, we confirmed a channel mismatch error where static_proj expected 1026 channels but got 1030.
 
-**Fix:**
-1. Modified the dataloader code to consistently select only the first band from each elevation file if multiple bands were detected:
-```python
-if dem_feat_res.shape[0] > 1:
-    logging.warning(f"DEM has {dem_feat_res.shape[0]} bands, using only the first band.")
-    dem_feat_res = dem_feat_res[0:1]  # Keep as 3D with a single channel
-```
+**Solution:**
+1. Modified `dataloader_branched.py` to explicitly select only the first band from each elevation file
+2. Added debug logs to help identify the exact shapes at each processing step
+3. Suppressed frequent warning messages during training to reduce noise
 
-2. Updated the download_data.ipynb notebook to ensure only single-band data is saved during the download process:
-```python
-# Check if data has multiple bands/channels and take only the first one
-if len(dem_data.shape) > 2 and dem_data.shape[0] > 1:
-    logging.warning(f"DEM data has {dem_data.shape[0]} bands when it should have 1. Keeping only first band.")
-    dem_data = dem_data[0:1]
-```
+**Verification:**
+After the changes, the dataloader now correctly provides 2 channels (1 for DEM, 1 for DSM) instead of 10. This resolved the channel mismatch error in the model forward pass.
 
 **Status:** Resolved 

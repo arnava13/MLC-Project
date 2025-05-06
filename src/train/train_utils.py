@@ -271,6 +271,11 @@ def train_epoch_generic(model: nn.Module,
 
         # --- Backpropagation --- #
         loss.backward()
+        
+        # Add gradient clipping to prevent exploding gradients
+        # A max_norm of 1.0 is a common value that works well in many cases
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        
         optimizer.step()
 
         # --- Metrics Calculation --- #
