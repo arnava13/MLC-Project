@@ -346,6 +346,7 @@ class BranchedUHIModel(nn.Module):
 
         logging.info(f"Calculated dataloader static channels: {dataloader_static_channels}")
         logging.info(f"Total calculated input channels for STATIC projection: {static_input_channels}")
+        print(f"[DEBUG MODEL INIT] Initializing static_proj with {static_input_channels} input channels.")
 
         if static_input_channels > 0:
             self.static_proj = nn.Conv2d(static_input_channels, proj_static_ch, kernel_size=1)
