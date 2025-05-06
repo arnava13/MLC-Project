@@ -238,12 +238,12 @@ def load_sentinel_tensor_from_bbox_median(bounds, time_window, selected_bands=["
                 logging.error("No items were processed successfully.")
                 return None
 
-            logging.info(f"Loading data with odc.stac.stac_load on {len(processed_items)} items...")
+            logging.debug(f"Loading data with odc.stac.stac_load on {len(processed_items)} items...")
             # --- Detailed pre-load logging and additional georeference checking ---
             items_with_issues = []
             for item_idx, p_item in enumerate(processed_items):
                 has_georef_issues = False
-                logging.info(f"  Pre-load check for item {item_idx + 1}/{len(processed_items)}: ID {p_item.id}")
+                logging.debug(f"  Pre-load check for item {item_idx + 1}/{len(processed_items)}: ID {p_item.id}")
                 for band_name in selected_bands:
                     asset_to_check = p_item.assets.get(band_name)
                     if asset_to_check and asset_to_check.href:
@@ -264,7 +264,7 @@ def load_sentinel_tensor_from_bbox_median(bounds, time_window, selected_bands=["
                                         f"identity transform without GCPs"
                                     )
                                 
-                                logging.info(
+                                logging.debug(
                                     f"    Item {p_item.id}, Band {band_name}: href={href_to_check}, "
                                     f"transform={src_check.transform}, crs={src_check.crs}, "
                                     f"gcps={has_gcps}, "
@@ -290,7 +290,7 @@ def load_sentinel_tensor_from_bbox_median(bounds, time_window, selected_bands=["
                     # Remove items with issues, in reverse order to maintain valid indices
                     for item_idx, _ in sorted(items_with_issues, key=lambda x: x[0], reverse=True):
                         processed_items.pop(item_idx)
-                    logging.info(f"After removal: {len(processed_items)} items remain for processing.")
+                    logging.warning(f"After removal: {len(processed_items)} items remain for processing.")
                 else:
                     logging.warning("All items have georeferencing issues! Proceeding with caution.")
             # --- End detailed pre-load logging and checking ---
