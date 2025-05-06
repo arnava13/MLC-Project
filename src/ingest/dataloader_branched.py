@@ -475,22 +475,30 @@ class CityDataSetBranched(Dataset):
                          dem_feat_res = None
                 
                 if dem_feat_res is not None:
-                    # Use global min/max if available
+                    # Use global stats for normalization with clipping
                     if self.global_dem_min is not None and self.global_dem_max is not None:
-                        min_v, max_v = self.global_dem_min, self.global_dem_max
-                    else: # Fallback to local min/max if global failed
-                        logging.warning("Using local DEM min/max scaling as global stats were not computed.")
-                        min_v, max_v = np.nanmin(dem_feat_res), np.nanmax(dem_feat_res)
-
-                    if max_v > min_v: # Avoid division by zero
-                        dem_feat_res = (dem_feat_res - min_v) / (max_v - min_v)
-                        # Ensure NaNs (from original nodata or failed reprojection) remain NaN or become 0
-                        # If fill_value was 0.0, NaNs are already 0. Normalization might make them non-zero.
-                        # Re-masking might be safer if NaNs need preservation, but let's clip first.
-                        dem_feat_res = np.clip(dem_feat_res, 0.0, 1.0) # Clip to [0, 1] after scaling
+                        # Step 1: Clip extreme values (typical range is mean ± 3*std)
+                        # Since we don't have std directly, we'll estimate using the range
+                        dem_range = self.global_dem_max - self.global_dem_min
+                        dem_mean = (self.global_dem_max + self.global_dem_min) / 2
+                        # Approximate a 3-sigma range (covers ~99.7% of normal distribution)
+                        clip_factor = 3.0
+                        estimated_std = dem_range / 6  # rough estimate assuming min/max are 3 std dev from mean
+                        lower_bound = dem_mean - clip_factor * estimated_std
+                        upper_bound = dem_mean + clip_factor * estimated_std
+                        
+                        # Apply clipping before normalization
+                        dem_feat_res = np.clip(dem_feat_res, lower_bound, upper_bound)
+                        
+                        # Step 2: Normalize using global stats
+                        dem_feat_res = (dem_feat_res - self.global_dem_min) / (self.global_dem_max - self.global_dem_min)
+                        logging.debug(f"DEM normalized using global stats (min: {self.global_dem_min}, max: {self.global_dem_max}) with clipping")
                     else:
-                        # If min == max (flat terrain or all nodata), fill with 0.5
-                        dem_feat_res.fill(0.5)
+                        # Fallback to local min-max if global stats are not available
+                        min_v, max_v = np.min(dem_feat_res), np.max(dem_feat_res)
+                        dem_feat_res = (dem_feat_res - min_v) / (max_v - min_v) if max_v > min_v else np.full_like(dem_feat_res, 0.5)
+                        logging.debug("DEM normalized using local stats (global stats not available)")
+                    
                     static_features_list.append(dem_feat_res)
                     feature_names.append("dem")
                     # Keep dem_feat_res for potential later use (e.g., Clay?)
@@ -518,19 +526,29 @@ class CityDataSetBranched(Dataset):
                          dsm_feat_res = None
                 
                 if dsm_feat_res is not None:
-                    # Use global min/max if available
+                    # Use global stats for normalization with clipping
                     if self.global_dsm_min is not None and self.global_dsm_max is not None:
-                        min_v, max_v = self.global_dsm_min, self.global_dsm_max
-                    else: # Fallback to local min/max
-                        logging.warning("Using local DSM min/max scaling as global stats were not computed.")
-                        min_v, max_v = np.nanmin(dsm_feat_res), np.nanmax(dsm_feat_res)
-
-                    if max_v > min_v: # Avoid division by zero
-                        dsm_feat_res = (dsm_feat_res - min_v) / (max_v - min_v)
-                        dsm_feat_res = np.clip(dsm_feat_res, 0.0, 1.0) # Clip to [0, 1] after scaling
+                        # Step 1: Clip extreme values
+                        dsm_range = self.global_dsm_max - self.global_dsm_min
+                        dsm_mean = (self.global_dsm_max + self.global_dsm_min) / 2
+                        # Approximate a 3-sigma range
+                        clip_factor = 3.0
+                        estimated_std = dsm_range / 6  # rough estimate assuming min/max are 3 std dev from mean
+                        lower_bound = dsm_mean - clip_factor * estimated_std
+                        upper_bound = dsm_mean + clip_factor * estimated_std
+                        
+                        # Apply clipping before normalization
+                        dsm_feat_res = np.clip(dsm_feat_res, lower_bound, upper_bound)
+                        
+                        # Step 2: Normalize using global stats
+                        dsm_feat_res = (dsm_feat_res - self.global_dsm_min) / (self.global_dsm_max - self.global_dsm_min)
+                        logging.debug(f"DSM normalized using global stats (min: {self.global_dsm_min}, max: {self.global_dsm_max}) with clipping")
                     else:
-                        # If min == max, fill with 0.5
-                        dsm_feat_res.fill(0.5)
+                        # Fallback to local min-max if global stats are not available
+                        min_v, max_v = np.min(dsm_feat_res), np.max(dsm_feat_res)
+                        dsm_feat_res = (dsm_feat_res - min_v) / (max_v - min_v) if max_v > min_v else np.full_like(dsm_feat_res, 0.5)
+                        logging.debug("DSM normalized using local stats (global stats not available)")
+                    
                     static_features_list.append(dsm_feat_res)
                     feature_names.append("dsm")
                     # Keep dsm_feat_res for potential later use

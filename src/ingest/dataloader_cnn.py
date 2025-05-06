@@ -162,18 +162,18 @@ class CityDataSet(Dataset):
                 try:
                     self.dem_xr = rioxarray.open_rasterio(dem_p, masked=True)
                     if self.elevation_nodata is not None:
-                        self.dem_xr = self.dem_xr.where(self.dem_xr != self.elevation_nodata)
-                        self.dem_xr.rio.write_nodata(np.nan, encoded=True, inplace=True)
+                         self.dem_xr = self.dem_xr.where(self.dem_xr != self.elevation_nodata)
+                         self.dem_xr.rio.write_nodata(np.nan, encoded=True, inplace=True)
                     if self.dem_xr.rio.crs != self.target_crs:
                        logging.info(f"Reprojecting DEM from {self.dem_xr.rio.crs} to {self.target_crs_str}")
                     logging.info(f"Clipping DEM to bounds: {self.bounds}")
                     min_lon, min_lat, max_lon, max_lat = self.bounds
                     logging.info(f"Opened DEM (lazy load). Native shape (approx): {self.dem_xr.shape}")
-                    except Exception as e:
+                except Exception as e:
                     logging.error(f"Failed to open/process DEM from {dem_p}: {e}")
                     if self.dem_xr: self.dem_xr.close()
                     self.dem_xr = None
-                else:
+            else:
                 logging.warning(f"DEM path specified but not found: {dem_p}")
 
         # 2. DSM (Load with rioxarray, keep as object)
@@ -199,6 +199,29 @@ class CityDataSet(Dataset):
                     self.dsm_xr = None
             else:
                 logging.warning(f"DSM path specified but not found: {dsm_p}")
+
+        # --- Calculate Global Min/Max for DEM/DSM (if loaded) ---
+        self.global_dem_min, self.global_dem_max = None, None
+        if self.dem_xr is not None:
+            try:
+                logging.info("Calculating global DEM min/max...")
+                # Compute min/max, ignoring NaNs potentially introduced by nodata handling
+                # Ensure computation happens on the actual data, not lazy representation
+                self.global_dem_min = float(np.nanmin(self.dem_xr.values))
+                self.global_dem_max = float(np.nanmax(self.dem_xr.values))
+                logging.info(f"Global DEM Min: {self.global_dem_min}, Max: {self.global_dem_max}")
+            except Exception as e:
+                logging.error(f"Failed to compute global DEM stats: {e}. Proceeding without global stats.")
+
+        self.global_dsm_min, self.global_dsm_max = None, None
+        if self.dsm_xr is not None:
+            try:
+                logging.info("Calculating global DSM min/max...")
+                self.global_dsm_min = float(np.nanmin(self.dsm_xr.values))
+                self.global_dsm_max = float(np.nanmax(self.dsm_xr.values))
+                logging.info(f"Global DSM Min: {self.global_dsm_min}, Max: {self.global_dsm_max}")
+            except Exception as e:
+                logging.error(f"Failed to compute global DSM stats: {e}. Proceeding without global stats.")
 
         # 3. Cloudless Mosaic (Keep as NumPy array for now, will wrap in xr in getitem)
         self.cloudless_mosaic_full_np = None
@@ -399,10 +422,32 @@ class CityDataSet(Dataset):
                 self.dem_xr, self.feat_H, self.feat_W, self.feat_transform, self.target_crs, fill_value=0.0
             )
             if dem_feat_res is not None:
-                 min_v, max_v = np.min(dem_feat_res), np.max(dem_feat_res)
-                 dem_feat_res = (dem_feat_res - min_v) / (max_v - min_v) if max_v > min_v else np.full_like(dem_feat_res, 0.5)
-                 static_features_list.append(dem_feat_res)
-                 feature_names.append("dem")
+                # Use global stats for normalization with clipping
+                if self.global_dem_min is not None and self.global_dem_max is not None:
+                    # Step 1: Clip extreme values (typical range is mean ± 3*std)
+                    # Since we don't have std directly, we'll estimate using the range
+                    dem_range = self.global_dem_max - self.global_dem_min
+                    dem_mean = (self.global_dem_max + self.global_dem_min) / 2
+                    # Approximate a 3-sigma range (covers ~99.7% of normal distribution)
+                    clip_factor = 3.0
+                    estimated_std = dem_range / 6  # rough estimate assuming min/max are 3 std dev from mean
+                    lower_bound = dem_mean - clip_factor * estimated_std
+                    upper_bound = dem_mean + clip_factor * estimated_std
+                    
+                    # Apply clipping before normalization
+                    dem_feat_res = np.clip(dem_feat_res, lower_bound, upper_bound)
+                    
+                    # Step 2: Normalize using global stats
+                    dem_feat_res = (dem_feat_res - self.global_dem_min) / (self.global_dem_max - self.global_dem_min)
+                    logging.debug(f"DEM normalized using global stats (min: {self.global_dem_min}, max: {self.global_dem_max}) with clipping")
+                else:
+                    # Fallback to local min-max if global stats are not available
+                    min_v, max_v = np.min(dem_feat_res), np.max(dem_feat_res)
+                    dem_feat_res = (dem_feat_res - min_v) / (max_v - min_v) if max_v > min_v else np.full_like(dem_feat_res, 0.5)
+                    logging.debug("DEM normalized using local stats (global stats not available)")
+                
+                static_features_list.append(dem_feat_res)
+                feature_names.append("dem")
             else: logging.warning(f"DEM resampling failed for timestamp {target_timestamp}.")
 
         # 4. DSM (Resample to FEATURE resolution)
@@ -412,10 +457,31 @@ class CityDataSet(Dataset):
                 self.dsm_xr, self.feat_H, self.feat_W, self.feat_transform, self.target_crs, fill_value=0.0
             )
             if dsm_feat_res is not None:
-                 min_v, max_v = np.min(dsm_feat_res), np.max(dsm_feat_res)
-                 dsm_feat_res = (dsm_feat_res - min_v) / (max_v - min_v) if max_v > min_v else np.full_like(dsm_feat_res, 0.5)
-                 static_features_list.append(dsm_feat_res)
-                 feature_names.append("dsm")
+                # Use global stats for normalization with clipping
+                if self.global_dsm_min is not None and self.global_dsm_max is not None:
+                    # Step 1: Clip extreme values
+                    dsm_range = self.global_dsm_max - self.global_dsm_min
+                    dsm_mean = (self.global_dsm_max + self.global_dsm_min) / 2
+                    # Approximate a 3-sigma range
+                    clip_factor = 3.0
+                    estimated_std = dsm_range / 6  # rough estimate assuming min/max are 3 std dev from mean
+                    lower_bound = dsm_mean - clip_factor * estimated_std
+                    upper_bound = dsm_mean + clip_factor * estimated_std
+                    
+                    # Apply clipping before normalization
+                    dsm_feat_res = np.clip(dsm_feat_res, lower_bound, upper_bound)
+                    
+                    # Step 2: Normalize using global stats
+                    dsm_feat_res = (dsm_feat_res - self.global_dsm_min) / (self.global_dsm_max - self.global_dsm_min)
+                    logging.debug(f"DSM normalized using global stats (min: {self.global_dsm_min}, max: {self.global_dsm_max}) with clipping")
+                else:
+                    # Fallback to local min-max if global stats are not available
+                    min_v, max_v = np.min(dsm_feat_res), np.max(dsm_feat_res)
+                    dsm_feat_res = (dsm_feat_res - min_v) / (max_v - min_v) if max_v > min_v else np.full_like(dsm_feat_res, 0.5)
+                    logging.debug("DSM normalized using local stats (global stats not available)")
+                
+                static_features_list.append(dsm_feat_res)
+                feature_names.append("dsm")
             else: logging.warning(f"DSM resampling failed for timestamp {target_timestamp}.")
 
         # Combine ALL static features (excluding Clay mosaic input)

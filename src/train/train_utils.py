@@ -220,9 +220,6 @@ def create_dataloaders(train_ds: Subset,
     logging.info("Data loading setup complete.")
     return train_loader, val_loader 
 
-
-# --- NEW Generic Train/Validate Epoch Functions --- #
-
 def train_epoch_generic(model: nn.Module,
                           dataloader: DataLoader,
                           optimizer: torch.optim.Optimizer,
@@ -238,7 +235,7 @@ def train_epoch_generic(model: nn.Module,
     all_preds_unnorm = []
     num_batches = 0
     progress_bar = tqdm(dataloader, desc=desc, leave=False)
-
+    
     for batch in progress_bar:
         optimizer.zero_grad()
 
@@ -422,7 +419,7 @@ def validate_epoch_generic(model: nn.Module,
 
     # Calculate overall epoch metrics (RMSE, R2)
     rmse_epoch = 0.0
-    r2_epoch = 0.0 # Initialize with a default value
+    r2_epoch = 0.0
     if all_targets_unnorm:
         all_targets_flat = np.concatenate(all_targets_unnorm)
         all_preds_flat = np.concatenate(all_preds_unnorm)
@@ -432,13 +429,8 @@ def validate_epoch_generic(model: nn.Module,
             target_variance = np.var(all_targets_flat)
             
             # Calculate R2 directly, adding epsilon to variance to avoid division by zero
-            # Removed specific handling for target_variance <= 1e-6
             epsilon = 1e-9
             r2_epoch = 1 - (mse / (target_variance + epsilon))
-            
-            # Remove debug print from previous step
-            # print(f"[DEBUG R2 VAL] Target Variance: {target_variance:.8e}") 
-            # print(f"[DEBUG R2 VAL] Variance <= 1e-6. Predictions close to targets? {np.allclose(all_preds_flat, all_targets_flat)}. Setting R2 to 1.0 if True else 0.0")
 
     return avg_loss, rmse_epoch, r2_epoch
 

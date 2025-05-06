@@ -390,23 +390,6 @@ class BranchedUHIModel(nn.Module):
 
         logging.info(f"BranchedUHIModel initialized. Static Proj In: {static_input_channels}, Out: {proj_static_ch}. Temporal Proj In: {temporal_input_channels}, Out: {proj_temporal_ch}. UNet In: {unet_input_channels}")
 
-        # Apply Kaiming initialization
-        self._initialize_weights()
-        logging.info("Applied Kaiming Normal initialization to Conv2d layers.")
-
-    def _initialize_weights(self):
-        """Applies Kaiming Normal initialization to relevant layers."""
-        for m in self.modules():
-            if isinstance(m, nn.Conv2d):
-                # Initialize Conv2d weights with Kaiming Normal
-                # Use 'relu' nonlinearity as ReLU is common in UNet blocks
-                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
-                # Initialize bias to zero if it exists
-                if m.bias is not None:
-                    nn.init.constant_(m.bias, 0)
-            # Note: ConvLSTM weights are initialized internally in its own __init__
-            # Note: Clay model uses pre-trained weights, no explicit init needed here
-
     def forward(self, weather_seq: torch.Tensor,
                 # --- Optional Static Features (All at feature resolution) --- #
                 static_features: Optional[torch.Tensor] = None,
