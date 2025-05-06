@@ -413,7 +413,18 @@ class BranchedUHIModel(nn.Module):
             # Clay expects (B, C, H, W), norm_latlon (B, 2, H, W), norm_timestamp (B, 1)
             # Ensure norm_timestamp is broadcastable if needed, Clay handles it internally
             clay_features = self.clay_model(clay_mosaic, norm_latlon, norm_timestamp)
-            # clay_features shape: (B, C_clay_out, H_feat, W_feat)
+            # clay_features shape: (B, C_clay_out, H_clay, W_clay)
+
+            # --- RESIZE Clay features to match other static features --- #
+            if clay_features.shape[-2:] != (H_feat, W_feat):
+                logging.debug(f"Resizing Clay features from {clay_features.shape[-2:]} to {(H_feat, W_feat)}")
+                clay_features = F.interpolate(
+                    clay_features, 
+                    size=(H_feat, W_feat), 
+                    mode='bilinear', 
+                    align_corners=False
+                )
+            # ----------------------------------------------------------- #
             all_static_features_list.append(clay_features)
 
         # Other Static Features (Optional)

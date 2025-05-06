@@ -191,7 +191,7 @@ class ClayFeatureExtractor(nn.Module):
              print(f"Unexpected error determining model parameters: {e}")
              raise
 
-        # --- Define Target Input Size for Clay ---
+        # --- Define Target Input Size for Clay --- 
         self.target_input_size = (224, 224) # Standard ViT size
 
         # Prepare normalization based on metadata and selected bands
