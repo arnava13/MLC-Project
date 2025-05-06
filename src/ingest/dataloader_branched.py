@@ -203,6 +203,29 @@ class CityDataSetBranched(Dataset):
             else:
                 logging.warning(f"DSM path specified but not found: {dsm_p}")
 
+        # --- Calculate Global Min/Max for DEM/DSM (if loaded) ---
+        self.global_dem_min, self.global_dem_max = None, None
+        if self.dem_xr is not None:
+            try:
+                logging.info("Calculating global DEM min/max...")
+                # Compute min/max, ignoring NaNs potentially introduced by nodata handling
+                # Ensure computation happens on the actual data, not lazy representation
+                self.global_dem_min = float(np.nanmin(self.dem_xr.values))
+                self.global_dem_max = float(np.nanmax(self.dem_xr.values))
+                logging.info(f"Global DEM Min: {self.global_dem_min}, Max: {self.global_dem_max}")
+            except Exception as e:
+                logging.error(f"Failed to compute global DEM stats: {e}. Proceeding without global stats.")
+
+        self.global_dsm_min, self.global_dsm_max = None, None
+        if self.dsm_xr is not None:
+            try:
+                logging.info("Calculating global DSM min/max...")
+                self.global_dsm_min = float(np.nanmin(self.dsm_xr.values))
+                self.global_dsm_max = float(np.nanmax(self.dsm_xr.values))
+                logging.info(f"Global DSM Min: {self.global_dsm_min}, Max: {self.global_dsm_max}")
+            except Exception as e:
+                logging.error(f"Failed to compute global DSM stats: {e}. Proceeding without global stats.")
+
         # 3. Cloudless Mosaic (Keep as NumPy array for now, will wrap in xr in getitem)
         self.cloudless_mosaic_full_np = None
         self.mosaic_transform = None # Need transform if loading from npy
@@ -452,10 +475,21 @@ class CityDataSetBranched(Dataset):
                          dem_feat_res = None
                 
                 if dem_feat_res is not None:
-                    min_v, max_v = np.min(dem_feat_res), np.max(dem_feat_res)
-                    if max_v > min_v:
+                    # Use global min/max if available
+                    if self.global_dem_min is not None and self.global_dem_max is not None:
+                        min_v, max_v = self.global_dem_min, self.global_dem_max
+                    else: # Fallback to local min/max if global failed
+                        logging.warning("Using local DEM min/max scaling as global stats were not computed.")
+                        min_v, max_v = np.nanmin(dem_feat_res), np.nanmax(dem_feat_res)
+
+                    if max_v > min_v: # Avoid division by zero
                         dem_feat_res = (dem_feat_res - min_v) / (max_v - min_v)
+                        # Ensure NaNs (from original nodata or failed reprojection) remain NaN or become 0
+                        # If fill_value was 0.0, NaNs are already 0. Normalization might make them non-zero.
+                        # Re-masking might be safer if NaNs need preservation, but let's clip first.
+                        dem_feat_res = np.clip(dem_feat_res, 0.0, 1.0) # Clip to [0, 1] after scaling
                     else:
+                        # If min == max (flat terrain or all nodata), fill with 0.5
                         dem_feat_res.fill(0.5)
                     static_features_list.append(dem_feat_res)
                     feature_names.append("dem")
@@ -484,10 +518,18 @@ class CityDataSetBranched(Dataset):
                          dsm_feat_res = None
                 
                 if dsm_feat_res is not None:
-                    min_v, max_v = np.min(dsm_feat_res), np.max(dsm_feat_res)
-                    if max_v > min_v:
+                    # Use global min/max if available
+                    if self.global_dsm_min is not None and self.global_dsm_max is not None:
+                        min_v, max_v = self.global_dsm_min, self.global_dsm_max
+                    else: # Fallback to local min/max
+                        logging.warning("Using local DSM min/max scaling as global stats were not computed.")
+                        min_v, max_v = np.nanmin(dsm_feat_res), np.nanmax(dsm_feat_res)
+
+                    if max_v > min_v: # Avoid division by zero
                         dsm_feat_res = (dsm_feat_res - min_v) / (max_v - min_v)
+                        dsm_feat_res = np.clip(dsm_feat_res, 0.0, 1.0) # Clip to [0, 1] after scaling
                     else:
+                        # If min == max, fill with 0.5
                         dsm_feat_res.fill(0.5)
                     static_features_list.append(dsm_feat_res)
                     feature_names.append("dsm")
