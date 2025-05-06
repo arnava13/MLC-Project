@@ -8,7 +8,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import logging
 
-from src.model import UNetConvBlock, ClayFeatureExtractor
+from src.model import UNetConvBlock, ClayFeatureExtractor, UNetUpBlock, UNetDecoder, UNetDecoderWithTargetResize
 from src.ingest.data_utils import determine_target_grid_size
 
 # -----------------------------------------------------------------------------
@@ -214,24 +214,6 @@ class ConvLSTM(nn.Module):
             param = [param] * num_layers
         return param
 
-class UNetUpBlockInterpolate(nn.Module):
-    """UNet Up-block using Interpolate + Conv."""
-    def __init__(self, in_channels, out_channels, scale_factor=2):
-        super().__init__()
-        self.scale_factor = scale_factor
-        # Conv block input channels = skip channels (out_channels) + upsampled channels (in_channels)
-        self.conv = UNetConvBlock(in_channels + out_channels, out_channels)
-
-    def forward(self, x1, x2):
-        x1_upsampled = F.interpolate(x1, scale_factor=self.scale_factor, mode='bilinear', align_corners=False)
-        # Pad x1_upsampled if needed
-        diffY = x2.size()[2] - x1_upsampled.size()[2]
-        diffX = x2.size()[3] - x1_upsampled.size()[3]
-        x1_upsampled = F.pad(x1_upsampled, [diffX // 2, diffX - diffX // 2, diffY // 2, diffY - diffY // 2])
-        # Concatenate
-        x = torch.cat([x2, x1_upsampled], dim=1)
-        return self.conv(x)
-
 # -----------------------------------------------------------------------------
 # Branched UHI Model ----------------------------------------------------------
 # -----------------------------------------------------------------------------
@@ -378,7 +360,7 @@ class BranchedUHIModel(nn.Module):
         if unet_input_channels == 0:
             raise ValueError("No features projected for U-Net head (static_ch=0, temporal_ch=0). Check feature flags and projections.")
 
-        # Use the new decoder that handles target resizing
+        # Use the UNetDecoderWithTargetResize that handles target resizing
         self.unet_decoder = UNetDecoderWithTargetResize(
             in_channels=unet_input_channels,
             base_channels=unet_base_channels,
@@ -491,107 +473,4 @@ class BranchedUHIModel(nn.Module):
         prediction = self.final_conv(unet_output)
         # prediction shape: (B, 1, H_uhi, W_uhi) - ensured by UNetDecoderWithTargetResize
 
-        return prediction
-
-
-# --- U-Net Decoder Implementation (Original, potentially used by CNN) ---
-class UNetDecoder(nn.Module):
-    def __init__(self, in_channels, base_channels, depth):
-        super().__init__()
-        self.depth = depth
-        ch = in_channels
-        self.downs = nn.ModuleList()
-        for i in range(depth):
-            self.downs.append(UNetConvBlock(ch, base_channels * (2**i)))
-            ch = base_channels * (2**i)
-
-        self.middle_conv = UNetConvBlock(ch, ch)
-
-        self.ups = nn.ModuleList()
-        for i in reversed(range(depth)):
-            # Input channels = current level channels + skip connection channels
-            # Output channels = skip connection channels (channels at the shallower level)
-            upsample_in_ch = base_channels * (2**(i+1)) # Channels from deeper layer
-            skip_ch = base_channels * (2**i)        # Channels from skip connection
-            self.ups.append(UNetUpBlockInterpolate(upsample_in_ch, skip_ch))
-
-        # Final output channels will be base_channels after the last up-block
-
-    def forward(self, x):
-        skips = []
-        # Down path
-        for i, down_block in enumerate(self.downs):
-            x = down_block(x)
-            if i < self.depth - 1:
-                skips.append(x)
-                x = F.max_pool2d(x, 2)
-            else:
-                # No max pool after the last down block
-                skips.append(x)
-
-        # Middle
-        x = self.middle_conv(skips.pop()) # Use the deepest feature map
-
-        # Up path
-        for up_block in self.ups:
-            skip_connection = skips.pop()
-            x = up_block(x, skip_connection) # x is from deeper layer, skip_connection is from down path
-
-        return x
-
-# --- NEW U-Net Decoder with Target Size Resizing (for Branched Model) ---
-class UNetDecoderWithTargetResize(nn.Module):
-    """U-Net Decoder that ensures output matches target H, W using interpolation if needed."""
-    def __init__(self, in_channels, base_channels, depth, target_h, target_w):
-        super().__init__()
-        self.depth = depth
-        self.target_h = target_h
-        self.target_w = target_w
-
-        ch = in_channels
-        self.downs = nn.ModuleList()
-        self.down_pools = nn.ModuleList()
-        for i in range(depth):
-            out_ch = base_channels * (2**i)
-            self.downs.append(UNetConvBlock(ch, out_ch))
-            if i < depth - 1: # Don't add pool after last down block
-                self.down_pools.append(nn.MaxPool2d(2))
-            ch = out_ch
-
-        self.middle_conv = UNetConvBlock(ch, ch) # Middle block uses final down channels
-
-        self.ups = nn.ModuleList()
-        for i in reversed(range(depth)):
-            # Input channels for up-block: channels from deeper layer (x1)
-            # Skip channels for up-block: channels from corresponding down layer (x2)
-            upsample_in_ch = base_channels * (2**(i+1)) if i < depth - 1 else ch # Handle middle block output
-            skip_ch = base_channels * (2**i)
-            self.ups.append(UNetUpBlockInterpolate(upsample_in_ch, skip_ch))
-
-        # Final output channels will be base_channels after the last up-block
-        logging.info(f"Initialized UNetDecoderWithTargetResize. Target: ({target_h}, {target_w})")
-
-    def forward(self, x):
-        skips = []
-        # Down path
-        for i in range(self.depth):
-            x = self.downs[i](x)
-            skips.append(x)
-            if i < self.depth - 1:
-                x = self.down_pools[i](x)
-
-        # Middle (use the last element of skips, which is the output of the last down conv)
-        x = self.middle_conv(x)
-
-        # Up path (iterate through skips in reverse, starting from second-to-last)
-        for i, up_block in enumerate(self.ups):
-            skip_connection = skips[self.depth - 1 - i]
-            x = up_block(x, skip_connection)
-
-        # --- Final Resize Check --- #
-        _, _, current_h, current_w = x.shape
-        if current_h != self.target_h or current_w != self.target_w:
-            logging.debug(f"UNetDecoder output ({current_h}, {current_w}) != target ({self.target_h}, {self.target_w}). Interpolating.")
-            x = F.interpolate(x, size=(self.target_h, self.target_w), mode='bicubic', align_corners=False)
-
-        return x 
+        return prediction 

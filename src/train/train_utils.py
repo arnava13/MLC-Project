@@ -227,6 +227,7 @@ def train_epoch_generic(model: nn.Module,
                           device: torch.device,
                           uhi_mean: float,
                           uhi_std: float,
+                          max_grad_norm: float = 1.0,  # Add gradient clipping with default value
                           desc: str = 'Training') -> Tuple[float, float, float]:
     """Trains a generic UHI model for one epoch, handling different batch structures."""
     model.train()
@@ -237,201 +238,217 @@ def train_epoch_generic(model: nn.Module,
     progress_bar = tqdm(dataloader, desc=desc, leave=False)
     
     for batch in progress_bar:
+        # ------ Processing batch structure ------ #
+        batch_size = None  # Will be determined from first tensor
+        weather_input = None
+        static_features = None
+        clay_mosaic = None
+        norm_latlon = None
+        norm_timestamp = None
+        target = None
+
+        # Extract batch structure based on dataloader type
+        for key, value in batch.items():
+            if isinstance(value, torch.Tensor):
+                # Set batch size from first tensor
+                if batch_size is None and value.dim() > 0:
+                    batch_size = value.size(0)
+
+                # Move tensor to device
+                batch[key] = value.to(device)
+
+                # Identify key tensors based on name
+                if key == 'weather_grid' or key == 'weather_seq':
+                    weather_input = batch[key]
+                elif key == 'static_features':
+                    static_features = batch[key]
+                elif key == 'clay_mosaic':
+                    clay_mosaic = batch[key]
+                elif key == 'norm_latlon':
+                    norm_latlon = batch[key]
+                elif key == 'norm_timestamp':
+                    norm_timestamp = batch[key]
+                elif key == 'target':
+                    target = batch[key]
+
+        # ------ Forward pass and loss calculation ------ #
         optimizer.zero_grad()
 
-        # --- Move data to device --- #
-        target = batch['target'].to(device)
-        mask = batch['mask'].to(device)
-        static_features = batch.get('static_features')
-        if static_features is not None: static_features = static_features.to(device)
-        clay_mosaic = batch.get('cloudless_mosaic')
-        if clay_mosaic is not None: clay_mosaic = clay_mosaic.to(device)
-        norm_latlon = batch.get('norm_latlon')
-        if norm_latlon is not None: norm_latlon = norm_latlon.to(device)
-        norm_timestamp = batch.get('norm_timestamp')
-        if norm_timestamp is not None: norm_timestamp = norm_timestamp.to(device)
-
-        # --- Determine model-specific inputs --- #
-        model_inputs = {
-            'static_features': static_features,
-            'clay_mosaic': clay_mosaic,
-            'norm_latlon': norm_latlon,
-            'norm_timestamp': norm_timestamp
-        }
-        if 'weather' in batch: # For UHINetCNN
-            model_inputs['weather'] = batch['weather'].to(device)
-        elif 'weather_seq' in batch: # For BranchedUHIModel
-            model_inputs['weather_seq'] = batch['weather_seq'].to(device)
+        # Forward pass depends on model type
+        if clay_mosaic is not None and norm_latlon is not None and norm_timestamp is not None:
+            # BranchedUHIModel forward with clay
+            pred = model(
+                weather_seq=weather_input,
+                static_features=static_features,
+                clay_mosaic=clay_mosaic,
+                norm_latlon=norm_latlon,
+                norm_timestamp=norm_timestamp
+            )
+        elif static_features is not None:
+            # UHINetCNN forward
+            pred = model(
+                weather=weather_input,
+                static_features=static_features
+            )
         else:
-            logging.warning("Batch missing 'weather' or 'weather_seq'. Cannot pass temporal data.")
-            # Continue without temporal data if model can handle it, otherwise error
+            # Basic model with just weather input
+            pred = model(weather_input)
 
-        # --- Forward Pass --- #
-        try:
-            predictions = model(**model_inputs)
-            # <<< Check for NaN/Inf in predictions >>>
-            if not torch.isfinite(predictions).all():
-                logging.error(f"NaN or Inf detected in model predictions! Skipping batch.")
-                # Optionally log more details about inputs here if needed
-                continue # Skip to next batch
-        except TypeError as e:
-            logging.error(f"Error during model forward pass: {e}")
-            logging.error(f"Model type: {type(model).__name__}, Available keys in batch: {batch.keys()}")
-            logging.error(f"Inputs passed to model: {model_inputs.keys()}")
-            raise
+        loss = loss_fn(pred, target)
 
-        # Ensure prediction spatial dims match target/mask for loss calculation
-        if predictions.shape[-2:] != target.shape[-2:]:
-            predictions = F.interpolate(predictions, size=target.shape[-2:], mode='bilinear', align_corners=False)
-
-        loss = loss_fn(predictions, target, mask)
-
-        # <<< Check for NaN/Inf in loss >>>
-        if not torch.isfinite(loss):
-            logging.error(f"NaN or Inf detected in loss value ({loss.item()})! Skipping batch.")
-            # Log prediction/target stats if helpful
-            # pred_min, pred_max = torch.min(predictions).item(), torch.max(predictions).item()
-            # target_min, target_max = torch.min(target[mask]).item(), torch.max(target[mask]).item()
-            # logging.error(f"Pred range: [{pred_min}, {pred_max}], Target range: [{target_min}, {target_max}]")
-            continue # Skip gradient calculation and step
-
-        # --- Backpropagation --- #
+        # ------ Backward pass ------ #
         loss.backward()
         
-        # Add gradient clipping to prevent exploding gradients
-        # A max_norm of 1.0 is a common value that works well in many cases
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        
+        # Apply gradient clipping to prevent exploding gradients
+        # This is especially important for ConvLSTM components
+        if max_grad_norm > 0:
+            nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+            
         optimizer.step()
 
-        # --- Metrics Calculation --- #
+        # ------ Metrics calculation ------ #
+        # Un-normalize for human-interpretable metrics
+        pred_unnorm = pred * uhi_std + uhi_mean
+        target_unnorm = target * uhi_std + uhi_mean
+        
+        # Update running statistics
         total_loss += loss.item()
-
-        # Convert tensors to numpy for evaluation metrics (no extra scaling)
-        targets_unnorm = target.cpu().numpy()
-        preds_unnorm = predictions.detach().cpu().numpy()
-        valid_mask_np = mask.cpu().numpy().astype(bool) # Ensure boolean mask
-
-        # Store only valid pixels efficiently
-        valid_targets = targets_unnorm[valid_mask_np]
-        valid_preds = preds_unnorm[valid_mask_np]
-
-        if valid_targets.size > 0: # Check if there are any valid pixels
-            all_targets_unnorm.append(valid_targets)
-            all_preds_unnorm.append(valid_preds)
-
+        all_targets_unnorm.append(target_unnorm.detach().cpu())
+        all_preds_unnorm.append(pred_unnorm.detach().cpu())
         num_batches += 1
-        progress_bar.set_postfix(loss=loss.item())
-
-    avg_loss = total_loss / num_batches if num_batches > 0 else 0.0
-
-    # Calculate overall epoch metrics (RMSE, R2) on all valid pixels
-    rmse_epoch = 0.0
-    r2_epoch = 0.0
-    if all_targets_unnorm:
-        all_targets_flat = np.concatenate(all_targets_unnorm)
-        all_preds_flat = np.concatenate(all_preds_unnorm)
-        if all_targets_flat.size > 0:
-            mse = np.mean((all_preds_flat - all_targets_flat)**2)
-            rmse_epoch = np.sqrt(mse)
-            target_variance = np.var(all_targets_flat)
-            epsilon = 1e-10
-            r2_epoch = 1 - (mse / (target_variance + epsilon))
-
-    return avg_loss, rmse_epoch, r2_epoch
+        
+        # Update progress bar
+        progress_bar.set_postfix({'Loss': total_loss / num_batches})
+        
+    # Compute metrics on the whole dataset
+    all_targets_unnorm = torch.cat(all_targets_unnorm, dim=0).flatten()
+    all_preds_unnorm = torch.cat(all_preds_unnorm, dim=0).flatten()
+    
+    avg_loss = total_loss / num_batches
+    rmse = torch.sqrt(torch.mean((all_preds_unnorm - all_targets_unnorm) ** 2)).item()
+    r2 = r2_score(all_targets_unnorm.numpy(), all_preds_unnorm.numpy())
+    
+    return avg_loss, rmse, r2
 
 
 def validate_epoch_generic(model: nn.Module,
-                           dataloader: DataLoader,
-                           loss_fn: callable,
-                           device: torch.device,
-                           uhi_mean: float,
-                           uhi_std: float,
-                           desc: str = 'Validation') -> Tuple[float, float, float]:
+                            dataloader: DataLoader,
+                            loss_fn: callable,
+                            device: torch.device,
+                            uhi_mean: float,
+                            uhi_std: float,
+                            desc: str = 'Validation') -> Tuple[float, float, float]:
     """Validates a generic UHI model for one epoch, handling different batch structures."""
     model.eval()
     total_loss = 0.0
     all_targets_unnorm = []
     all_preds_unnorm = []
     num_batches = 0
+    
     progress_bar = tqdm(dataloader, desc=desc, leave=False)
-
+    
     with torch.no_grad():
         for batch in progress_bar:
-            # --- Move data to device --- #
-            target = batch['target'].to(device)
-            mask = batch['mask'].to(device)
-            static_features = batch.get('static_features')
-            if static_features is not None: static_features = static_features.to(device)
-            clay_mosaic = batch.get('cloudless_mosaic')
-            if clay_mosaic is not None: clay_mosaic = clay_mosaic.to(device)
-            norm_latlon = batch.get('norm_latlon')
-            if norm_latlon is not None: norm_latlon = norm_latlon.to(device)
-            norm_timestamp = batch.get('norm_timestamp')
-            if norm_timestamp is not None: norm_timestamp = norm_timestamp.to(device)
+            # ------ Processing batch structure ------ #
+            batch_size = None  # Will be determined from first tensor
+            weather_input = None
+            static_features = None
+            clay_mosaic = None
+            norm_latlon = None
+            norm_timestamp = None
+            target = None
 
-            # --- Determine model-specific inputs --- #
-            model_inputs = {
-                'static_features': static_features,
-                'clay_mosaic': clay_mosaic,
-                'norm_latlon': norm_latlon,
-                'norm_timestamp': norm_timestamp
-            }
-            if 'weather' in batch:
-                model_inputs['weather'] = batch['weather'].to(device)
-            elif 'weather_seq' in batch:
-                model_inputs['weather_seq'] = batch['weather_seq'].to(device)
-            else:
-                logging.warning("Batch missing 'weather' or 'weather_seq' during validation.")
+            # Extract batch structure based on dataloader type
+            for key, value in batch.items():
+                if isinstance(value, torch.Tensor):
+                    # Set batch size from first tensor
+                    if batch_size is None and value.dim() > 0:
+                        batch_size = value.size(0)
 
-            # --- Forward Pass --- #
+                    # Move tensor to device
+                    batch[key] = value.to(device)
+
+                    # Identify key tensors based on name
+                    if key == 'weather_grid' or key == 'weather_seq':
+                        weather_input = batch[key]
+                    elif key == 'static_features':
+                        static_features = batch[key]
+                    elif key == 'clay_mosaic':
+                        clay_mosaic = batch[key]
+                    elif key == 'norm_latlon':
+                        norm_latlon = batch[key]
+                    elif key == 'norm_timestamp':
+                        norm_timestamp = batch[key]
+                    elif key == 'target':
+                        target = batch[key]
+
+            # ------ Forward pass and loss calculation ------ #
             try:
-                predictions = model(**model_inputs)
-            except TypeError as e:
-                logging.error(f"Error during model forward pass (validation): {e}")
-                logging.error(f"Model type: {type(model).__name__}, Available keys in batch: {batch.keys()}")
-                logging.error(f"Inputs passed to model: {model_inputs.keys()}")
-                raise
-
-            # Ensure prediction spatial dims match target/mask for metric calculation
-            if predictions.shape[-2:] != target.shape[-2:]:
-                predictions = F.interpolate(predictions, size=target.shape[-2:], mode='bilinear', align_corners=False)
-
-            loss = loss_fn(predictions, target, mask)
-            total_loss += loss.item()
-
-            # --- Metrics Calculation (raw scale) --- #
-            targets_unnorm = target.cpu().numpy()
-            preds_unnorm = predictions.cpu().numpy()
-            valid_mask_np = mask.cpu().numpy().astype(bool)
-
-            valid_targets = targets_unnorm[valid_mask_np]
-            valid_preds = preds_unnorm[valid_mask_np]
-
-            if valid_targets.size > 0:
-                all_targets_unnorm.append(valid_targets)
-                all_preds_unnorm.append(valid_preds)
-
-            num_batches += 1
-            progress_bar.set_postfix(loss=loss.item())
-
-    avg_loss = total_loss / num_batches if num_batches > 0 else 0.0
-
-    # Calculate overall epoch metrics (RMSE, R2)
-    rmse_epoch = 0.0
-    r2_epoch = 0.0
-    if all_targets_unnorm:
-        all_targets_flat = np.concatenate(all_targets_unnorm)
-        all_preds_flat = np.concatenate(all_preds_unnorm)
-        if all_targets_flat.size > 0:
-            mse = np.mean((all_preds_flat - all_targets_flat)**2)
-            rmse_epoch = np.sqrt(mse)
-            target_variance = np.var(all_targets_flat)
+                # Forward pass depends on model type
+                if clay_mosaic is not None and norm_latlon is not None and norm_timestamp is not None:
+                    # BranchedUHIModel forward with clay
+                    pred = model(
+                        weather_seq=weather_input,
+                        static_features=static_features,
+                        clay_mosaic=clay_mosaic,
+                        norm_latlon=norm_latlon,
+                        norm_timestamp=norm_timestamp
+                    )
+                elif static_features is not None:
+                    # UHINetCNN forward
+                    pred = model(
+                        weather=weather_input,
+                        static_features=static_features
+                    )
+                else:
+                    # Basic model with just weather input
+                    pred = model(weather_input)
+                
+                # Check for NaN/Inf in predictions
+                if not torch.isfinite(pred).all():
+                    logging.warning(f"NaN or Inf detected in model predictions during validation! Skipping batch.")
+                    continue
+                    
+                loss = loss_fn(pred, target)
+                
+                # Check for NaN/Inf in loss
+                if not torch.isfinite(loss):
+                    logging.warning(f"NaN or Inf detected in validation loss ({loss.item()})! Skipping batch.")
+                    continue
+                    
+            except Exception as e:
+                logging.error(f"Error during validation forward pass: {e}")
+                logging.error(f"Batch keys: {batch.keys()}")
+                continue
             
-            # Calculate R2 directly, adding epsilon to variance to avoid division by zero
-            epsilon = 1e-9
-            r2_epoch = 1 - (mse / (target_variance + epsilon))
-
-    return avg_loss, rmse_epoch, r2_epoch
+            # ------ Metrics calculation ------ #
+            # Un-normalize for human-interpretable metrics
+            pred_unnorm = pred * uhi_std + uhi_mean
+            target_unnorm = target * uhi_std + uhi_mean
+            
+            # Update running statistics
+            total_loss += loss.item()
+            all_targets_unnorm.append(target_unnorm.detach().cpu())
+            all_preds_unnorm.append(pred_unnorm.detach().cpu())
+            num_batches += 1
+            
+            # Update progress bar
+            progress_bar.set_postfix({'Val Loss': total_loss / num_batches})
+    
+    # Compute metrics on the whole dataset
+    if len(all_targets_unnorm) > 0:
+        all_targets_unnorm = torch.cat(all_targets_unnorm, dim=0).flatten()
+        all_preds_unnorm = torch.cat(all_preds_unnorm, dim=0).flatten()
+        
+        avg_loss = total_loss / num_batches if num_batches > 0 else float('inf')
+        rmse = torch.sqrt(torch.mean((all_preds_unnorm - all_targets_unnorm) ** 2)).item()
+        r2 = r2_score(all_targets_unnorm.numpy(), all_preds_unnorm.numpy())
+    else:
+        logging.warning("No valid batches during validation!")
+        avg_loss = float('inf')
+        rmse = float('inf')
+        r2 = -float('inf')
+    
+    return avg_loss, rmse, r2
 
 # --- End Generic Train/Validate Functions --- # 

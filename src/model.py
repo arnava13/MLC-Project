@@ -432,20 +432,41 @@ class SimpleCNNHead(nn.Module):
 # --- UNet-style Blocks ---
 class UNetConvBlock(nn.Module):
     """Helper: Conv(3x3, padding=1) -> BN -> ReLU -> Conv(3x3, padding=1) -> BN -> ReLU"""
-    def __init__(self, in_channels, out_channels):
+    def __init__(self, in_channels, out_channels, dropout_rate=0.1):
         super().__init__()
         self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1)
-        self.bn1 = nn.BatchNorm2d(out_channels) # Restored BatchNorm
+        self.bn1 = nn.BatchNorm2d(out_channels)
         self.relu1 = nn.ReLU(inplace=True)
         self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1)
-        self.bn2 = nn.BatchNorm2d(out_channels) # Restored BatchNorm
+        self.bn2 = nn.BatchNorm2d(out_channels)
         self.relu2 = nn.ReLU(inplace=True)
-        self.dropout = nn.Dropout2d(p=0.1) # Add dropout
+        self.dropout = nn.Dropout2d(p=dropout_rate)
+        
+        # Use better weight initialization (Kaiming/He initialization)
+        # This helps with gradient flow in deep networks
+        nn.init.kaiming_normal_(self.conv1.weight, mode='fan_out', nonlinearity='relu')
+        nn.init.kaiming_normal_(self.conv2.weight, mode='fan_out', nonlinearity='relu')
+        if self.conv1.bias is not None:
+            nn.init.zeros_(self.conv1.bias)
+        if self.conv2.bias is not None:
+            nn.init.zeros_(self.conv2.bias)
+            
+        # Initialize batch norm to be identity function initially
+        nn.init.constant_(self.bn1.weight, 1.0)
+        nn.init.constant_(self.bn2.weight, 1.0)
+        nn.init.constant_(self.bn1.bias, 0.0)
+        nn.init.constant_(self.bn2.bias, 0.0)
 
     def forward(self, x):
-        x = self.relu1(self.bn1(self.conv1(x))) # Restored BatchNorm
-        x = self.relu2(self.bn2(self.conv2(x))) # Restored BatchNorm
-        x = self.dropout(x)
+        x = self.conv1(x)
+        x = self.bn1(x)
+        x = self.relu1(x)
+        x = self.conv2(x)
+        x = self.bn2(x)
+        x = self.relu2(x)
+        # Only apply dropout during training
+        if self.training:
+            x = self.dropout(x)
         return x
 
 class UNetUpBlock(nn.Module):
@@ -477,89 +498,116 @@ class UNetUpBlock(nn.Module):
         x = torch.cat([x2, x1], dim=1) # Concatenate along channel dimension
         return self.conv(x)
 
-class UNetStyleHead(nn.Module):
-    """
-    U-Net style head with downsampling, upsampling, and skip connections.
-    Uses ConvTranspose2d for upsampling.
-    Takes combined Clay, weather, and optional LST features.
-    Depth is configurable.
-    """
-    def __init__(self, in_channels: int, base_channels: int = 64, depth: int = 4):
+# --- U-Net Decoder Base Implementation ---
+class UNetDecoder(nn.Module):
+    """Standard U-Net decoder implementation."""
+    def __init__(self, in_channels, base_channels, depth):
         super().__init__()
-        if depth < 1:
-            raise ValueError("UNet depth must be at least 1")
         self.depth = depth
-        features = base_channels
-
+        
+        # Down path
+        ch = in_channels
         self.downs = nn.ModuleList()
+        self.pools = nn.ModuleList()
+        for i in range(depth):
+            out_ch = base_channels * (2**i)
+            self.downs.append(UNetConvBlock(ch, out_ch))
+            if i < depth - 1:  # Don't pool after last down block
+                self.pools.append(nn.MaxPool2d(2))
+            ch = out_ch
+
+        # Bottleneck
+        self.bottleneck = UNetConvBlock(ch, ch)
+
+        # Up path
         self.ups = nn.ModuleList()
+        for i in reversed(range(depth)):
+            in_ch = ch
+            out_ch = base_channels * (2**i)
+            self.ups.append(UNetUpBlock(in_ch, out_ch))
+            ch = out_ch
 
-        # Initial Convolution
-        self.inc = UNetConvBlock(in_channels, features)
+        logging.info(f"Initialized UNetDecoder. In channels: {in_channels}, Base channels: {base_channels}, Depth: {depth}")
 
-        # Downsampling Path
-        current_channels = features
-        for i in range(depth):
-            self.downs.append(
-                nn.Sequential(
-                    nn.MaxPool2d(2),
-                    UNetConvBlock(current_channels, current_channels * 2)
-                )
-            )
-            current_channels *= 2
-        # Bottleneck is implicitly the last downsampling block's output
-        self.bottleneck_channels = current_channels
-
-        # Upsampling Path
-        # Starts from bottleneck channels, goes up to base_channels
-        for i in range(depth):
-            # Input to UpBlock: current_channels (from below), Output: current_channels // 2
-            # Skip connection comes from layer with current_channels // 2
-            self.ups.append(
-                UNetUpBlock(current_channels, current_channels // 2)
-            )
-            current_channels //= 2
-
-        # Final 1x1 convolution
-        self.outc = nn.Conv2d(features, 1, kernel_size=1)
-
-        logging.info(f"UNetStyleHead initialized: Input Ch={in_channels}, Base Ch={base_channels}, Depth={depth}")
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Forward pass for the U-Net head.
-
-        Args:
-            x (torch.Tensor): Combined projected input features
-                              (ProjClay+Weather[+LST])
-                              Shape (B, C_in, H_feat, W_feat)
-
-        Returns:
-            torch.Tensor: Predicted UHI map at feature resolution (B, 1, H_out, W_out)
-        """
-        # --- Encoder ---
-        skip_connections = []
-        out = self.inc(x) # Initial Block -> base_channels
-        skip_connections.append(out)
-
+    def forward(self, x):
+        # Store skip connections
+        skips = []
+        
+        # Down path
         for i in range(self.depth):
-            out = self.downs[i](out)
-            if i < self.depth - 1: # Don't store bottleneck output as skip
-                skip_connections.append(out)
+            x = self.downs[i](x)
+            skips.append(x)
+            if i < self.depth - 1:
+                x = self.pools[i](x)
+        
+        # Bottleneck
+        x = self.bottleneck(x)
+        
+        # Up path
+        for i, up_block in enumerate(self.ups):
+            skip_idx = self.depth - 1 - i  # Index into skips list
+            skip = skips[skip_idx]
+            x = up_block(x, skip)
+            
+        return x
 
-        # Bottleneck output is `out` after the loop
+# --- U-Net Decoder with Target Size Resizing ---
+class UNetDecoderWithTargetResize(UNetDecoder):
+    """U-Net Decoder that ensures output matches target H, W using a learnable upsampling stage."""
+    def __init__(self, in_channels, base_channels, depth, target_h, target_w):
+        super().__init__(in_channels, base_channels, depth)
+        self.target_h = target_h
+        self.target_w = target_w
+        
+        # Lightweight learnable upsampling stage to reach the final target size
+        # Takes the output of the main U-Net decoder (base_channels)
+        self.final_upsampler = nn.Sequential(
+            nn.Upsample(size=(target_h, target_w), mode='bilinear', align_corners=False),
+            nn.Conv2d(base_channels, base_channels, kernel_size=3, padding=1),
+            nn.BatchNorm2d(base_channels), # Added BatchNorm
+            nn.ReLU(inplace=True)
+        )
+        
+        logging.info(f"Initialized UNetDecoderWithTargetResize. Base U-Net output channels: {base_channels}. Target: ({target_h}, {target_w})")
 
-        # --- Decoder ---
-        # Iterate through upsampling blocks and corresponding skip connections in reverse
+    def forward(self, x):
+        # Log input shape
+        logging.debug(f"UNetDecoder input shape: {x.shape}")
+        
+        # Store skip connections
+        skips = []
+        
+        # Down path (inherited from UNetDecoder)
         for i in range(self.depth):
-            skip = skip_connections.pop() # Get corresponding skip connection
-            out = self.ups[i](out, skip)
+            x = self.downs[i](x)
+            skips.append(x)
+            if i < self.depth - 1:
+                x = self.pools[i](x)
+        
+        # Bottleneck (inherited from UNetDecoder)
+        x = self.bottleneck(x)
+        logging.debug(f"UNetDecoder bottleneck shape: {x.shape}")
 
-        # --- Final Output ---
-        logits = self.outc(out) # (B, 1, H_up, W_up)
+        # Up path (inherited from UNetDecoder)
+        for i, up_block in enumerate(self.ups):
+            skip_idx = self.depth - 1 - i  # Index into skips list
+            skip = skips[skip_idx]
+            logging.debug(f"UNetDecoder up level {i}: x shape={x.shape}, skip shape={skip.shape}")
+            x = up_block(x, skip)
 
-        # Output is at the resolution determined by U-Net structure
-        return logits
+        # Apply the final learnable upsampling stage
+        x = self.final_upsampler(x)
+        logging.debug(f"UNetDecoder final output shape after upsampler: {x.shape}")
+        
+        # Final check (should match target size now)
+        _, _, h, w = x.shape
+        if h != self.target_h or w != self.target_w:
+             # This should ideally not happen with the explicit nn.Upsample
+             logging.warning(f"Output size {h}x{w} STILL mismatch target {self.target_h}x{self.target_w} after final upsampler! Check architecture.")
+             # Fallback resize just in case
+             x = F.interpolate(x, size=(self.target_h, self.target_w), mode='bilinear', align_corners=False)
+
+        return x
 
 # -----------------------------------------------------------------------------
 # 5. CNN-BASED UHI NET MODEL  ----------------------------
@@ -614,7 +662,6 @@ class UHINetCNN(nn.Module):
         self.clay_model = None
         clay_output_channels = 0
         if self.feature_flags.get("use_clay", False):
-            if not CLAY_AVAILABLE: raise ImportError("Clay features requested but Clay library not installed.")
             if not all([clay_checkpoint_path, clay_metadata_path, clay_model_size, clay_bands, clay_platform, clay_gsd]):
                  raise ValueError("Missing required Clay configuration parameters when use_clay=True.")
             self.clay_model = ClayFeatureExtractor(
@@ -626,7 +673,7 @@ class UHINetCNN(nn.Module):
                 checkpoint_path=clay_checkpoint_path,
                 metadata_path=clay_metadata_path,
             )
-            clay_output_channels = self.clay_model.embed_dim
+            clay_output_channels = self.clay_model.output_channels
             logging.info(f"Initialized Clay model ({clay_model_size}), output channels: {clay_output_channels}")
 
         # --- Calculate Input Channels for U-Net --- #
@@ -649,31 +696,15 @@ class UHINetCNN(nn.Module):
              raise ValueError("No input features selected for UHINetCNN (weather, clay, static features all disabled/zero channels).")
         logging.info(f"Total calculated input channels for U-Net: {input_channels}")
 
-        # --- U-Net Architecture --- #
-        self.inc = UNetConvBlock(input_channels, base_channels)
-        self.downs = nn.ModuleList()
-        self.ups = nn.ModuleList()
-
-        # Downsampling Path
-        current_channels = base_channels
-        for _ in range(depth):
-            self.downs.append(
-                nn.Sequential(
-                    nn.MaxPool2d(2),
-                    UNetConvBlock(current_channels, current_channels * 2)
-                )
-            )
-            current_channels *= 2
-
-        # Upsampling Path (Using Interpolate + Conv Block)
-        for _ in range(depth):
-            self.ups.append(
-                UNetUpBlock(current_channels, current_channels // 2)
-            )
-            current_channels //= 2
-
+        # --- U-Net Architecture (using centralized implementation) --- #
+        self.unet_decoder = UNetDecoder(
+            in_channels=input_channels,
+            base_channels=base_channels,
+            depth=depth
+        )
+        
         # Final 1x1 convolution
-        self.outc = nn.Conv2d(base_channels, 1, kernel_size=1)
+        self.final_conv = nn.Conv2d(base_channels, 1, kernel_size=1)
 
         logging.info(f"UHINetCNN initialized. U-Net Input Ch: {input_channels}, Base Ch: {base_channels}, Depth: {depth}")
 
@@ -721,25 +752,10 @@ class UHINetCNN(nn.Module):
         # --- Combine all features --- #
         x = torch.cat(all_features_list, dim=1)
 
-        # --- U-Net Forward --- #
-        skip_connections = []
-        x1 = self.inc(x)
-        skip_connections.append(x1)
+        # --- Use U-Net Decoder --- #
+        x = self.unet_decoder(x)
+        
+        # Final convolution to get output
+        prediction = self.final_conv(x)
 
-        # Downsampling
-        xi = x1
-        for i in range(self.depth):
-            xi = self.downs[i](xi)
-            if i < self.depth - 1: # Don't store the bottleneck features as skip
-                skip_connections.append(xi)
-
-        # Upsampling
-        for i in range(self.depth):
-            skip = skip_connections.pop()
-            xi = self.ups[i](xi, skip)
-
-        # Final output
-        prediction = self.outc(xi) # (B, 1, H_feat, W_feat)
-
-        # Assuming H_feat, W_feat match the target UHI grid size based on dataloader config
         return prediction
