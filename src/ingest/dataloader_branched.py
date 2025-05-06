@@ -387,7 +387,7 @@ class CityDataSetBranched(Dataset):
                 needs_mosaic = False # Disable downstream use if resampling failed
             else:
                 # Add selected bands for composite feature
-                if self.feature_flags["use_sentinel_composite"]:
+                if self.feature_flags.get("use_sentinel_composite", False) and self.selected_mosaic_bands:
                     selected_indices = []
                     selected_band_names_ordered = []
                     for band_name in self.selected_mosaic_bands:
@@ -475,29 +475,17 @@ class CityDataSetBranched(Dataset):
                          dem_feat_res = None
                 
                 if dem_feat_res is not None:
-                    # Use global stats for normalization with clipping
-                    if self.global_dem_min is not None and self.global_dem_max is not None:
-                        # Step 1: Clip extreme values (typical range is mean ± 3*std)
-                        # Since we don't have std directly, we'll estimate using the range
-                        dem_range = self.global_dem_max - self.global_dem_min
-                        dem_mean = (self.global_dem_max + self.global_dem_min) / 2
-                        # Approximate a 3-sigma range (covers ~99.7% of normal distribution)
-                        clip_factor = 3.0
-                        estimated_std = dem_range / 6  # rough estimate assuming min/max are 3 std dev from mean
-                        lower_bound = dem_mean - clip_factor * estimated_std
-                        upper_bound = dem_mean + clip_factor * estimated_std
-                        
-                        # Apply clipping before normalization
-                        dem_feat_res = np.clip(dem_feat_res, lower_bound, upper_bound)
-                        
-                        # Step 2: Normalize using global stats
-                        dem_feat_res = (dem_feat_res - self.global_dem_min) / (self.global_dem_max - self.global_dem_min)
-                        logging.debug(f"DEM normalized using global stats (min: {self.global_dem_min}, max: {self.global_dem_max}) with clipping")
+                    # Robust percentile-based normalization
+                    # Ensure DEM is treated as a 1-band image for percentile calculation
+                    dem_values_for_norm = dem_feat_res.squeeze() # Remove single channel dim if present
+                    p2 = np.nanpercentile(dem_values_for_norm, 2)
+                    p98 = np.nanpercentile(dem_values_for_norm, 98)
+                    dem_feat_res = np.clip(dem_feat_res, p2, p98)
+                    if (p98 - p2) > 1e-6: # Avoid division by zero if percentiles are too close
+                        dem_feat_res = (dem_feat_res - p2) / (p98 - p2)
                     else:
-                        # Fallback to local min-max if global stats are not available
-                        min_v, max_v = np.min(dem_feat_res), np.max(dem_feat_res)
-                        dem_feat_res = (dem_feat_res - min_v) / (max_v - min_v) if max_v > min_v else np.full_like(dem_feat_res, 0.5)
-                        logging.debug("DEM normalized using local stats (global stats not available)")
+                        dem_feat_res = np.full_like(dem_feat_res, 0.5) # Default to mid-range if data is flat
+                    logging.debug(f"DEM normalized using 2nd/98th percentiles ({p2:.2f}, {p98:.2f})")
                     
                     static_features_list.append(dem_feat_res)
                     feature_names.append("dem")
@@ -526,28 +514,16 @@ class CityDataSetBranched(Dataset):
                          dsm_feat_res = None
                 
                 if dsm_feat_res is not None:
-                    # Use global stats for normalization with clipping
-                    if self.global_dsm_min is not None and self.global_dsm_max is not None:
-                        # Step 1: Clip extreme values
-                        dsm_range = self.global_dsm_max - self.global_dsm_min
-                        dsm_mean = (self.global_dsm_max + self.global_dsm_min) / 2
-                        # Approximate a 3-sigma range
-                        clip_factor = 3.0
-                        estimated_std = dsm_range / 6  # rough estimate assuming min/max are 3 std dev from mean
-                        lower_bound = dsm_mean - clip_factor * estimated_std
-                        upper_bound = dsm_mean + clip_factor * estimated_std
-                        
-                        # Apply clipping before normalization
-                        dsm_feat_res = np.clip(dsm_feat_res, lower_bound, upper_bound)
-                        
-                        # Step 2: Normalize using global stats
-                        dsm_feat_res = (dsm_feat_res - self.global_dsm_min) / (self.global_dsm_max - self.global_dsm_min)
-                        logging.debug(f"DSM normalized using global stats (min: {self.global_dsm_min}, max: {self.global_dsm_max}) with clipping")
+                    # Robust percentile-based normalization
+                    dsm_values_for_norm = dsm_feat_res.squeeze()
+                    p2 = np.nanpercentile(dsm_values_for_norm, 2)
+                    p98 = np.nanpercentile(dsm_values_for_norm, 98)
+                    dsm_feat_res = np.clip(dsm_feat_res, p2, p98)
+                    if (p98 - p2) > 1e-6:
+                        dsm_feat_res = (dsm_feat_res - p2) / (p98 - p2)
                     else:
-                        # Fallback to local min-max if global stats are not available
-                        min_v, max_v = np.min(dsm_feat_res), np.max(dsm_feat_res)
-                        dsm_feat_res = (dsm_feat_res - min_v) / (max_v - min_v) if max_v > min_v else np.full_like(dsm_feat_res, 0.5)
-                        logging.debug("DSM normalized using local stats (global stats not available)")
+                        dsm_feat_res = np.full_like(dsm_feat_res, 0.5)
+                    logging.debug(f"DSM normalized using 2nd/98th percentiles ({p2:.2f}, {p98:.2f})")
                     
                     static_features_list.append(dsm_feat_res)
                     feature_names.append("dsm")
@@ -617,7 +593,7 @@ class CityDataSetBranched(Dataset):
             sample['static_features'] = torch.from_numpy(combined_static_features).float()
 
         if self.feature_flags["use_clay"] and clay_mosaic_input is not None:
-            sample['cloudless_mosaic'] = torch.from_numpy(clay_mosaic_input).float()
+            sample['clay_mosaic'] = torch.from_numpy(clay_mosaic_input).float()
             sample['norm_latlon'] = torch.from_numpy(norm_latlon_tensor).float()
             sample['norm_timestamp'] = torch.from_numpy(norm_time_tensor).float()
 

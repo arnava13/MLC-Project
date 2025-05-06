@@ -192,8 +192,14 @@ class ConvLSTM(nn.Module):
         if not self.batch_first:
             layer_output_list = [o.permute(1, 0, 2, 3, 4) for o in layer_output_list]
 
-        # Return only the final state tuple (h, c) of the LAST layer
-        return last_state_list[-1]
+        # Return behavior based on return_all_layers
+        if self.return_all_layers:
+            # Return the list of hidden state sequences from ALL layers,
+            # and the list of last_state tuples from ALL layers
+            return layer_output_list, last_state_list
+        else:
+            # Original behavior: Return only the final state tuple (h, c) of the LAST layer
+            return last_state_list[-1]
 
     def _init_hidden(self, batch_size, image_size):
         init_states = []
@@ -213,6 +219,53 @@ class ConvLSTM(nn.Module):
         if not isinstance(param, list):
             param = [param] * num_layers
         return param
+
+# -----------------------------------------------------------------------------
+# Simple CNN Head (New) ------------------------------------------------------
+# -----------------------------------------------------------------------------
+class SimpleCNNHead(nn.Module):
+    """A simple CNN head with optional upsampling and a series of conv blocks."""
+    def __init__(self, 
+                 in_channels: int, 
+                 output_channels: int, 
+                 target_h: int, 
+                 target_w: int,
+                 hidden_channels_list: Optional[List[int]] = None,
+                 kernel_sizes_list: Optional[List[Union[int, Tuple[int, int]]]] = None,
+                 dropout_rate: float = 0.1): # Added dropout
+        super().__init__()
+        self.target_h = target_h
+        self.target_w = target_w
+        
+        layers = []
+        current_channels = in_channels
+
+        if hidden_channels_list is None:
+            hidden_channels_list = [max(output_channels * 2, 16), max(output_channels, 8)] # Default if none
+        if kernel_sizes_list is None:
+            kernel_sizes_list = [3] * len(hidden_channels_list)
+        
+        if len(hidden_channels_list) != len(kernel_sizes_list):
+            raise ValueError("hidden_channels_list and kernel_sizes_list must have the same length.")
+
+        # Add conv blocks
+        for i, (h_channels, k_size) in enumerate(zip(hidden_channels_list, kernel_sizes_list)):
+            layers.append(UNetConvBlock(current_channels, h_channels, h_channels, kernel_size=k_size, dropout_p=dropout_rate)) # Using UNetConvBlock
+            current_channels = h_channels
+            
+        # Final convolution to get to output_channels
+        layers.append(nn.Conv2d(current_channels, output_channels, kernel_size=1))
+        
+        self.network = nn.Sequential(*layers)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x shape: (B, C_in, H_feat, W_feat)
+        
+        # Upsample to target resolution if needed
+        if x.shape[-2] != self.target_h or x.shape[-1] != self.target_w:
+            x = F.interpolate(x, size=(self.target_h, self.target_w), mode='bilinear', align_corners=False)
+            
+        return self.network(x)
 
 # -----------------------------------------------------------------------------
 # Branched UHI Model ----------------------------------------------------------
@@ -242,6 +295,12 @@ class BranchedUHIModel(nn.Module):
                  # --- Target Grid Info ---
                  uhi_grid_resolution_m: int,
                  bounds: List[float],
+                 # --- Head Configuration (New) --- #
+                 head_type: str = "unet", # "unet" or "simple_cnn"
+                 simple_cnn_head_channels: Optional[List[int]] = None,
+                 simple_cnn_head_kernels: Optional[List[Union[int, Tuple[int, int]]]] = None,
+                 simple_cnn_dropout_rate: float = 0.1, # Added for simple_cnn head
+                 weather_seq_length: int = 60, # ADDED for timestep_weights parameter
                  # Optional arguments (can have defaults)
                  sentinel_bands_to_load: Optional[List[str]] = None,
                  # Clay Specific (optional, defaults handled internally if use_clay is False)
@@ -275,6 +334,11 @@ class BranchedUHIModel(nn.Module):
             unet_depth (int): Number of down/up sampling blocks in the U-Net decoder.
             uhi_grid_resolution_m (int): The resolution of the final target UHI grid.
             bounds (List[float]): The geographic bounds [min_lon, min_lat, max_lon, max_lat].
+            head_type (str): Type of head to use, "unet" or "simple_cnn". Defaults to "unet".
+            simple_cnn_head_channels (Optional[List[int]]): Hidden channels for SimpleCNNHead.
+            simple_cnn_head_kernels (Optional[List[Union[int, Tuple[int,int]]]]): Kernels for SimpleCNNHead.
+            simple_cnn_dropout_rate (float): Dropout rate for SimpleCNNHead UNetConvBlocks.
+            weather_seq_length (int): Length of weather sequence for timestep_weights parameter.
         """
         super().__init__()
         self.feature_flags = feature_flags
@@ -295,8 +359,10 @@ class BranchedUHIModel(nn.Module):
             num_layers=convlstm_num_layers,
             batch_first=True, # Expect input (B, T, C, H, W)
             bias=True,
-            return_all_layers=False
+            return_all_layers=True 
         )
+        self.weather_seq_length = weather_seq_length # Store for potential use
+        self.timestep_weights = nn.Parameter(torch.randn(self.weather_seq_length))
 
         # --- Static Feature Processing --- #
 
@@ -326,8 +392,7 @@ class BranchedUHIModel(nn.Module):
         if self.feature_flags.get("use_ndvi", False): dataloader_static_channels += 1
         if self.feature_flags.get("use_ndbi", False): dataloader_static_channels += 1
         if self.feature_flags.get("use_ndwi", False): dataloader_static_channels += 1
-        if self.feature_flags.get("use_sentinel_composite", False):
-            if not sentinel_bands_to_load: raise ValueError("sentinel_bands_to_load required if use_sentinel_composite=True")
+        if self.feature_flags.get("use_sentinel_composite", False) and sentinel_bands_to_load:
             dataloader_static_channels += len(sentinel_bands_to_load)
 
         # Calculate total input channels for the static projection layer
@@ -360,17 +425,43 @@ class BranchedUHIModel(nn.Module):
         if unet_input_channels == 0:
             raise ValueError("No features projected for U-Net head (static_ch=0, temporal_ch=0). Check feature flags and projections.")
 
-        # Use the UNetDecoderWithTargetResize that handles target resizing
-        self.unet_decoder = UNetDecoderWithTargetResize(
-            in_channels=unet_input_channels,
-            base_channels=unet_base_channels,
-            depth=unet_depth,
-            target_h=self.target_H,
-            target_w=self.target_W
-        )
-        self.final_conv = nn.Conv2d(unet_base_channels, 1, kernel_size=1)
+        # --- HEAD INITIALIZATION (Modified) --- #
+        self.head_type = head_type
+        if self.head_type == "unet":
+            # Use the UNetDecoderWithTargetResize that handles target resizing
+            unet_decoder_module = UNetDecoderWithTargetResize(
+                in_channels=unet_input_channels,
+                base_channels=unet_base_channels,
+                depth=unet_depth,
+                target_h=self.target_H,
+                target_w=self.target_W
+            )
+            final_conv_module = nn.Conv2d(unet_base_channels, 1, kernel_size=1)
+            self.head = nn.Sequential(unet_decoder_module, final_conv_module)
+            logging.info(f"Initialized U-Net head. Input channels: {unet_input_channels}, Base: {unet_base_channels}, Depth: {unet_depth}")
+        elif self.head_type == "simple_cnn":
+            if simple_cnn_head_channels is None:
+                # Provide default if not specified, e.g., based on unet_base_channels
+                simple_cnn_head_channels = [unet_base_channels, unet_base_channels // 2]
+                logging.warning(f"simple_cnn_head_channels not provided, defaulting to {simple_cnn_head_channels}")
+            if simple_cnn_head_kernels is None:
+                simple_cnn_head_kernels = [3] * len(simple_cnn_head_channels)
+                logging.warning(f"simple_cnn_head_kernels not provided, defaulting to {simple_cnn_head_kernels}")
+            
+            self.head = SimpleCNNHead(
+                in_channels=unet_input_channels,
+                output_channels=1, # UHI prediction is single channel
+                target_h=self.target_H,
+                target_w=self.target_W,
+                hidden_channels_list=simple_cnn_head_channels,
+                kernel_sizes_list=simple_cnn_head_kernels,
+                dropout_rate=simple_cnn_dropout_rate
+            )
+            logging.info(f"Initialized SimpleCNNHead. Input channels: {unet_input_channels}, Hidden: {simple_cnn_head_channels}, Kernels: {simple_cnn_head_kernels}")
+        else:
+            raise ValueError(f"Invalid head_type: {self.head_type}. Must be 'unet' or 'simple_cnn'.")
 
-        logging.info(f"BranchedUHIModel initialized. Static Proj In: {static_input_channels}, Out: {proj_static_ch}. Temporal Proj In: {temporal_input_channels}, Out: {proj_temporal_ch}. UNet In: {unet_input_channels}")
+        logging.info(f"BranchedUHIModel initialized with {self.head_type} head. Static Proj In: {static_input_channels}, Out: {proj_static_ch}. Temporal Proj In: {temporal_input_channels}, Out: {proj_temporal_ch}. Head In: {unet_input_channels}")
 
     def forward(self, weather_seq: torch.Tensor,
                 # --- Optional Static Features (All at feature resolution) --- #
@@ -398,10 +489,26 @@ class BranchedUHIModel(nn.Module):
 
         # --- 1. Temporal Branch (ConvLSTM) --- #
         # Input: (B, T, C, H, W), Output is now just the final state tuple (h, c) of the last layer
-        last_state = self.conv_lstm(weather_seq)
-        temporal_features = last_state[0] # Get hidden state h from the last layer state tuple
-        temporal_projected = self.temporal_proj(temporal_features)
-        B, _, H_feat, W_feat = temporal_projected.shape
+
+        layer_outputs_list, _ = self.conv_lstm(weather_seq)
+
+        temporal_feature_sequence = layer_outputs_list[-1] # (B, T, C_lstm_hidden, H_feat, W_feat)
+        B, T_actual, C_lstm, H_feat, W_feat = temporal_feature_sequence.shape
+
+        # Ensure timestep_weights parameter was initialized with the correct T
+        if self.timestep_weights.shape[0] != T_actual:
+            # This should ideally not happen if weather_seq_length is correctly passed at init
+            raise ValueError(f"Mismatch between initialized timestep_weights ({self.timestep_weights.shape[0]}) and actual T from data ({T_actual}). Ensure weather_seq_length is passed correctly to model constructor.")
+
+        # Global Timestep Weights
+        normalized_attention_weights = F.softmax(self.timestep_weights, dim=0) # Shape (T_actual)
+        weights_reshaped = normalized_attention_weights.view(1, T_actual, 1, 1, 1) # Reshape for broadcasting
+
+        temporal_features_pooled = (temporal_feature_sequence * weights_reshaped).sum(dim=1) # Sum over T dimension
+        # temporal_features_pooled shape: (B, C_lstm, H_feat, W_feat)
+
+        temporal_projected = self.temporal_proj(temporal_features_pooled) # Project the pooled features
+        # B_proj, _, H_feat_proj, W_feat_proj = temporal_projected.shape # B will be same, H,W will be same as input to proj
 
         # --- 2. Static Branch --- #
         all_static_features_list = []
@@ -465,12 +572,8 @@ class BranchedUHIModel(nn.Module):
         # Concatenate projected features
         fused_features = torch.cat([static_projected, temporal_projected], dim=1)
 
-        # U-Net Decoder expects (B, C_fused, H_feat, W_feat)
-        unet_output = self.unet_decoder(fused_features)
-        # unet_output shape: (B, unet_base_channels, H_feat, W_feat)
-        
-        # Final 1x1 Convolution
-        prediction = self.final_conv(unet_output)
-        # prediction shape: (B, 1, H_uhi, W_uhi) - ensured by UNetDecoderWithTargetResize
+        # --- Pass through the selected head --- #
+        prediction = self.head(fused_features)
+        # prediction shape: (B, 1, H_uhi, W_uhi) - ensured by head
 
         return prediction 

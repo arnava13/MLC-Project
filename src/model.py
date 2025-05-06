@@ -473,29 +473,66 @@ class UNetUpBlock(nn.Module):
     """Helper: Upsample(ConvTranspose2d 2x2, stride=2) -> Concat -> UNetConvBlock"""
     def __init__(self, in_channels, out_channels):
         super().__init__()
-        # in_channels is channels from previous layer, out_channels is for the ConvBlock
-        # The actual input to ConvBlock will be in_channels//2 (from upsampling) + in_channels//2 (from skip connection) = in_channels
-        # The output from ConvBlock will be out_channels
+        # in_channels: Channels from the deeper layer (input to ConvTranspose2d)
+        # out_channels: Channels from the skip connection (and the desired output channels for this block)
         self.up = nn.ConvTranspose2d(in_channels, in_channels // 2, kernel_size=2, stride=2)
-        self.conv = UNetConvBlock(in_channels, out_channels) # Takes combined channels
+        # The input to the subsequent conv block is the concatenation of:
+        # 1. Skip connection channels (out_channels)
+        # 2. Upsampled channels (in_channels // 2)
+        conv_in_channels = out_channels + (in_channels // 2)
+        self.conv = UNetConvBlock(conv_in_channels, out_channels)
 
     def forward(self, x1, x2):
         """
-        x1: input from previous layer (to be upsampled)
-        x2: input from corresponding skip connection
+        x1: input from previous (deeper) layer (to be upsampled)
+        x2: input from corresponding skip connection (encoder)
         """
-        x1 = self.up(x1)
-        # Input tensors to ConvTranspose2d must have the same spatial size.
-        # Pad x1 if necessary to match x2's spatial dimensions after upsampling
-        # Calculate difference: target_size - current_size
-        diffY = x2.size()[2] - x1.size()[2]
-        diffX = x2.size()[3] - x1.size()[3]
+        x1 = self.up(x1) # Shape becomes (B, C1=in_channels//2, H1, W1)
+        # x2 shape is (B, C2=out_channels, H2, W2)
+        
+        # Target spatial dimensions are those of x1 (the upsampled tensor)
+        target_h, target_w = x1.shape[2], x1.shape[3]
+        h2, w2 = x2.shape[2], x2.shape[3]
 
-        # Pad x1: (padding_left, padding_right, padding_top, padding_bottom)
-        x1 = F.pad(x1, [diffX // 2, diffX - diffX // 2,
-                        diffY // 2, diffY - diffY // 2])
+        # Handle potential size mismatch. We want the final concatenated tensor
+        # to have the spatial dimensions of x1 (H1, W1).
+        if target_h != h2 or target_w != w2:
+            logging.debug(f"Size mismatch in UNetUpBlock: x1({x1.shape}), x2({x2.shape}). Adjusting x2.")
+            # Calculate the difference needed to make x2 match x1
+            diff_y = target_h - h2
+            diff_x = target_w - w2
 
-        x = torch.cat([x2, x1], dim=1) # Concatenate along channel dimension
+            if diff_y >= 0 and diff_x >= 0:
+                # Case 1: x1 is larger or equal. Pad x2.
+                pad_top = diff_y // 2
+                pad_bottom = diff_y - pad_top
+                pad_left = diff_x // 2
+                pad_right = diff_x - pad_left
+                x2 = F.pad(x2, [pad_left, pad_right, pad_top, pad_bottom])
+                logging.debug(f"Padded x2 to size: {x2.shape}")
+            elif diff_y <= 0 and diff_x <= 0:
+                # Case 2: x2 is larger. Crop x2.
+                # Note: Using absolute values of potentially negative differences
+                crop_top = abs(diff_y) // 2
+                crop_bottom = abs(diff_y) - crop_top
+                crop_left = abs(diff_x) // 2
+                crop_right = abs(diff_x) - crop_left
+                x2 = x2[:, :, crop_top : h2 - crop_bottom, crop_left : w2 - crop_right]
+                logging.debug(f"Cropped x2 to size: {x2.shape}")
+            else:
+                # Mixed case (one dim larger, one smaller) - this is problematic
+                # Indicates a potential issue earlier in the network.
+                # Fallback: Resize x2 to match x1 using interpolation.
+                logging.warning(f"Mixed size mismatch in UNetUpBlock (x1={x1.shape}, x2={x2.shape}). Resizing x2.")
+                x2 = F.interpolate(x2, size=(target_h, target_w), mode='bilinear', align_corners=False)
+
+        # Now x1 and x2 *should* have matching spatial dimensions (target_h, target_w)
+        # Add a final assertion for safety during development/debugging
+        assert x1.shape[2:] == x2.shape[2:], \
+               f"UNetUpBlock FAILED to align shapes! x1: {x1.shape}, x2: {x2.shape}"
+
+        # Concatenate along channel dimension: (B, C2 + C1, H1, W1)
+        x = torch.cat([x2, x1], dim=1)
         return self.conv(x)
 
 # --- U-Net Decoder Base Implementation ---
@@ -688,8 +725,7 @@ class UHINetCNN(nn.Module):
         if self.feature_flags.get("use_ndvi", False): input_channels += 1
         if self.feature_flags.get("use_ndbi", False): input_channels += 1
         if self.feature_flags.get("use_ndwi", False): input_channels += 1
-        if self.feature_flags.get("use_sentinel_composite", False):
-            if not sentinel_bands_to_load: raise ValueError("sentinel_bands_to_load required if use_sentinel_composite=True")
+        if self.feature_flags.get("use_sentinel_composite", False) and sentinel_bands_to_load:
             input_channels += len(sentinel_bands_to_load)
 
         if input_channels == 0:
