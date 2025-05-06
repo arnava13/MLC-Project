@@ -239,11 +239,12 @@ class CityDataSetBranched(Dataset):
                         logging.info(f"Reprojecting LST from {self.lst_xr.rio.crs} to {self.target_crs_str}")
                     logging.info(f"Opened LST (lazy load). Native shape (approx): {self.lst_xr.shape}")
                 except Exception as e:
-                        logging.error(f"Failed LST loading/processing from {lst_path}: {e}")
-                        if self.lst_xr: self.lst_xr.close()
-                        self.lst_xr = None
-                else: # Path doesn't exist
-                    logging.warning(f"LST path specified but not found: {self._single_lst_median_path}")
+                    logging.error(f"Failed LST loading/processing from {lst_path}: {e}")
+                    if hasattr(self, 'lst_xr') and self.lst_xr: 
+                        self.lst_xr.close()
+                    self.lst_xr = None
+            else: 
+                logging.warning(f"LST path specified but not found: {self._single_lst_median_path}")
 
         # --- Load Weather Station Data --- #
         self.bronx_weather = pd.read_csv(bronx_weather_csv)
@@ -322,7 +323,10 @@ class CityDataSetBranched(Dataset):
         # --- Prepare Static Features (resampled to FEATURE resolution) --- #
         static_features_list = [] # For non-Clay, non-Elev features
         feature_names = []      # Track names
-
+        
+        # Debug which features will be loaded based on flag settings
+        logging.debug(f"Feature flags settings for __getitem__: {self.feature_flags}")
+        
         # 1. Cloudless Mosaic & Derived Indices
         mosaic_feat_res = None
         needs_mosaic = self.feature_flags["use_sentinel_composite"] or \
@@ -457,6 +461,7 @@ class CityDataSetBranched(Dataset):
         if not static_features_list:
             # Need to handle case where no static features are available/enabled
             combined_static_features = np.zeros((0, self.feat_H, self.feat_W), dtype=np.float32)
+            logging.debug("No static features present, creating empty tensor.")
         else:
             # Ensure all have the correct shape before concatenating
             valid_static_features = []
@@ -469,9 +474,10 @@ class CityDataSetBranched(Dataset):
                     logging.warning(f"Static feature '{feature_names[i]}' has incorrect shape or is None. Skipping.")
             if valid_static_features:
                 combined_static_features = np.concatenate(valid_static_features, axis=0).astype(np.float32)
-                logging.debug(f"Included static features: {valid_feature_names}")
+                logging.info(f"Included static features: {valid_feature_names}")
             else:
                 combined_static_features = np.zeros((0, self.feat_H, self.feat_W), dtype=np.float32)
+                logging.warning("No valid static features found for concatenation.")
 
         # <<< DEBUG PRINT >>>
         print(f"[DEBUG DATALOADER] combined_static_features shape: {combined_static_features.shape}")
