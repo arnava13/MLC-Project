@@ -140,7 +140,7 @@ def load_sentinel_tensor_from_bbox_median(bounds, time_window, selected_bands=["
         if not items:
             logging.warning(f"No Sentinel data found for window {time_window} and bounds {bounds}")
             return None
-        logging.info(f"Found {len(items)} Sentinel-2 items. Checking for GCPs...")
+        logging.debug(f"Found {len(items)} Sentinel-2 items. Checking for GCPs...")
 
         with tempfile.TemporaryDirectory(prefix="gdal_preprocess_") as tmpdir:
             logging.info(f"Using temporary directory for gdalwarp: {tmpdir}")
@@ -173,7 +173,7 @@ def load_sentinel_tensor_from_bbox_median(bounds, time_window, selected_bands=["
                         # Check if GCPs are used
                         with rasterio.open(f'/vsicurl/{original_href}') as src:
                             if src.gcps[0] and src.transform.is_identity:
-                                logging.info(f"Item {item_id} asset '{band}' uses GCPs. Pre-processing with gdalwarp.")
+                                logging.debug(f"Item {item_id} asset '{band}' uses GCPs. Pre-processing with gdalwarp.")
 
                                 # Create a deep copy of the item if we haven't already for this item
                                 if not item_needs_copy:
