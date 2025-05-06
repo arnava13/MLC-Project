@@ -386,13 +386,9 @@ class BranchedUHIModel(nn.Module):
             target_h=self.target_H,
             target_w=self.target_W
         )
+        # Add BatchNorm before the final convolution
+        self.final_bn = nn.BatchNorm2d(unet_base_channels)
         self.final_conv = nn.Conv2d(unet_base_channels, 1, kernel_size=1)
-
-        # Initialize final layer weights and bias to zero
-        # This makes the initial normalized prediction 0, corresponding to the mean UHI
-        torch.nn.init.zeros_(self.final_conv.weight)
-        if self.final_conv.bias is not None:
-            torch.nn.init.zeros_(self.final_conv.bias)
 
         logging.info(f"BranchedUHIModel initialized. Static Proj In: {static_input_channels}, Out: {proj_static_ch}. Temporal Proj In: {temporal_input_channels}, Out: {proj_temporal_ch}. UNet In: {unet_input_channels}")
 
@@ -494,15 +490,18 @@ class BranchedUHIModel(nn.Module):
         unet_output = self.unet_decoder(fused_features)
         # unet_output shape: (B, unet_base_channels, H_feat, W_feat)
         
+        # Apply BatchNorm before final conv
+        unet_output_bn = self.final_bn(unet_output)
+        
         # --- DEBUG: Check magnitude before final conv ---
-        if torch.isnan(unet_output).any() or torch.isinf(unet_output).any():
-            logging.warning(f"[DEBUG FORWARD] UNet output contains NaN/Inf! Max: {unet_output.max().item()}, Min: {unet_output.min().item()}")
+        if torch.isnan(unet_output_bn).any() or torch.isinf(unet_output_bn).any():
+            logging.warning(f"[DEBUG FORWARD] Final BN output contains NaN/Inf! Max: {unet_output_bn.max().item()}, Min: {unet_output_bn.min().item()}")
         else: 
-            logging.info(f"[DEBUG FORWARD] UNet output stats - Max: {unet_output.max().item():.4e}, Min: {unet_output.min().item():.4e}, Mean: {unet_output.mean().item():.4e}")
+            logging.info(f"[DEBUG FORWARD] Final BN output stats - Max: {unet_output_bn.max().item():.4e}, Min: {unet_output_bn.min().item():.4e}, Mean: {unet_output_bn.mean().item():.4e}")
         # --- END DEBUG ---
 
         # Final 1x1 Convolution
-        prediction = self.final_conv(unet_output)
+        prediction = self.final_conv(unet_output_bn) # Use BN output
         # prediction shape: (B, 1, H_uhi, W_uhi) - ensured by UNetDecoderWithTargetResize
 
         return prediction
