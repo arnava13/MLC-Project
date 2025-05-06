@@ -463,6 +463,16 @@ class BranchedUHIModel(nn.Module):
             if self.static_proj is None:
                 # This case should ideally not happen if init checks pass
                 raise ValueError("Static features provided, but static projection layer is None. Check config.")
+            
+            # Check for channel mismatch
+            static_proj_in_ch = self.static_proj.weight.shape[1]  # Input channels of Conv2d
+            if static_proj_in_ch != combined_static.shape[1]:
+                print(f"[ERROR] Channel mismatch! static_proj expects {static_proj_in_ch} channels but combined_static has {combined_static.shape[1]} channels")
+                # Print the feature flags for debugging
+                print(f"[DEBUG] Feature flags: {self.feature_flags}")
+                # Hard requirement since spatial dims already match - we can trace back through stack
+                raise ValueError(f"Channel mismatch: static_proj expects {static_proj_in_ch} channels but got {combined_static.shape[1]}")
+            
             static_projected = self.static_proj(combined_static)
 
         # --- 3. Fusion & U-Net Decoder --- #

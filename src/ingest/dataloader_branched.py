@@ -239,11 +239,11 @@ class CityDataSetBranched(Dataset):
                         logging.info(f"Reprojecting LST from {self.lst_xr.rio.crs} to {self.target_crs_str}")
                     logging.info(f"Opened LST (lazy load). Native shape (approx): {self.lst_xr.shape}")
                 except Exception as e:
-                    logging.error(f"Failed LST loading/processing from {lst_path}: {e}")
-                    if self.lst_xr: self.lst_xr.close()
-                    self.lst_xr = None
-            else: # Path doesn't exist
-                logging.warning(f"LST path specified but not found: {self._single_lst_median_path}")
+                        logging.error(f"Failed LST loading/processing from {lst_path}: {e}")
+                        if self.lst_xr: self.lst_xr.close()
+                        self.lst_xr = None
+                else: # Path doesn't exist
+                    logging.warning(f"LST path specified but not found: {self._single_lst_median_path}")
 
         # --- Load Weather Station Data --- #
         self.bronx_weather = pd.read_csv(bronx_weather_csv)
@@ -387,15 +387,22 @@ class CityDataSetBranched(Dataset):
                     index_map = np.clip(index_map, -1.0, 1.0)
                     return index_map[np.newaxis, :, :]
 
+                # ONLY add indices if their corresponding feature flags are TRUE
                 if self.feature_flags["use_ndvi"]:
                     ndvi_map = _calculate_index("ndvi", "nir", "red")
-                    if ndvi_map is not None: static_features_list.append(ndvi_map); feature_names.append("ndvi")
+                    if ndvi_map is not None: 
+                        static_features_list.append(ndvi_map)
+                        feature_names.append("ndvi")
                 if self.feature_flags["use_ndbi"]:
                     ndbi_map = _calculate_index("ndbi", "swir16", "nir")
-                    if ndbi_map is not None: static_features_list.append(ndbi_map); feature_names.append("ndbi")
+                    if ndbi_map is not None: 
+                        static_features_list.append(ndbi_map)
+                        feature_names.append("ndbi")
                 if self.feature_flags["use_ndwi"]:
                     ndwi_map = _calculate_index("ndwi", "green", "nir")
-                    if ndwi_map is not None: static_features_list.append(ndwi_map); feature_names.append("ndwi")
+                    if ndwi_map is not None: 
+                        static_features_list.append(ndwi_map)
+                        feature_names.append("ndwi")
 
         # 2. LST Median (Resample to FEATURE resolution)
         lst_feat_res = None
@@ -453,13 +460,16 @@ class CityDataSetBranched(Dataset):
         else:
             # Ensure all have the correct shape before concatenating
             valid_static_features = []
+            valid_feature_names = []
             for i, feat in enumerate(static_features_list):
                 if feat is not None and feat.shape[1:] == (self.feat_H, self.feat_W):
                     valid_static_features.append(feat)
+                    valid_feature_names.append(feature_names[i])
                 else:
                     logging.warning(f"Static feature '{feature_names[i]}' has incorrect shape or is None. Skipping.")
             if valid_static_features:
                 combined_static_features = np.concatenate(valid_static_features, axis=0).astype(np.float32)
+                logging.debug(f"Included static features: {valid_feature_names}")
             else:
                 combined_static_features = np.zeros((0, self.feat_H, self.feat_W), dtype=np.float32)
 
@@ -475,7 +485,7 @@ class CityDataSetBranched(Dataset):
             if mosaic_feat_res is None:
                 logging.warning("Clay features enabled, but mosaic could not be loaded/resampled. Skipping Clay.")
             else:
-                # Clay takes specific bands (e.g., RGB+NIR)
+            # Clay takes specific bands (e.g., RGB+NIR)
                 clay_input_band_names = ["blue", "green", "red", "nir"]
                 clay_input_indices = []
                 available_bands_in_resampled = {band: i for i, band in enumerate(DEFAULT_MOSAIC_BANDS_ORDER[:mosaic_feat_res.shape[0]])}
