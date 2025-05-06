@@ -634,6 +634,14 @@ def resample_xarray_to_target(
             resampled_np = resampled_np[np.newaxis, :, :]
         
         logging.debug(f"Resampled data shape (after conversion to numpy): {resampled_np.shape}")
+        
+        # Ensure NaN values are preserved during resampling
+        if 'nodata' in resampled_xr.attrs:
+            nodata_val = resampled_xr.attrs['nodata']
+            # Replace nodata values with NaN for consistent handling downstream
+            if not np.isnan(nodata_val):
+                resampled_np = np.where(resampled_np == nodata_val, np.nan, resampled_np)
+        
         return resampled_np.astype(np.float32)
 
     except Exception as e:

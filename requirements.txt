@@ -20,3 +20,4 @@ torchmetrics
 dask[array] 
 requests
 geopandas 
+cartopy

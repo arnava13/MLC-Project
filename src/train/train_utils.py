@@ -221,6 +221,69 @@ def create_dataloaders(train_ds: Subset,
     logging.info("Data loading setup complete.")
     return train_loader, val_loader 
 
+
+def validate_model(model, val_loader, loss_fn, device=None):
+    """Evaluates model performance on a validation set, properly handling NaN values."""
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model.eval()
+    total_loss = 0.0
+    num_batches = 0
+    all_metrics = {"mae": 0.0, "mse": 0.0, "valid_pixels": 0}
+    
+    with torch.no_grad():
+        for batch in val_loader:
+            # Move necessary inputs to device
+            inputs = {k: v.to(device) for k, v in batch.items() if k != 'mask' and k != 'target'}
+            target = batch['target'].to(device)
+            mask = batch['mask'].to(device)
+            
+            # Forward pass
+            output = model(**inputs)
+            
+            # Check for NaNs in the model output
+            if torch.isnan(output).any():
+                print(f"Warning: NaN values detected in model output")
+                # Replace NaNs with zeros (or any other appropriate value) for loss calculation
+                output = torch.nan_to_num(output, nan=0.0)
+            
+            # Make sure mask excludes NaN values in target
+            if torch.isnan(target).any():
+                nan_mask = torch.isnan(target)
+                mask = mask & (~nan_mask)  # Only consider valid pixels that are not NaN
+            
+            # Calculate loss
+            loss = loss_fn(output, target, mask)
+            
+            # Calculate additional metrics
+            valid_mask = mask.bool()
+            if valid_mask.any():
+                pred_valid = output[valid_mask]
+                target_valid = target[valid_mask]
+                
+                # MAE and MSE over valid pixels
+                mae = torch.abs(pred_valid - target_valid).mean().item()
+                mse = torch.pow(pred_valid - target_valid, 2).mean().item()
+                
+                all_metrics["mae"] += mae
+                all_metrics["mse"] += mse
+                all_metrics["valid_pixels"] += valid_mask.sum().item()
+            
+            total_loss += loss.item()
+            num_batches += 1
+    
+    # Compute average metrics
+    avg_metrics = {}
+    if num_batches > 0:
+        avg_metrics["loss"] = total_loss / num_batches
+        avg_metrics["mae"] = all_metrics["mae"] / num_batches
+        avg_metrics["mse"] = all_metrics["mse"] / num_batches
+        avg_metrics["rmse"] = (all_metrics["mse"] / num_batches) ** 0.5
+        avg_metrics["valid_pixels_per_batch"] = all_metrics["valid_pixels"] / num_batches
+    
+    return avg_metrics
+
+
 def train_epoch_generic(model: nn.Module,
                           dataloader: DataLoader,
                           optimizer: torch.optim.Optimizer,

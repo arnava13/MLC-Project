@@ -362,12 +362,38 @@ def load_sentinel_tensor_from_bbox_median(bounds, time_window, selected_bands=["
         else:
             logging.warning("Could not create transform from bounds - missing dimensions or bounds")
 
+        # Calculate median with skipna=True to handle NaN values in the input data
         median_tensor = arr.median(dim="time", skipna=True)
-        final_median_tensor = median_tensor.values.astype(np.float32)
-        logging.info(f"Generated median tensor with shape: {final_median_tensor.shape}")
         
-        # Return the tensor, transform, and CRS as a tuple - these will be saved as metadata
-        # with the output file if needed by downstream processes
+        # Get the values and convert to float32 for storage efficiency
+        final_median_tensor = median_tensor.values.astype(np.float32)
+        
+        # Explicitly set nodata values to NaN
+        # First, check if there's a _FillValue or nodata attribute in arr
+        nodata_value = None
+        for var_name in arr.data_vars if hasattr(arr, 'data_vars') else []:
+            if hasattr(arr[var_name], 'attrs') and ('_FillValue' in arr[var_name].attrs or 'nodata' in arr[var_name].attrs):
+                nodata_value = arr[var_name].attrs.get('_FillValue', arr[var_name].attrs.get('nodata'))
+                break
+        
+        # If a nodata value was found, replace it with NaN in the final tensor
+        if nodata_value is not None:
+            final_median_tensor = np.where(
+                final_median_tensor == nodata_value, 
+                np.nan, 
+                final_median_tensor
+            )
+        
+        # Check for any invalid values (inf, -inf) and set them to NaN as well
+        final_median_tensor = np.where(
+            np.isfinite(final_median_tensor),
+            final_median_tensor,
+            np.nan
+        )
+        
+        logging.info(f"Generated median tensor with shape: {final_median_tensor.shape} with NaN for missing values")
+        
+        # Return the tensor (now with NaN for missing values)
         return final_median_tensor
 
     except FileNotFoundError:
@@ -507,8 +533,34 @@ def load_lst_tensor_from_bbox_median(bounds, time_window, resolution_m=30, dest_
         temperature_k = radiance_to_temperature_landsat(lst_da)
         median_lst_k = temperature_k.median(dim="time", skipna=True)
         final_median_lst = median_lst_k.values.astype(np.float32)
+        
+        # Get nodata value if present
+        nodata_value = None
+        if hasattr(lst_da, 'attrs') and ('_FillValue' in lst_da.attrs or 'nodata' in lst_da.attrs):
+            nodata_value = lst_da.attrs.get('_FillValue', lst_da.attrs.get('nodata'))
+        
+        # Set nodata values to NaN
+        if nodata_value is not None:
+            final_median_lst = np.where(
+                final_median_lst == nodata_value,
+                np.nan,
+                final_median_lst
+            )
+        
+        # Check for any invalid values (inf, -inf, unreasonable values) and set them to NaN
+        # For LST in Kelvin, reasonable range is ~200K to ~350K (approx -73°C to 77°C)
+        final_median_lst = np.where(
+            np.logical_and(
+                np.isfinite(final_median_lst),
+                np.logical_and(final_median_lst > 200, final_median_lst < 350)
+            ),
+            final_median_lst,
+            np.nan
+        )
+        
+        # Add channel dimension
         final_median_lst = final_median_lst[np.newaxis, :, :] # Shape (1, height, width)
-        logging.info(f"Generated median LST tensor (Kelvin) with shape: {final_median_lst.shape}")
+        logging.info(f"Generated median LST tensor (Kelvin) with shape: {final_median_lst.shape} with NaN for missing values")
         return final_median_lst
 
     except FileNotFoundError:
