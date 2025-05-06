@@ -237,7 +237,62 @@ def load_sentinel_tensor_from_bbox_median(bounds, time_window, selected_bands=["
                 logging.error("No items were processed successfully.")
                 return None
 
-            logging.info("Loading data with odc.stac.stac_load...")
+            logging.info(f"Loading data with odc.stac.stac_load on {len(processed_items)} items...")
+            # --- Detailed pre-load logging and additional georeference checking ---
+            items_with_issues = []
+            for item_idx, p_item in enumerate(processed_items):
+                has_georef_issues = False
+                logging.info(f"  Pre-load check for item {item_idx + 1}/{len(processed_items)}: ID {p_item.id}")
+                for band_name in selected_bands:
+                    asset_to_check = p_item.assets.get(band_name)
+                    if asset_to_check and asset_to_check.href:
+                        href_to_check = asset_to_check.href
+                        # Determine if it's a local file (from gdalwarp) or remote URL
+                        is_local_file = href_to_check.startswith('file://')
+                        path_for_rasterio = href_to_check[7:] if is_local_file else f'/vsicurl/{href_to_check}'
+                        try:
+                            with rasterio.open(path_for_rasterio) as src_check:
+                                has_gcps = bool(src_check.gcps[0]) if src_check.gcps else False
+                                is_identity = src_check.transform.is_identity
+                                
+                                # Check for problematic georeferencing
+                                if is_identity and not has_gcps:
+                                    has_georef_issues = True
+                                    logging.warning(
+                                        f"    ⚠️ Item {p_item.id}, Band {band_name}: MISSING GEOREFERENCING - "
+                                        f"identity transform without GCPs"
+                                    )
+                                
+                                logging.info(
+                                    f"    Item {p_item.id}, Band {band_name}: href={href_to_check}, "
+                                    f"transform={src_check.transform}, crs={src_check.crs}, "
+                                    f"gcps={has_gcps}, "
+                                    f"is_identity={is_identity}"
+                                )
+                        except Exception as e_check:
+                            logging.error(
+                                f"    Item {p_item.id}, Band {band_name}: ERROR opening asset {href_to_check} for pre-load check: {e_check}"
+                            )
+                    else:
+                        logging.warning(f"    Item {p_item.id}, Band {band_name}: Asset missing or no href.")
+                
+                # Collect items with issues for potential removal
+                if has_georef_issues:
+                    items_with_issues.append((item_idx, p_item))
+            
+            # Optionally remove problematic items (uncomment if needed)
+            if items_with_issues:
+                logging.warning(f"Found {len(items_with_issues)} items with georeferencing issues.")
+                # If all items have issues, we can't remove them all
+                if len(items_with_issues) < len(processed_items):
+                    logging.warning("Removing items with georeferencing issues to avoid reprojection warnings.")
+                    # Remove items with issues, in reverse order to maintain valid indices
+                    for item_idx, _ in sorted(items_with_issues, key=lambda x: x[0], reverse=True):
+                        processed_items.pop(item_idx)
+                    logging.info(f"After removal: {len(processed_items)} items remain for processing.")
+                else:
+                    logging.warning("All items have georeferencing issues! Proceeding with caution.")
+            # --- End detailed pre-load logging and checking ---
 
             # patch_url is likely not needed as hrefs are either signed URLs or file URIs
             ds = stac_load(
@@ -278,10 +333,37 @@ def load_sentinel_tensor_from_bbox_median(bounds, time_window, selected_bands=["
                 arr = arr.transpose("band", "y", "x")
                 arr = arr.expand_dims("time", axis=1)
             else: raise e
+            
+        # Store important georeference information for later reconstruction
+        transform = None
+        crs = None
+        if hasattr(ds, 'transform') and not ds.transform.is_identity:
+            transform = ds.transform
+        else:
+            # Create a transform from the bounds and dimensions
+            width = arr.sizes.get('x')
+            height = arr.sizes.get('y')
+            if width and height and bounds:
+                transform = rasterio.transform.from_bounds(
+                    bounds[0], bounds[1], bounds[2], bounds[3], width, height)
+                logging.info(f"Created transform from bounds: {transform}")
+            else:
+                logging.warning("Could not create transform from bounds - missing dimensions or bounds")
+                
+        if hasattr(ds, 'crs'):
+            crs = ds.crs
+            logging.info(f"Using CRS from dataset: {crs}")
+        else:
+            # Default to WGS84
+            crs = "EPSG:4326"
+            logging.info(f"Using default CRS: {crs}")
 
         median_tensor = arr.median(dim="time", skipna=True)
         final_median_tensor = median_tensor.values.astype(np.float32)
         logging.info(f"Generated median tensor with shape: {final_median_tensor.shape}")
+        
+        # Return the tensor, transform, and CRS as a tuple - these will be saved as metadata
+        # with the output file if needed by downstream processes
         return final_median_tensor
 
     except FileNotFoundError:
@@ -454,6 +536,7 @@ def create_and_save_cloudless_mosaic(city_name, bounds, output_dir,
 
     logging.info(f"Generating cloudless mosaic for {city_name}, window {time_window}...")
     try:
+        # Call the function to get mosaic data
         mosaic_data = load_sentinel_tensor_from_bbox_median(
             bounds=bounds,
             time_window=time_window,
@@ -464,8 +547,27 @@ def create_and_save_cloudless_mosaic(city_name, bounds, output_dir,
         if mosaic_data is None:
              raise ValueError("Mosaic generation returned None (likely processing error).")
 
+        # Save the mosaic tensor data
         np.save(output_path, mosaic_data)
         logging.info(f"Saved cloudless mosaic to {output_path}")
+        
+        # Save metadata in a JSON file if needed
+        # Currently not saving metadata because we know the dataloader is creating its own transform
+        # but we could uncomment this code if we want to include metadata in the future
+        # metadata_path = output_path.with_suffix('.json')
+        # transform_json = None
+        # if transform is not None:
+        #     transform_json = transform.to_gdal()
+        # metadata = {
+        #     'bounds': bounds,
+        #     'transform': transform_json,
+        #     'crs': str(crs) if crs else 'EPSG:4326',
+        #     'shape': mosaic_data.shape
+        # }
+        # with open(metadata_path, 'w') as f:
+        #     json.dump(metadata, f)
+        # logging.info(f"Saved metadata to {metadata_path}")
+        
         return output_path
     except ValueError as e:
         logging.error(f"No suitable Sentinel data found or processed for mosaic ({city_name}, {time_window}): {e}")
