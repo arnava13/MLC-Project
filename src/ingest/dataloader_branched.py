@@ -162,6 +162,7 @@ class CityDataSetBranched(Dataset):
                 logging.info(f"Loading DEM from: {dem_p}")
                 try:
                     self.dem_xr = rioxarray.open_rasterio(dem_p, masked=True)
+                    logging.info(f"DEM loaded raw shape: {self.dem_xr.shape}")
                     if self.elevation_nodata is not None:
                          self.dem_xr = self.dem_xr.where(self.dem_xr != self.elevation_nodata)
                          self.dem_xr.rio.write_nodata(np.nan, encoded=True, inplace=True)
@@ -186,6 +187,7 @@ class CityDataSetBranched(Dataset):
                 logging.info(f"Loading DSM from: {dsm_p}")
                 try:
                     self.dsm_xr = rioxarray.open_rasterio(dsm_p, masked=True)
+                    logging.info(f"DSM loaded raw shape: {self.dsm_xr.shape}")
                     if self.elevation_nodata is not None:
                          self.dsm_xr = self.dsm_xr.where(self.dsm_xr != self.elevation_nodata)
                          self.dsm_xr.rio.write_nodata(np.nan, encoded=True, inplace=True)
@@ -238,12 +240,12 @@ class CityDataSetBranched(Dataset):
                     if self.lst_xr.rio.crs != self.target_crs:
                         logging.info(f"Reprojecting LST from {self.lst_xr.rio.crs} to {self.target_crs_str}")
                     logging.info(f"Opened LST (lazy load). Native shape (approx): {self.lst_xr.shape}")
-                except Exception as e:
+            except Exception as e:
                     logging.error(f"Failed LST loading/processing from {lst_path}: {e}")
                     if hasattr(self, 'lst_xr') and self.lst_xr: 
                         self.lst_xr.close()
                     self.lst_xr = None
-            else: 
+        else:
                 logging.warning(f"LST path specified but not found: {self._single_lst_median_path}")
 
         # --- Load Weather Station Data --- #
@@ -424,10 +426,18 @@ class CityDataSetBranched(Dataset):
         # 3. DEM (Resample to FEATURE resolution)
         dem_feat_res = None
         if self.feature_flags["use_dem"] and self.dem_xr is not None:
+            logging.debug(f"Resampling DEM with initial shape: {self.dem_xr.shape}")
             dem_feat_res = resample_xarray_to_target(
                 self.dem_xr, self.feat_H, self.feat_W, self.feat_transform, self.target_crs, fill_value=0.0 # Fill nodata with 0
             )
             if dem_feat_res is not None:
+                logging.debug(f"DEM after resampling shape: {dem_feat_res.shape}")
+                # Take just the first band if multiple bands exist
+                if dem_feat_res.shape[0] > 1:
+                    logging.warning(f"DEM has {dem_feat_res.shape[0]} bands, using only the first band.")
+                    dem_feat_res = dem_feat_res[0:1]  # Keep as 3D with a single channel
+                    logging.debug(f"DEM after band selection shape: {dem_feat_res.shape}")
+                
                 # Normalize DEM [0, 1] - specific to this feature resolution grid
                 min_v, max_v = np.min(dem_feat_res), np.max(dem_feat_res)
                 if max_v > min_v:
@@ -442,10 +452,18 @@ class CityDataSetBranched(Dataset):
         # 4. DSM (Resample to FEATURE resolution)
         dsm_feat_res = None
         if self.feature_flags["use_dsm"] and self.dsm_xr is not None:
+            logging.debug(f"Resampling DSM with initial shape: {self.dsm_xr.shape}")
             dsm_feat_res = resample_xarray_to_target(
                 self.dsm_xr, self.feat_H, self.feat_W, self.feat_transform, self.target_crs, fill_value=0.0
             )
             if dsm_feat_res is not None:
+                logging.debug(f"DSM after resampling shape: {dsm_feat_res.shape}")
+                # Take just the first band if multiple bands exist
+                if dsm_feat_res.shape[0] > 1:
+                    logging.warning(f"DSM has {dsm_feat_res.shape[0]} bands, using only the first band.")
+                    dsm_feat_res = dsm_feat_res[0:1]  # Keep as 3D with a single channel
+                    logging.debug(f"DSM after band selection shape: {dsm_feat_res.shape}")
+                
                 # Normalize DSM [0, 1]
                 min_v, max_v = np.min(dsm_feat_res), np.max(dsm_feat_res)
                 if max_v > min_v:
@@ -493,14 +511,14 @@ class CityDataSetBranched(Dataset):
             else:
             # Clay takes specific bands (e.g., RGB+NIR)
                 clay_input_band_names = ["blue", "green", "red", "nir"]
-                clay_input_indices = []
+            clay_input_indices = []
                 available_bands_in_resampled = {band: i for i, band in enumerate(DEFAULT_MOSAIC_BANDS_ORDER[:mosaic_feat_res.shape[0]])}
-                try:
-                    for band_name in clay_input_band_names:
+            try:
+                for band_name in clay_input_band_names:
                         clay_input_indices.append(available_bands_in_resampled[band_name])
                     clay_mosaic_input = mosaic_feat_res[clay_input_indices, :, :]
                     norm_latlon_tensor = self._cached_norm_latlon
-                    norm_time_tensor = normalize_clay_timestamp(target_timestamp)
+            norm_time_tensor = normalize_clay_timestamp(target_timestamp)
                 except KeyError as e:
                     logging.warning(f"Cannot extract required bands for Clay ('{e}') from resampled mosaic bands. Skipping Clay.")
                     clay_mosaic_input = None
