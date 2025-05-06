@@ -7,6 +7,7 @@ import rasterio.warp
 import rasterio.transform
 import logging
 import xarray as xr # Restore xarray for stac_load output processing
+import rioxarray   # Add rioxarray for proper geospatial handling
 from odc.stac import stac_load # Restore stac_load
 import subprocess # For calling gdalwarp
 import tempfile   # For temporary files
@@ -334,29 +335,32 @@ def load_sentinel_tensor_from_bbox_median(bounds, time_window, selected_bands=["
                 arr = arr.expand_dims("time", axis=1)
             else: raise e
             
-        # Store important georeference information for later reconstruction
-        transform = None
-        crs = None
-        if hasattr(ds, 'transform') and not ds.transform.is_identity:
-            transform = ds.transform
+        # Ensure we have rioxarray for proper geospatial handling
+        import rioxarray  # Make sure this is imported
+        
+        # Get dimensions for proper transform creation
+        width = arr.sizes.get('x')
+        height = arr.sizes.get('y')
+        
+        if width and height and bounds:
+            # Create the transform properly using the bounds like in example notebooks
+            gt = rasterio.transform.from_bounds(
+                bounds[0], bounds[1], bounds[2], bounds[3], width, height)
+            
+            # Convert to a DataArray with spatial dimensions for proper handling
+            # This is a key step - using rioxarray to handle the geospatial metadata
+            xarr = xr.DataArray(arr)
+            
+            # Apply the geospatial information directly as in example notebooks
+            xarr = xarr.rio.write_crs("EPSG:4326", inplace=False)
+            xarr = xarr.rio.write_transform(transform=gt, inplace=False)
+            
+            # Replace the original array with the properly georeferenced one
+            arr = xarr
+            
+            logging.info(f"Applied proper transform using rioxarray: {gt}")
         else:
-            # Create a transform from the bounds and dimensions
-            width = arr.sizes.get('x')
-            height = arr.sizes.get('y')
-            if width and height and bounds:
-                transform = rasterio.transform.from_bounds(
-                    bounds[0], bounds[1], bounds[2], bounds[3], width, height)
-                logging.info(f"Created transform from bounds: {transform}")
-            else:
-                logging.warning("Could not create transform from bounds - missing dimensions or bounds")
-                
-        if hasattr(ds, 'crs'):
-            crs = ds.crs
-            logging.info(f"Using CRS from dataset: {crs}")
-        else:
-            # Default to WGS84
-            crs = "EPSG:4326"
-            logging.info(f"Using default CRS: {crs}")
+            logging.warning("Could not create transform from bounds - missing dimensions or bounds")
 
         median_tensor = arr.median(dim="time", skipna=True)
         final_median_tensor = median_tensor.values.astype(np.float32)
