@@ -463,6 +463,10 @@ class CityDataSetBranched(Dataset):
             else:
                 combined_static_features = np.zeros((0, self.feat_H, self.feat_W), dtype=np.float32)
 
+        # <<< DEBUG PRINT >>>
+        print(f"[DEBUG DATALOADER] combined_static_features shape: {combined_static_features.shape}")
+        # <<< END DEBUG >>>
+
         # --- Prepare Clay Inputs (if needed) --- #
         clay_mosaic_input = None # The mosaic resampled to feature res
         norm_latlon_tensor = None
