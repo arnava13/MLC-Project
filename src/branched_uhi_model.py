@@ -388,6 +388,12 @@ class BranchedUHIModel(nn.Module):
         )
         self.final_conv = nn.Conv2d(unet_base_channels, 1, kernel_size=1)
 
+        # Initialize final layer weights and bias to zero
+        # This makes the initial normalized prediction 0, corresponding to the mean UHI
+        torch.nn.init.zeros_(self.final_conv.weight)
+        if self.final_conv.bias is not None:
+            torch.nn.init.zeros_(self.final_conv.bias)
+
         logging.info(f"BranchedUHIModel initialized. Static Proj In: {static_input_channels}, Out: {proj_static_ch}. Temporal Proj In: {temporal_input_channels}, Out: {proj_temporal_ch}. UNet In: {unet_input_channels}")
 
 
