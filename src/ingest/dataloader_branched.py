@@ -322,7 +322,7 @@ class CityDataSetBranched(Dataset):
 
         weather_seq_feat_res = np.stack(weather_sequence_list, axis=0)
 
-        # --- Prepare Static Features (resampled to FEATURE resolution) --- #
+        # --- Prepare Static Features (resampled to FEATURE resolution) ---
         static_features_list = [] # For non-Clay, non-Elev features
         feature_names = []      # Track names
         
@@ -344,8 +344,9 @@ class CityDataSetBranched(Dataset):
                 'y': np.linspace(self.bounds[3], self.bounds[1], self.cloudless_mosaic_full_np.shape[1]),
                 'x': np.linspace(self.bounds[0], self.bounds[2], self.cloudless_mosaic_full_np.shape[2]),
             }
+            # Ensure float32 when creating DataArray
             mosaic_xr = xr.DataArray(
-                self.cloudless_mosaic_full_np,
+                self.cloudless_mosaic_full_np.astype(np.float32), # Cast here
                 coords=coords,
                 dims=['band', 'y', 'x'],
                 name='mosaic'
@@ -356,6 +357,8 @@ class CityDataSetBranched(Dataset):
             mosaic_feat_res = resample_xarray_to_target(
                 mosaic_xr, self.feat_H, self.feat_W, self.feat_transform, self.target_crs
             )
+            del mosaic_xr # Release memory for original-res mosaic wrapper
+
             if mosaic_feat_res is None:
                 logging.warning(f"Mosaic resampling failed for timestamp {target_timestamp}. Skipping mosaic features.")
                 needs_mosaic = False # Disable downstream use if resampling failed
@@ -399,16 +402,19 @@ class CityDataSetBranched(Dataset):
                     if ndvi_map is not None: 
                         static_features_list.append(ndvi_map)
                         feature_names.append("ndvi")
+                    if 'ndvi_map' in locals(): del ndvi_map # Release memory
                 if self.feature_flags["use_ndbi"]:
                     ndbi_map = _calculate_index("ndbi", "swir16", "nir")
                     if ndbi_map is not None: 
                         static_features_list.append(ndbi_map)
                         feature_names.append("ndbi")
+                    if 'ndbi_map' in locals(): del ndbi_map # Release memory
                 if self.feature_flags["use_ndwi"]:
                     ndwi_map = _calculate_index("ndwi", "green", "nir")
                     if ndwi_map is not None: 
                         static_features_list.append(ndwi_map)
                         feature_names.append("ndwi")
+                    if 'ndwi_map' in locals(): del ndwi_map # Release memory
 
         # 2. LST Median (Resample to FEATURE resolution)
         lst_feat_res = None
@@ -417,35 +423,43 @@ class CityDataSetBranched(Dataset):
                 self.lst_xr, self.feat_H, self.feat_W, self.feat_transform, self.target_crs, fill_value=0.0 # Fill with 0
             )
             if lst_feat_res_raw is not None:
-                lst_feat_res = normalize_lst(lst_feat_res_raw, self.feat_H, self.feat_W)
+                lst_feat_res = normalize_lst(lst_feat_res_raw.astype(np.float32), self.feat_H, self.feat_W) # Ensure float32
                 static_features_list.append(lst_feat_res)
                 feature_names.append("lst")
+                del lst_feat_res_raw # Release memory
             else:
                 logging.warning(f"LST resampling failed for timestamp {target_timestamp}.")
+            # lst_feat_res might be needed later for other processing, delete after use
 
         # 3. DEM (Resample to FEATURE resolution)
         dem_feat_res = None
         if self.feature_flags["use_dem"] and self.dem_xr is not None:
             logging.debug(f"Resampling DEM with initial shape: {self.dem_xr.shape}")
-            dem_feat_res = resample_xarray_to_target(
+            dem_feat_res_raw = resample_xarray_to_target(
                 self.dem_xr, self.feat_H, self.feat_W, self.feat_transform, self.target_crs, fill_value=0.0 # Fill nodata with 0
             )
-            if dem_feat_res is not None:
-                logging.debug(f"DEM after resampling shape: {dem_feat_res.shape}")
-                # ALWAYS force using only the first band, even if shape[0] is 1
-                # This ensures we have consistent behavior regardless of input
-                logging.debug(f"DEM has {dem_feat_res.shape[0]} bands, using only the first band.")
-                dem_feat_res = dem_feat_res[0:1]  # Keep as 3D with a single channel
-                logging.debug(f"DEM after band selection shape: {dem_feat_res.shape}")
+            if dem_feat_res_raw is not None:
+                logging.debug(f"DEM after resampling shape: {dem_feat_res_raw.shape}")
+                dem_feat_res = dem_feat_res_raw.astype(np.float32) # Ensure float32
+                del dem_feat_res_raw # Release raw resampled
+
+                if dem_feat_res.shape[0] != 1:
+                    logging.warning(f"Resampled DEM has unexpected band count: {dem_feat_res.shape[0]}. Expected 1.")
+                    if dem_feat_res.shape[0] > 1:
+                         dem_feat_res = dem_feat_res[0:1]
+                    else:
+                         logging.error("Resampled DEM has 0 bands. Cannot use DEM.")
+                         dem_feat_res = None
                 
-                # Normalize DEM [0, 1] - specific to this feature resolution grid
-                min_v, max_v = np.min(dem_feat_res), np.max(dem_feat_res)
-                if max_v > min_v:
-                    dem_feat_res = (dem_feat_res - min_v) / (max_v - min_v)
-                else:
-                    dem_feat_res.fill(0.5)
-                static_features_list.append(dem_feat_res)
-                feature_names.append("dem")
+                if dem_feat_res is not None:
+                    min_v, max_v = np.min(dem_feat_res), np.max(dem_feat_res)
+                    if max_v > min_v:
+                        dem_feat_res = (dem_feat_res - min_v) / (max_v - min_v)
+                    else:
+                        dem_feat_res.fill(0.5)
+                    static_features_list.append(dem_feat_res)
+                    feature_names.append("dem")
+                    # Keep dem_feat_res for potential later use (e.g., Clay?)
             else:
                 logging.warning(f"DEM resampling failed for timestamp {target_timestamp}.")
 
@@ -453,48 +467,64 @@ class CityDataSetBranched(Dataset):
         dsm_feat_res = None
         if self.feature_flags["use_dsm"] and self.dsm_xr is not None:
             logging.debug(f"Resampling DSM with initial shape: {self.dsm_xr.shape}")
-            dsm_feat_res = resample_xarray_to_target(
+            dsm_feat_res_raw = resample_xarray_to_target(
                 self.dsm_xr, self.feat_H, self.feat_W, self.feat_transform, self.target_crs, fill_value=0.0 # Fill nodata with 0
             )
-            if dsm_feat_res is not None:
-                logging.debug(f"DSM after resampling shape: {dsm_feat_res.shape}")
-                # Use only first band (multiple bands handled by xarray open_rasterio)
-                logging.debug(f"DSM has {dsm_feat_res.shape[0]} bands, using only the first band.")
-                dsm_feat_res = dsm_feat_res[0:1]  # Keep as 3D with a single channel
-                logging.debug(f"DSM after band selection shape: {dsm_feat_res.shape}")
+            if dsm_feat_res_raw is not None:
+                logging.debug(f"DSM after resampling shape: {dsm_feat_res_raw.shape}")
+                dsm_feat_res = dsm_feat_res_raw.astype(np.float32) # Ensure float32
+                del dsm_feat_res_raw # Release raw resampled
 
-                # Normalize DSM [0, 1] - specific to this feature resolution grid
-                min_v, max_v = np.min(dsm_feat_res), np.max(dsm_feat_res)
-                if max_v > min_v:
-                    dsm_feat_res = (dsm_feat_res - min_v) / (max_v - min_v)
-                else:
-                    dsm_feat_res.fill(0.5)
-                static_features_list.append(dsm_feat_res)
-                feature_names.append("dsm")
+                if dsm_feat_res.shape[0] != 1:
+                    logging.warning(f"Resampled DSM has unexpected band count: {dsm_feat_res.shape[0]}. Expected 1.")
+                    if dsm_feat_res.shape[0] > 1:
+                         dsm_feat_res = dsm_feat_res[0:1]
+                    else:
+                         logging.error("Resampled DSM has 0 bands. Cannot use DSM.")
+                         dsm_feat_res = None
+                
+                if dsm_feat_res is not None:
+                    min_v, max_v = np.min(dsm_feat_res), np.max(dsm_feat_res)
+                    if max_v > min_v:
+                        dsm_feat_res = (dsm_feat_res - min_v) / (max_v - min_v)
+                    else:
+                        dsm_feat_res.fill(0.5)
+                    static_features_list.append(dsm_feat_res)
+                    feature_names.append("dsm")
+                    # Keep dsm_feat_res for potential later use
             else:
                 logging.warning(f"DSM resampling failed for timestamp {target_timestamp}.")
 
         # Combine ALL static features (excluding Clay mosaic input)
         if not static_features_list:
-            # Need to handle case where no static features are available/enabled
             combined_static_features = np.zeros((0, self.feat_H, self.feat_W), dtype=np.float32)
             logging.debug("No static features present, creating empty tensor.")
         else:
-            # Ensure all have the correct shape before concatenating
             valid_static_features = []
             valid_feature_names = []
             for i, feat in enumerate(static_features_list):
                 if feat is not None and feat.shape[1:] == (self.feat_H, self.feat_W):
+                    if feat.ndim == 2:
+                        feat = feat[np.newaxis, :, :]
+                    elif feat.ndim == 3 and feat.shape[0] == 1:
+                        pass
+                    else:
+                        logging.warning(f"Static feature '{feature_names[i]}' has unexpected shape {feat.shape} after processing. Skipping.")
+                        continue
                     valid_static_features.append(feat)
                     valid_feature_names.append(feature_names[i])
                 else:
-                    logging.warning(f"Static feature '{feature_names[i]}' has incorrect shape or is None. Skipping.")
+                    logging.warning(f"Static feature '{feature_names[i]}' has incorrect spatial shape or is None after resampling. Skipping.")
+
             if valid_static_features:
                 combined_static_features = np.concatenate(valid_static_features, axis=0).astype(np.float32)
-                #logging.info(f"Included static features: {valid_feature_names}")
+                # Clear the list to potentially free memory of contained arrays earlier
+                del valid_static_features
+                del static_features_list
             else:
                 combined_static_features = np.zeros((0, self.feat_H, self.feat_W), dtype=np.float32)
                 logging.warning("No valid static features found for concatenation.")
+
         # --- Prepare Clay Inputs (if needed) --- #
         clay_mosaic_input = None # The mosaic resampled to feature res
         norm_latlon_tensor = None
@@ -503,36 +533,43 @@ class CityDataSetBranched(Dataset):
             if mosaic_feat_res is None:
                 logging.warning("Clay features enabled, but mosaic could not be loaded/resampled. Skipping Clay.")
             else:
-            # Clay takes specific bands (e.g., RGB+NIR)
                 clay_input_band_names = ["blue", "green", "red", "nir"]
                 clay_input_indices = []
                 available_bands_in_resampled = {band: i for i, band in enumerate(DEFAULT_MOSAIC_BANDS_ORDER[:mosaic_feat_res.shape[0]])}
-            try:
-                for band_name in clay_input_band_names:
-                        clay_input_indices.append(available_bands_in_resampled[band_name])
-                clay_mosaic_input = mosaic_feat_res[clay_input_indices, :, :]
-                norm_latlon_tensor = self._cached_norm_latlon
-                norm_time_tensor = normalize_clay_timestamp(target_timestamp)
-            except KeyError as e:
-                    logging.warning(f"Cannot extract required bands for Clay ('{e}') from resampled mosaic bands. Skipping Clay.")
-                    clay_mosaic_input = None
+                try:
+                    for band_name in clay_input_band_names:
+                            clay_input_indices.append(available_bands_in_resampled[band_name])
+                    clay_mosaic_input = mosaic_feat_res[clay_input_indices, :, :]
+                    norm_latlon_tensor = self._cached_norm_latlon
+                    norm_time_tensor = normalize_clay_timestamp(target_timestamp)
+                except KeyError as e:
+                        logging.warning(f"Cannot extract required bands for Clay ('{e}') from resampled mosaic bands. Skipping Clay.")
+                        clay_mosaic_input = None
 
         # --- Assemble Sample Dictionary --- #
         sample = {
-            'weather_seq': torch.from_numpy(weather_seq_feat_res).float(), # (T, C_weather, H_feat, W_feat)
-            'target': torch.from_numpy(target_grid).float().unsqueeze(0),   # (1, H_uhi, W_uhi)
-            'mask': torch.from_numpy(valid_mask).bool().unsqueeze(0),       # (1, H_uhi, W_uhi)
+            'weather_seq': torch.from_numpy(weather_seq_feat_res).float(),
+            'target': torch.from_numpy(target_grid).float().unsqueeze(0),
+            'mask': torch.from_numpy(valid_mask).bool().unsqueeze(0),
         }
 
-        # Add combined static features (LST, DEM, DSM, indices, composite)
         if combined_static_features.shape[0] > 0:
             sample['static_features'] = torch.from_numpy(combined_static_features).float()
 
-        # Add optional Clay inputs
         if self.feature_flags["use_clay"] and clay_mosaic_input is not None:
             sample['cloudless_mosaic'] = torch.from_numpy(clay_mosaic_input).float()
             sample['norm_latlon'] = torch.from_numpy(norm_latlon_tensor).float()
             sample['norm_timestamp'] = torch.from_numpy(norm_time_tensor).float()
+
+        # Explicitly delete large intermediate arrays at the end of __getitem__
+        if 'mosaic_feat_res' in locals() and mosaic_feat_res is not None: del mosaic_feat_res
+        if 'dem_feat_res' in locals() and dem_feat_res is not None: del dem_feat_res
+        if 'dsm_feat_res' in locals() and dsm_feat_res is not None: del dsm_feat_res
+        if 'lst_feat_res' in locals() and lst_feat_res is not None: del lst_feat_res
+        if 'combined_static_features' in locals(): del combined_static_features
+        if 'weather_seq_feat_res' in locals(): del weather_seq_feat_res
+        if 'clay_mosaic_input' in locals(): del clay_mosaic_input
+        # Keep target_grid and valid_mask as they are retrieved from precomputed dicts
 
         return sample 
 
