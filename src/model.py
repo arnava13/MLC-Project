@@ -347,53 +347,6 @@ class ClayFeatureExtractor(nn.Module):
         return spatial_features
 
 # -----------------------------------------------------------------------------
-# NEW: High-Resolution Elevation Branch ---------------------------------------
-# -----------------------------------------------------------------------------
-
-class HighResElevationBranch(nn.Module):
-    """
-    A convolutional branch to process high-resolution elevation data (DEM/DSM)
-    and downsample it to match the feature map resolution of the main backbone.
-    Uses strided convolutions for downsampling.
-    """
-    def __init__(self, in_channels: int = 1,
-                 start_channels: int = 16,
-                 out_channels: int = 32,
-                 num_downsample_layers: int = 3, # Adjust based on resolution diff
-                 kernel_size: int = 3):
-        super().__init__()
-        
-        layers = []
-        current_channels = in_channels
-        padding = kernel_size // 2
-        
-        # Initial convolution
-        layers.append(nn.Conv2d(current_channels, start_channels, kernel_size=kernel_size, padding=padding, stride=1))
-        layers.append(nn.BatchNorm2d(start_channels))
-        layers.append(nn.ReLU(inplace=True))
-        current_channels = start_channels
-        
-        # Downsampling layers with stride=2
-        for i in range(num_downsample_layers):
-            next_channels = current_channels * 2
-            layers.append(nn.Conv2d(current_channels, next_channels,
-                                    kernel_size=kernel_size, padding=padding, stride=2))
-            layers.append(nn.BatchNorm2d(next_channels))
-            layers.append(nn.ReLU(inplace=True))
-            current_channels = next_channels
-            
-        # Final convolution to get desired output channels (without further downsampling)
-        layers.append(nn.Conv2d(current_channels, out_channels, kernel_size=1, stride=1))
-        layers.append(nn.BatchNorm2d(out_channels))
-        layers.append(nn.ReLU(inplace=True))
-
-        self.branch = nn.Sequential(*layers)
-
-        logging.info(f"HighResElevationBranch initialized: In={in_channels}, Start={start_channels}, Out={out_channels}, DownsampleLayers={num_downsample_layers}")
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.branch(x)
-
 # -----------------------------------------------------------------------------
 # CNN HEADS -------------------------------------------------------------------
 # -----------------------------------------------------------------------------
