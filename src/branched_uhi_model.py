@@ -253,6 +253,8 @@ class BranchedUHIModel(nn.Module):
                  weather_seq_length: int = 60,
                  sentinel_bands_to_load: Optional[List[str]] = None,
                  enabled_weather_features: Optional[List[str]] = None,
+                 # --- U-Net specific dropout --- #
+                 unet_dropout_rate: Optional[float] = 0.1,
                  clay_model_size: Optional[str] = None,
                  clay_bands: Optional[List[str]] = None,
                  clay_platform: Optional[str] = None,
@@ -345,7 +347,8 @@ class BranchedUHIModel(nn.Module):
             self.feature_head = UNetDecoder( # From src.model
                 in_channels=input_channels_to_head,
                 base_channels=unet_base_channels,
-                depth=unet_depth
+                depth=unet_depth,
+                dropout_rate=unet_dropout_rate
             )
             channels_from_feature_head = unet_base_channels
             logging.info(f"BranchedModel using UNetDecoder head. Output channels: {channels_from_feature_head}")
