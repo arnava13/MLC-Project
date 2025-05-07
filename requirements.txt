@@ -21,3 +21,6 @@ dask[array]
 requests
 geopandas 
 cartopy
+lightning
+wandb
+sklearn
