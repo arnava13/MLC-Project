@@ -411,7 +411,7 @@ class SimpleCNNFeatureHead(nn.Module):
 # --- UNet-style Blocks ---
 class UNetConvBlock(nn.Module):
     """Helper: Conv(3x3, padding=1) -> BN -> ReLU -> Conv(3x3, padding=1) -> BN -> ReLU"""
-    def __init__(self, in_channels, out_channels, dropout_rate=0.1):
+    def __init__(self, in_channels, out_channels, dropout_rate: float = 0.1):
         super().__init__()
         self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1)
         self.bn1 = nn.BatchNorm2d(out_channels)
@@ -450,7 +450,7 @@ class UNetConvBlock(nn.Module):
 
 class UNetUpBlock(nn.Module):
     """Helper: Upsample(ConvTranspose2d 2x2, stride=2) -> Concat -> UNetConvBlock"""
-    def __init__(self, in_channels, out_channels):
+    def __init__(self, in_channels, out_channels, dropout_rate: float = 0.1):
         super().__init__()
         # in_channels: Channels from the deeper layer (input to ConvTranspose2d)
         # out_channels: Channels from the skip connection (and the desired output channels for this block)
@@ -459,7 +459,7 @@ class UNetUpBlock(nn.Module):
         # 1. Skip connection channels (out_channels)
         # 2. Upsampled channels (in_channels // 2)
         conv_in_channels = out_channels + (in_channels // 2)
-        self.conv = UNetConvBlock(conv_in_channels, out_channels)
+        self.conv = UNetConvBlock(conv_in_channels, out_channels, dropout_rate=dropout_rate)
 
     def forward(self, x1, x2):
         """
@@ -517,7 +517,7 @@ class UNetUpBlock(nn.Module):
 # --- U-Net Decoder Base Implementation ---
 class UNetDecoder(nn.Module):
     """Standard U-Net decoder implementation."""
-    def __init__(self, in_channels, base_channels, depth):
+    def __init__(self, in_channels, base_channels, depth, dropout_rate: float = 0.1):
         super().__init__()
         self.depth = depth
         
@@ -527,20 +527,20 @@ class UNetDecoder(nn.Module):
         self.pools = nn.ModuleList()
         for i in range(depth):
             out_ch = base_channels * (2**i)
-            self.downs.append(UNetConvBlock(ch, out_ch))
+            self.downs.append(UNetConvBlock(ch, out_ch, dropout_rate))
             if i < depth - 1:  # Don't pool after last down block
                 self.pools.append(nn.MaxPool2d(2))
             ch = out_ch
 
         # Bottleneck
-        self.bottleneck = UNetConvBlock(ch, ch)
+        self.bottleneck = UNetConvBlock(ch, ch, dropout_rate)
 
         # Up path
         self.ups = nn.ModuleList()
         for i in reversed(range(depth)):
             in_ch = ch
             out_ch = base_channels * (2**i)
-            self.ups.append(UNetUpBlock(in_ch, out_ch))
+            self.ups.append(UNetUpBlock(in_ch, out_ch, dropout_rate))
             ch = out_ch
 
         logging.info(f"Initialized UNetDecoder. In channels: {in_channels}, Base channels: {base_channels}, Depth: {depth}")
@@ -570,8 +570,8 @@ class UNetDecoder(nn.Module):
 # --- U-Net Decoder with Target Size Resizing ---
 class UNetDecoderWithTargetResize(UNetDecoder):
     """U-Net Decoder that ensures output matches target H, W using a learnable upsampling stage."""
-    def __init__(self, in_channels, base_channels, depth, target_h, target_w):
-        super().__init__(in_channels, base_channels, depth)
+    def __init__(self, in_channels, base_channels, depth, target_h, target_w, dropout_rate: float = 0.1):
+        super().__init__(in_channels, base_channels, depth, dropout_rate)
         self.target_h = target_h
         self.target_w = target_w
         
@@ -658,7 +658,9 @@ class UHINetCNN(nn.Module):
                  clay_gsd: Optional[int] = None,
                  freeze_backbone: bool = True,
                  clay_checkpoint_path: Optional[str] = None,
-                 clay_metadata_path: Optional[str] = None):
+                 clay_metadata_path: Optional[str] = None,
+                 # U-Net dropout
+                 unet_dropout_rate: float = 0.1):
         super().__init__()
         self.feature_flags = feature_flags
         self.head_type = head_type.lower()
@@ -692,7 +694,14 @@ class UHINetCNN(nn.Module):
             self.clay_model = ClayFeatureExtractor(
                 model_size=clay_model_size, bands=clay_bands, platform=clay_platform, gsd=clay_gsd,
                 freeze_backbone=freeze_backbone, checkpoint_path=clay_checkpoint_path, metadata_path=clay_metadata_path)
-            clay_output_channels = self.clay_model.output_channels
+            clay_raw_channels = self.clay_model.output_channels
+            # --- NEW: projection to reduce Clay channels ---
+            self.clay_proj_dim = clay_proj_channels
+            self.clay_proj = nn.Conv2d(clay_raw_channels, self.clay_proj_dim, kernel_size=1, bias=False)
+            clay_projected_channels = self.clay_proj_dim
+            logging.info(f"Added Clay projection Conv1x1: {clay_raw_channels} -> {self.clay_proj_dim} channels")
+            # Record projected channels for head input
+            clay_output_channels = clay_projected_channels
             logging.info(f"Initialized Clay model ({clay_model_size}), output channels: {clay_output_channels}")
 
         # --- Calculate Input Channels for the selected Feature Head --- #
@@ -722,13 +731,16 @@ class UHINetCNN(nn.Module):
         # --- Instantiate Selected Feature Head --- #
         channels_from_feature_head = 0
         if self.head_type == "unet":
-            self.feature_head = UNetDecoder(
+            self.feature_head = UNetDecoderWithTargetResize(
                 in_channels=input_channels_to_head,
                 base_channels=unet_base_channels,
-                depth=unet_depth
+                depth=unet_depth,
+                target_h=determine_target_grid_size(bounds, uhi_grid_resolution_m)[0],
+                target_w=determine_target_grid_size(bounds, uhi_grid_resolution_m)[1],
+                dropout_rate=unet_dropout_rate
             )
             channels_from_feature_head = unet_base_channels # UNetDecoder outputs `base_channels` features
-            logging.info(f"UHINetCNN using UNetDecoder head. Output channels: {channels_from_feature_head}")
+            logging.info(f"UHINetCNN using UNetDecoderWithTargetResize head. Output channels: {channels_from_feature_head}")
         elif self.head_type == "simple_cnn":
             if simple_cnn_hidden_dims is None:
                 simple_cnn_hidden_dims = [max(simple_cnn_output_channels * 2, 64), simple_cnn_output_channels] # Sensible default
@@ -745,15 +757,18 @@ class UHINetCNN(nn.Module):
             raise ValueError(f"Unsupported head_type: {self.head_type}. Choose 'unet' or 'simple_cnn'.")
 
         # --- Final Processor (Upsampling and Projection) --- #
-        target_H_uhi, target_W_uhi = determine_target_grid_size(bounds, uhi_grid_resolution_m)
-        logging.info(f"UHINetCNN final processor target UHI grid: ({target_H_uhi}, {target_W_uhi})")
-        self.final_processor = FinalUpsamplerAndProjection(
-            in_channels=channels_from_feature_head,
-            refinement_channels=final_processor_refinement_channels, # New parameter
-            target_h=target_H_uhi,
-            target_w=target_W_uhi
-        )
-        
+        # target_H_uhi, target_W_uhi = determine_target_grid_size(bounds, uhi_grid_resolution_m) # REMOVED
+        # logging.info(f"UHINetCNN final processor target UHI grid: ({target_H_uhi}, {target_W_uhi})") # REMOVED
+        # self.final_processor = FinalUpsamplerAndProjection( # REMOVED
+        #     in_channels=channels_from_feature_head, # REMOVED
+        #     refinement_channels=final_processor_refinement_channels, # New parameter # REMOVED
+        #     target_h=target_H_uhi, # REMOVED
+        #     target_w=target_W_uhi # REMOVED
+        # ) # REMOVED
+        # ADDED: Final 1x1 convolution to project to 1 channel for UHI prediction
+        self.final_projection = nn.Conv2d(channels_from_feature_head, 1, kernel_size=1)
+        logging.info(f"Added final 1x1 Conv2d to project to 1 UHI channel from {channels_from_feature_head} head output channels.")
+
         logging.info(f"UHINetCNN initialized completely with {self.head_type} head.")
 
     def forward(self, weather: torch.Tensor,
@@ -783,10 +798,12 @@ class UHINetCNN(nn.Module):
                     mode='bilinear',
                     align_corners=False
                 )
-                logging.debug(f"Interpolated Clay output from {clay_features_raw.shape} to {clay_features_interpolated.shape}")
-                all_features_list.append(clay_features_interpolated)
+                clay_proj = self.clay_proj(clay_features_interpolated)
+                logging.debug(f"Interpolated & projected Clay: {clay_features_interpolated.shape} -> {clay_proj.shape}")
+                all_features_list.append(clay_proj)
             else:
-                all_features_list.append(clay_features_raw) # Already matching
+                clay_proj = self.clay_proj(clay_features_raw)
+                all_features_list.append(clay_proj)
 
         # --- Other Static Features (Optional) --- #
         if static_features is not None:
@@ -801,6 +818,7 @@ class UHINetCNN(nn.Module):
         x = self.feature_head(x)
         
         # --- Pass through Final Processor --- #
-        prediction = self.final_processor(x)
+        # prediction = self.final_processor(x) # REMOVED
+        prediction = self.final_projection(x) # ADDED: Apply final projection
 
         return prediction
