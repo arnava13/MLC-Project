@@ -358,6 +358,14 @@ def train_epoch_generic(model: nn.Module,
             
         if static_features is not None: model_args['static_features'] = static_features.to(device)
         
+        # --- ADD CLAY INPUTS TO MODEL_ARGS IF ENABLED ---
+        if feature_flags.get("use_clay", False):
+            if clay_mosaic_tensor is not None: model_args['clay_mosaic'] = clay_mosaic_tensor.to(device)
+            if norm_latlon_tensor is not None: model_args['norm_latlon'] = norm_latlon_tensor.to(device)
+            if norm_timestamp_tensor is not None: model_args['norm_timestamp'] = norm_timestamp_tensor.to(device)
+            # The check for None on these tensors was already done earlier when extracting from batch
+        # --- END ADD CLAY INPUTS ---
+
         # --- Forward Pass --- #
         optimizer.zero_grad()
         try:
@@ -505,6 +513,14 @@ def validate_epoch_generic(model: nn.Module,
                 continue
                 
             if static_features is not None: model_args['static_features'] = static_features.to(device)
+
+            # --- ADD CLAY INPUTS TO MODEL_ARGS IF ENABLED ---
+            if feature_flags.get("use_clay", False):
+                if clay_mosaic_tensor is not None: model_args['clay_mosaic'] = clay_mosaic_tensor.to(device)
+                if norm_latlon_tensor is not None: model_args['norm_latlon'] = norm_latlon_tensor.to(device)
+                if norm_timestamp_tensor is not None: model_args['norm_timestamp'] = norm_timestamp_tensor.to(device)
+                # The check for None on these tensors was already done earlier when extracting from batch
+            # --- END ADD CLAY INPUTS ---
 
             # ------ Forward pass and loss calculation ------ #
             try:
