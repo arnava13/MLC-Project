@@ -298,6 +298,7 @@ def train_epoch_generic(model: nn.Module,
                           device: torch.device,
                           uhi_mean: float,
                           uhi_std: float,
+                          feature_flags: Dict[str, bool],
                           max_grad_norm: float = 1.0,
                           desc: str = 'Training') -> Tuple[float, float, float]:
     """Trains a generic UHI model for one epoch, handling different batch structures robustly."""
@@ -316,9 +317,10 @@ def train_epoch_generic(model: nn.Module,
         weather_seq = batch.get('weather_seq')
         weather_grid = batch.get('weather') # For CNN
         static_features = batch.get('static_features')
-        clay_mosaic = batch.get('clay_mosaic')
-        norm_latlon = batch.get('norm_latlon')
-        norm_timestamp = batch.get('norm_timestamp')
+        # Get Clay-specific inputs if they exist in the batch
+        cloudless_mosaic_batch = batch.get('cloudless_mosaic')
+        norm_latlon_batch = batch.get('norm_latlon')
+        norm_timestamp_batch = batch.get('norm_timestamp')
         
         # --- Basic Checks and Move to Device --- # 
         if target is None or mask is None:
@@ -344,9 +346,24 @@ def train_epoch_generic(model: nn.Module,
             continue # Cannot proceed without weather input
             
         if static_features is not None: model_args['static_features'] = static_features.to(device)
-        if clay_mosaic is not None: model_args['clay_mosaic'] = clay_mosaic.to(device)
-        if norm_latlon is not None: model_args['norm_latlon'] = norm_latlon.to(device)
-        if norm_timestamp is not None: model_args['norm_timestamp'] = norm_timestamp.to(device)
+        
+        # Add Clay inputs to model_args IF use_clay is True AND inputs are in batch
+        if feature_flags.get("use_clay", False):
+            if cloudless_mosaic_batch is not None:
+                model_args['clay_mosaic'] = cloudless_mosaic_batch.to(device)
+            else:
+                logging.error(f"Batch {batch_idx}: 'use_clay' is True but 'cloudless_mosaic' not found in batch. Skipping batch.")
+                continue
+            if norm_latlon_batch is not None:
+                model_args['norm_latlon'] = norm_latlon_batch.to(device)
+            else:
+                logging.error(f"Batch {batch_idx}: 'use_clay' is True but 'norm_latlon' not found in batch. Skipping batch.")
+                continue
+            if norm_timestamp_batch is not None:
+                model_args['norm_timestamp'] = norm_timestamp_batch.to(device)
+            else:
+                logging.error(f"Batch {batch_idx}: 'use_clay' is True but 'norm_timestamp' not found in batch. Skipping batch.")
+                continue
             
         # --- Forward Pass --- #
         optimizer.zero_grad()
@@ -436,6 +453,7 @@ def validate_epoch_generic(model: nn.Module,
                             device: torch.device,
                             uhi_mean: float,
                             uhi_std: float,
+                            feature_flags: Dict[str, bool],
                             desc: str = 'Validation') -> Tuple[float, float, float]:
     """Validates a generic UHI model for one epoch, handling different batch structures robustly."""
     model.eval()
@@ -454,9 +472,10 @@ def validate_epoch_generic(model: nn.Module,
             weather_seq = batch.get('weather_seq')
             weather_grid = batch.get('weather') # For CNN
             static_features = batch.get('static_features')
-            clay_mosaic = batch.get('clay_mosaic')
-            norm_latlon = batch.get('norm_latlon')
-            norm_timestamp = batch.get('norm_timestamp')
+            # Get Clay-specific inputs if they exist in the batch
+            cloudless_mosaic_batch = batch.get('cloudless_mosaic')
+            norm_latlon_batch = batch.get('norm_latlon')
+            norm_timestamp_batch = batch.get('norm_timestamp')
             
             # --- Basic Checks and Move to Device --- # 
             if target is None or mask is None:
@@ -482,9 +501,25 @@ def validate_epoch_generic(model: nn.Module,
                 continue
                 
             if static_features is not None: model_args['static_features'] = static_features.to(device)
-            if clay_mosaic is not None: model_args['clay_mosaic'] = clay_mosaic.to(device)
-            if norm_latlon is not None: model_args['norm_latlon'] = norm_latlon.to(device)
-            if norm_timestamp is not None: model_args['norm_timestamp'] = norm_timestamp.to(device)
+
+            # Add Clay inputs to model_args IF use_clay is True AND inputs are in batch
+            if feature_flags.get("use_clay", False):
+                if cloudless_mosaic_batch is not None:
+                    model_args['clay_mosaic'] = cloudless_mosaic_batch.to(device)
+                else:
+                    # During validation, if clay inputs are missing but expected, log and skip.
+                    logging.warning(f"Validation Batch {batch_idx}: 'use_clay' is True but 'cloudless_mosaic' not found. Skipping batch.")
+                    continue
+                if norm_latlon_batch is not None:
+                    model_args['norm_latlon'] = norm_latlon_batch.to(device)
+                else:
+                    logging.warning(f"Validation Batch {batch_idx}: 'use_clay' is True but 'norm_latlon' not found. Skipping batch.")
+                    continue
+                if norm_timestamp_batch is not None:
+                    model_args['norm_timestamp'] = norm_timestamp_batch.to(device)
+                else:
+                    logging.warning(f"Validation Batch {batch_idx}: 'use_clay' is True but 'norm_timestamp' not found. Skipping batch.")
+                    continue
 
             # ------ Forward pass and loss calculation ------ #
             try:
