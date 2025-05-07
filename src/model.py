@@ -13,6 +13,7 @@ from torchvision.transforms import v2
 import pandas as pd # Added for Timestamp check
 
 from src.Clay.src.module import ClayMAEModule
+from src.ingest.data_utils import determine_target_grid_size # Ensure this is available
 
 # -----------------------------------------------------------------------------
 # Pretrained Feature Extractors -----------------------------------------------
@@ -351,36 +352,65 @@ class ClayFeatureExtractor(nn.Module):
 # CNN HEADS -------------------------------------------------------------------
 # -----------------------------------------------------------------------------
 
-# --- Added SimpleCNNHead back ---
-class SimpleCNNHead(nn.Module):
-    """Simple multi-layer CNN head with optional dropout."""
-    def __init__(self, in_channels, hidden_dims, kernel_size=3, dropout=0.0):
+# --- NEW: Final Processing Module ---
+class FinalUpsamplerAndProjection(nn.Module):
+    """Upsamples features to target UHI resolution and projects to 1 channel."""
+    def __init__(self, in_channels: int, refinement_channels: int, target_h: int, target_w: int):
         super().__init__()
-        self.dropout = dropout
+        self.target_h = target_h
+        self.target_w = target_w
+        self.in_channels = in_channels # Store for logging or checks if needed
+
+        self.upsampler_conv = nn.Sequential(
+            nn.Upsample(size=(target_h, target_w), mode='bilinear', align_corners=False),
+            nn.Conv2d(in_channels, refinement_channels, kernel_size=3, padding=1, bias=False), # Bias False if BN follows
+            nn.BatchNorm2d(refinement_channels),
+            nn.ReLU(inplace=True)
+        )
+        self.final_projection = nn.Conv2d(refinement_channels, 1, kernel_size=1)
+        logging.info(f"Initialized FinalUpsamplerAndProjection: InCh={in_channels}, RefineCh={refinement_channels}, Target=({target_h},{target_w})")
+
+    def forward(self, x):
+        # x is (B, in_channels, H_from_head, W_from_head)
+        if x.shape[1] != self.in_channels:
+            logging.warning(f"FinalUpsamplerAndProjection input channel mismatch! Expected {self.in_channels}, got {x.shape[1]}. This might indicate an issue.")
+            # Attempt to proceed if dynamically possible, but this is a sign of config error.
+
+        x = self.upsampler_conv(x) # Output: (B, refinement_channels, target_h, target_w)
+        x = self.final_projection(x) # Output: (B, 1, target_h, target_w)
+        return x
+
+# --- MODIFIED: SimpleCNNHead (adapted to be a feature head) ---
+class SimpleCNNFeatureHead(nn.Module):
+    """Simple multi-layer CNN head that outputs features, not final prediction."""
+    def __init__(self, in_channels: int, hidden_dims: List[int], output_channels_head: int, kernel_size: int = 3, dropout_rate: float = 0.1):
+        super().__init__()
         
         cnn_layers = []
         current_channels = in_channels
         padding = kernel_size // 2
         for i, hidden_dim in enumerate(hidden_dims):
-            cnn_layers.append(nn.Conv2d(current_channels, hidden_dim, kernel_size=kernel_size, padding=padding))
+            cnn_layers.append(nn.Conv2d(current_channels, hidden_dim, kernel_size=kernel_size, padding=padding, bias=False))
             cnn_layers.append(nn.BatchNorm2d(hidden_dim))
             cnn_layers.append(nn.ReLU(inplace=True))
+            if dropout_rate > 0:
+                cnn_layers.append(nn.Dropout2d(p=dropout_rate))
             current_channels = hidden_dim
-        self.cnn_core = nn.Sequential(*cnn_layers)
-        self.final_bn = nn.BatchNorm2d(current_channels)
-        self.regressor = nn.Conv2d(current_channels, 1, kernel_size=1)
+        
+        # Final conv to get to output_channels_head
+        cnn_layers.append(nn.Conv2d(current_channels, output_channels_head, kernel_size=kernel_size, padding=padding, bias=False))
+        cnn_layers.append(nn.BatchNorm2d(output_channels_head))
+        cnn_layers.append(nn.ReLU(inplace=True))
+        
+        self.network = nn.Sequential(*cnn_layers)
+        self.output_channels = output_channels_head # Store for UHINetCNN to know
 
-        # Log dimensions
-        logging.info(f"SimpleCNNHead initialized: Input Ch={in_channels}, Hidden Dims={hidden_dims}, Kernel={kernel_size}, Dropout={dropout}")
-        logging.info(f"  Output Dim (before final BN/Regressor): {current_channels}")
+        logging.info(f"SimpleCNNFeatureHead initialized: InCh={in_channels}, Hidden={hidden_dims}, OutChHead={output_channels_head}")
 
     def forward(self, x):
-        x = self.cnn_core(x)
-        x = self.final_bn(x)
-        if self.dropout > 0.0 and self.training:
-            x = F.dropout(x, p=self.dropout, training=self.training)
-        x = self.regressor(x)
-        return x
+        # Input x is (B, in_channels, H_feat, W_feat)
+        # Output will be (B, output_channels_head, H_feat, W_feat) assuming padding='same' and stride=1
+        return self.network(x)
 
 # --- UNet-style Blocks ---
 class UNetConvBlock(nn.Module):
@@ -554,7 +584,6 @@ class UNetDecoderWithTargetResize(UNetDecoder):
         self.final_upsampler = nn.Sequential(
             nn.Upsample(size=(target_h, target_w), mode='bilinear', align_corners=False),
             nn.Conv2d(base_channels, base_channels, kernel_size=3, padding=1),
-            nn.BatchNorm2d(base_channels), # Added BatchNorm
             nn.ReLU(inplace=True)
         )
         
@@ -600,20 +629,31 @@ class UNetDecoderWithTargetResize(UNetDecoder):
         return x
 
 # -----------------------------------------------------------------------------
-# 5. CNN-BASED UHI NET MODEL  ----------------------------
+# 5. CNN-BASED UHI NET MODEL (MODIFIED) ---------------------------------------
 # -----------------------------------------------------------------------------
 
 class UHINetCNN(nn.Module):
     """
-    UHI Prediction CNN model with optional Clay integration.
-    Accepts ALL spatial features (weather, clay, lst, dem, dsm, indices) at a
-    common feature resolution.
+    UHI Prediction CNN model with optional Clay integration and selectable head.
     """
     def __init__(self,
-                 # --- Input Feature Config --- #
-                 feature_flags: Dict[str, bool], # To determine input channels
-                 weather_channels: int, # Number of weather channels
-                 sentinel_bands_to_load: Optional[List[str]] = None, # For composite
+                 feature_flags: Dict[str, bool],
+                 weather_channels: int,
+                 uhi_grid_resolution_m: int, 
+                 bounds: List[float],
+                 head_type: str = "unet", # "unet" or "simple_cnn"
+                 # U-Net Head Params (if head_type="unet")
+                 unet_base_channels: int = 64,
+                 unet_depth: int = 4,
+                 # SimpleCNN Head Params (if head_type="simple_cnn")
+                 simple_cnn_hidden_dims: Optional[List[int]] = None, # e.g. [128, 64]
+                 simple_cnn_output_channels: int = 32, # Output channels from SimpleCNNFeatureHead
+                 simple_cnn_kernel_size: int = 3,
+                 simple_cnn_dropout_rate: float = 0.1,
+                 # Final Processor Params
+                 final_processor_refinement_channels: int = 32, # Channels for conv in FinalUpsamplerAndProjection
+                 # Optional Sentinel Composite Bands
+                 sentinel_bands_to_load: Optional[List[str]] = None,
                  # Clay Specific (if feature_flags["use_clay"])
                  clay_model_size: Optional[str] = None,
                  clay_bands: Optional[List[str]] = None,
@@ -621,32 +661,10 @@ class UHINetCNN(nn.Module):
                  clay_gsd: Optional[int] = None,
                  freeze_backbone: bool = True,
                  clay_checkpoint_path: Optional[str] = None,
-                 clay_metadata_path: Optional[str] = None,
-                 # --- CNN Backbone Config --- #
-                 base_channels: int = 64,
-                 depth: int = 4,
-                 # --- REMOVED Elevation Branch Config --- #
-                ):
-        """
-        Initializes the UHINetCNN Model with common feature resolution.
-
-        Args:
-            feature_flags (Dict[str, bool]): Controls inclusion of input features.
-            weather_channels (int): Number of channels in the weather grid input.
-            sentinel_bands_to_load (Optional[List[str]]): Bands if using sentinel_composite.
-            clay_model_size (Optional[str]): Size of Clay model if use_clay is True.
-            clay_bands (Optional[List[str]]): Bands for Clay if use_clay is True.
-            clay_platform (Optional[str]): Platform for Clay if use_clay is True.
-            clay_gsd (Optional[int]): GSD for Clay if use_clay is True.
-            freeze_backbone (bool): Whether to freeze Clay backbone weights.
-            clay_checkpoint_path (Optional[str]): Path to Clay checkpoint if use_clay is True.
-            clay_metadata_path (Optional[str]): Path to Clay metadata if use_clay is True.
-            base_channels (int): Base number of channels for the U-Net.
-            depth (int): Depth of the U-Net.
-        """
+                 clay_metadata_path: Optional[str] = None):
         super().__init__()
         self.feature_flags = feature_flags
-        self.depth = depth
+        self.head_type = head_type.lower()
 
         # --- Clay Backbone (Optional) --- #
         self.clay_model = None
@@ -655,71 +673,67 @@ class UHINetCNN(nn.Module):
             if not all([clay_checkpoint_path, clay_metadata_path, clay_model_size, clay_bands, clay_platform, clay_gsd]):
                  raise ValueError("Missing required Clay configuration parameters when use_clay=True.")
             self.clay_model = ClayFeatureExtractor(
-            model_size=clay_model_size,
-            bands=clay_bands,
-            platform=clay_platform,
-            gsd=clay_gsd,
-                freeze_backbone=freeze_backbone,
-                checkpoint_path=clay_checkpoint_path,
-                metadata_path=clay_metadata_path,
-            )
+                model_size=clay_model_size, bands=clay_bands, platform=clay_platform, gsd=clay_gsd,
+                freeze_backbone=freeze_backbone, checkpoint_path=clay_checkpoint_path, metadata_path=clay_metadata_path)
             clay_output_channels = self.clay_model.output_channels
             logging.info(f"Initialized Clay model ({clay_model_size}), output channels: {clay_output_channels}")
 
-        # --- Calculate Input Channels for U-Net --- #
-        # Start with weather channels
-        input_channels = weather_channels
-        # Add Clay output channels (if used)
-        input_channels += clay_output_channels
-        # Add channels for other enabled static features
-        if self.feature_flags.get("use_lst", False): input_channels += 1
-        if self.feature_flags.get("use_dem", False): input_channels += 1
-        if self.feature_flags.get("use_dsm", False): input_channels += 1
-        if self.feature_flags.get("use_ndvi", False): input_channels += 1
-        if self.feature_flags.get("use_ndbi", False): input_channels += 1
-        if self.feature_flags.get("use_ndwi", False): input_channels += 1
+        # --- Calculate Input Channels for the selected Feature Head --- #
+        input_channels_to_head = weather_channels + clay_output_channels
+        if self.feature_flags.get("use_lst", False): input_channels_to_head += 1
+        if self.feature_flags.get("use_dem", False): input_channels_to_head += 1
+        if self.feature_flags.get("use_dsm", False): input_channels_to_head += 1
+        if self.feature_flags.get("use_ndvi", False): input_channels_to_head += 1
+        if self.feature_flags.get("use_ndbi", False): input_channels_to_head += 1
+        if self.feature_flags.get("use_ndwi", False): input_channels_to_head += 1
         if self.feature_flags.get("use_sentinel_composite", False) and sentinel_bands_to_load:
-            input_channels += len(sentinel_bands_to_load)
+            input_channels_to_head += len(sentinel_bands_to_load)
+        if input_channels_to_head == 0: raise ValueError("No input features for the head.")
+        logging.info(f"Total input channels for feature head: {input_channels_to_head}")
 
-        if input_channels == 0:
-             raise ValueError("No input features selected for UHINetCNN (weather, clay, static features all disabled/zero channels).")
-        logging.info(f"Total calculated input channels for U-Net: {input_channels}")
+        # --- Instantiate Selected Feature Head --- #
+        channels_from_feature_head = 0
+        if self.head_type == "unet":
+            self.feature_head = UNetDecoder(
+                in_channels=input_channels_to_head,
+                base_channels=unet_base_channels,
+                depth=unet_depth
+            )
+            channels_from_feature_head = unet_base_channels # UNetDecoder outputs `base_channels` features
+            logging.info(f"UHINetCNN using UNetDecoder head. Output channels: {channels_from_feature_head}")
+        elif self.head_type == "simple_cnn":
+            if simple_cnn_hidden_dims is None:
+                simple_cnn_hidden_dims = [max(simple_cnn_output_channels * 2, 64), simple_cnn_output_channels] # Sensible default
+            self.feature_head = SimpleCNNFeatureHead(
+                in_channels=input_channels_to_head,
+                hidden_dims=simple_cnn_hidden_dims,
+                output_channels_head=simple_cnn_output_channels,
+                kernel_size=simple_cnn_kernel_size,
+                dropout_rate=simple_cnn_dropout_rate
+            )
+            channels_from_feature_head = simple_cnn_output_channels
+            logging.info(f"UHINetCNN using SimpleCNNFeatureHead. Output channels: {channels_from_feature_head}")
+        else:
+            raise ValueError(f"Unsupported head_type: {self.head_type}. Choose 'unet' or 'simple_cnn'.")
 
-        # --- U-Net Architecture (using centralized implementation) --- #
-        self.unet_decoder = UNetDecoder(
-            in_channels=input_channels,
-            base_channels=base_channels,
-            depth=depth
+        # --- Final Processor (Upsampling and Projection) --- #
+        target_H_uhi, target_W_uhi = determine_target_grid_size(bounds, uhi_grid_resolution_m)
+        logging.info(f"UHINetCNN final processor target UHI grid: ({target_H_uhi}, {target_W_uhi})")
+        self.final_processor = FinalUpsamplerAndProjection(
+            in_channels=channels_from_feature_head,
+            refinement_channels=final_processor_refinement_channels, # New parameter
+            target_h=target_H_uhi,
+            target_w=target_W_uhi
         )
         
-        # Final 1x1 convolution
-        self.final_conv = nn.Conv2d(base_channels, 1, kernel_size=1)
-
-        logging.info(f"UHINetCNN initialized. U-Net Input Ch: {input_channels}, Base Ch: {base_channels}, Depth: {depth}")
+        logging.info(f"UHINetCNN initialized completely with {self.head_type} head.")
 
     def forward(self, weather: torch.Tensor,
-                # --- Optional Static Features (All at feature resolution) --- #
                 static_features: Optional[torch.Tensor] = None,
-                # --- Optional Clay Inputs (All at feature resolution) --- #
                 clay_mosaic: Optional[torch.Tensor] = None,
                 norm_latlon: Optional[torch.Tensor] = None,
                 norm_timestamp: Optional[torch.Tensor] = None,
                ) -> torch.Tensor:
-        """
-        Forward pass through the UHINetCNN Model.
-
-        Args:
-            weather (torch.Tensor): Weather grid (B, C_weather, H_feat, W_feat).
-            static_features (Optional[torch.Tensor]): Combined low-res static features
-                                                    (LST, DEM, DSM, Indices, Composite)
-                                                    (B, C_static_other, H_feat, W_feat).
-            clay_mosaic (Optional[torch.Tensor]): Input mosaic for Clay (B, C_clay_in, H_feat, W_feat).
-            norm_latlon (Optional[torch.Tensor]): Normalized lat/lon for Clay (B, 2, H_feat, W_feat).
-            norm_timestamp (Optional[torch.Tensor]): Normalized timestamp for Clay (B, 1).
-
-        Returns:
-            torch.Tensor: Predicted UHI grid (B, 1, H_uhi, W_uhi).
-        """
         B, _, H_feat, W_feat = weather.shape
         all_features_list = [weather]
 
@@ -755,10 +769,10 @@ class UHINetCNN(nn.Module):
         # --- Combine all features --- #
         x = torch.cat(all_features_list, dim=1)
 
-        # --- Use U-Net Decoder --- #
-        x = self.unet_decoder(x)
+        # --- Pass through selected Feature Head --- #
+        x = self.feature_head(x)
         
-        # Final convolution to get output
-        prediction = self.final_conv(x)
+        # --- Pass through Final Processor --- #
+        prediction = self.final_processor(x)
 
         return prediction
