@@ -316,6 +316,7 @@ def train_epoch_generic(model: nn.Module,
         mask = batch.get('mask')
         weather = batch.get('weather') # For CNN
         weather_seq = batch.get('weather_seq') # For Branched
+        input_temporal_seq = batch.get('input_temporal_seq') # NEW: For autoregressive Branched
         static_features = batch.get('static_features')
 
         # Clay-specific inputs
@@ -344,17 +345,23 @@ def train_epoch_generic(model: nn.Module,
         target_normalized = (target - uhi_mean) / (uhi_std + 1e-10) # Add epsilon for stability
         
         # Move other tensors if they exist
-        weather_input = None
+        weather_input = None # Keep track of the primary temporal input
         model_args = {}
-        if weather_seq is not None:
+        if input_temporal_seq is not None:
+             model_args['input_temporal_seq'] = input_temporal_seq.to(device)
+             weather_input = model_args['input_temporal_seq'] # Use this as primary
+        elif weather_seq is not None:
+             # Fallback for non-autoregressive branched?
+             logging.warning(f"Batch {batch_idx}: Found 'weather_seq' but not 'input_temporal_seq'. Using 'weather_seq'.")
              model_args['weather_seq'] = weather_seq.to(device)
-             weather_input = model_args['weather_seq'] # Prioritize seq if both somehow exist
+             weather_input = model_args['weather_seq']
         elif weather is not None:
+             # Fallback for CNN
              model_args['weather'] = weather.to(device)
              weather_input = model_args['weather']
         else:
-            logging.error(f"Batch {batch_idx}: Missing 'weather_seq' or 'weather'. Skipping batch.")
-            continue # Cannot proceed without weather input
+            logging.error(f"Batch {batch_idx}: Missing primary temporal input ('input_temporal_seq', 'weather_seq', or 'weather'). Skipping batch.")
+            continue 
             
         if static_features is not None: model_args['static_features'] = static_features.to(device)
         
@@ -369,13 +376,17 @@ def train_epoch_generic(model: nn.Module,
         # --- Forward Pass --- #
         optimizer.zero_grad()
         try:
-            pred = model(**model_args)
+            # Separate temporal sequence (positional) from other args (keyword)
+            if 'input_temporal_seq' not in model_args:
+                logging.error(f"Batch {batch_idx}: 'input_temporal_seq' missing from model_args before forward pass. Keys: {model_args.keys()}")
+                continue
+            temporal_input = model_args.pop('input_temporal_seq')
+            pred = model(temporal_input, **model_args)
         except TypeError as e:
-            logging.error(f"Model forward pass failed (TypeError) on batch {batch_idx}. Inputs: {model_args.keys()}. Error: {e}")
-            # Potentially log shapes here for debugging
+            logging.error(f"Model forward pass failed (TypeError) on batch {batch_idx}. Input Shapes - Temporal: {temporal_input.shape if 'temporal_input' in locals() else 'N/A'}, Others: { {k: v.shape for k, v in model_args.items()} }. Error: {e}")
             continue # Skip batch if forward call fails
         except Exception as e:
-            logging.error(f"Model forward pass failed (Other Error) on batch {batch_idx}. Inputs: {model_args.keys()}. Error: {e}")
+            logging.error(f"Model forward pass failed (Other Error) on batch {batch_idx}. Input Shapes - Temporal: {temporal_input.shape if 'temporal_input' in locals() else 'N/A'}, Others: { {k: v.shape for k, v in model_args.items()} }. Error: {e}")
             continue # Skip batch
 
         # --- Loss Calculation (model outputs assumed already in normalized scale) --- #
@@ -474,6 +485,7 @@ def validate_epoch_generic(model: nn.Module,
             mask = batch.get('mask')
             weather = batch.get('weather') # For CNN
             weather_seq = batch.get('weather_seq') # For Branched
+            input_temporal_seq = batch.get('input_temporal_seq') # NEW: For autoregressive Branched
             static_features = batch.get('static_features')
 
             # Clay-specific inputs
@@ -502,16 +514,20 @@ def validate_epoch_generic(model: nn.Module,
             target_normalized = (target - uhi_mean) / (uhi_std + 1e-9) # Add epsilon for stability
             
             # Move other tensors if they exist
-            weather_input = None
+            weather_input = None # Keep track of the primary temporal input
             model_args = {}
-            if weather_seq is not None:
+            if input_temporal_seq is not None:
+                 model_args['input_temporal_seq'] = input_temporal_seq.to(device)
+                 weather_input = model_args['input_temporal_seq']
+            elif weather_seq is not None:
+                 logging.warning(f"Validation Batch {batch_idx}: Found 'weather_seq' but not 'input_temporal_seq'. Using 'weather_seq'.")
                  model_args['weather_seq'] = weather_seq.to(device)
                  weather_input = model_args['weather_seq']
             elif weather is not None:
                  model_args['weather'] = weather.to(device)
                  weather_input = model_args['weather']
             else:
-                logging.warning(f"Validation Batch {batch_idx}: Missing 'weather_seq' or 'weather'. Skipping batch.")
+                logging.warning(f"Validation Batch {batch_idx}: Missing primary temporal input ('input_temporal_seq', 'weather_seq', or 'weather'). Skipping batch.")
                 continue
                 
             if static_features is not None: model_args['static_features'] = static_features.to(device)
@@ -526,7 +542,13 @@ def validate_epoch_generic(model: nn.Module,
 
             # ------ Forward pass and loss calculation ------ #
             try:
-                pred = model(**model_args)
+                # Separate temporal sequence (positional) from other args (keyword)
+                if 'input_temporal_seq' not in model_args:
+                    logging.error(f"Validation Batch {batch_idx}: 'input_temporal_seq' missing from model_args before forward pass. Keys: {model_args.keys()}")
+                    continue
+                temporal_input = model_args.pop('input_temporal_seq')
+                pred = model(temporal_input, **model_args)
+                
                 if not torch.isfinite(pred).all():
                     logging.warning(f"Validation Batch {batch_idx}: NaN or Inf detected in model predictions! Skipping.")
                     continue
@@ -538,10 +560,10 @@ def validate_epoch_generic(model: nn.Module,
                     continue
                     
             except TypeError as e:
-                logging.error(f"Validation model forward pass failed (TypeError) on batch {batch_idx}. Inputs: {model_args.keys()}. Error: {e}")
+                logging.error(f"Validation model forward pass failed (TypeError) on batch {batch_idx}. Input Shapes - Temporal: {temporal_input.shape if 'temporal_input' in locals() else 'N/A'}, Others: { {k: v.shape for k, v in model_args.items()} }. Error: {e}")
                 continue
             except Exception as e:
-                logging.error(f"Validation forward/loss failed (Other Error) on batch {batch_idx}. Inputs: {model_args.keys()}. Error: {e}")
+                logging.error(f"Validation forward/loss failed (Other Error) on batch {batch_idx}. Input Shapes - Temporal: {temporal_input.shape if 'temporal_input' in locals() else 'N/A'}, Others: { {k: v.shape for k, v in model_args.items()} }. Error: {e}")
                 continue
             
             # ------ Metrics calculation ------ #

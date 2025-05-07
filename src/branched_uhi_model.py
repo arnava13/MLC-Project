@@ -249,7 +249,7 @@ class BranchedUHIModel(nn.Module):
                  simple_cnn_dropout_rate: float = 0.1,
                  # Final Processor Params
                  final_processor_refinement_channels: int = 16, 
-                 weather_seq_length: int = 60,
+                 temporal_seq_len: int = 60,
                  sentinel_bands_to_load: Optional[List[str]] = None,
                  enabled_weather_features: Optional[List[str]] = None,
                  # --- U-Net specific dropout --- #
@@ -281,19 +281,23 @@ class BranchedUHIModel(nn.Module):
             self.enabled_weather_features = enabled_weather_features
 
         actual_weather_input_channels = calculate_actual_weather_channels(self.enabled_weather_features)
+        # ADD 1 for the autoregressive UHI channel
+        convlstm_input_dim = actual_weather_input_channels + 1 
 
         self.target_H, self.target_W = determine_target_grid_size(
             self.bounds, self.uhi_grid_resolution_m
         )
         logging.info(f"BranchedModel configured for target output UHI grid: ({self.target_H}, {self.target_W})")
 
-        # --- Weather Branch (ConvLSTM) --- (Logic remains same)
+        # --- Weather Branch (ConvLSTM) --- #
         self.conv_lstm = ConvLSTM(
-            input_dim=actual_weather_input_channels, hidden_dim=convlstm_hidden_dims,
+            input_dim=convlstm_input_dim, # USE UPDATED DIMENSION
+            hidden_dim=convlstm_hidden_dims,
             kernel_size=convlstm_kernel_sizes, num_layers=convlstm_num_layers,
             batch_first=True, bias=True, return_all_layers=True)
-        self.weather_seq_length = weather_seq_length
-        self.timestep_weights = nn.Parameter(torch.randn(self.weather_seq_length))
+        self.temporal_seq_len = temporal_seq_len
+        self.timestep_weights = nn.Parameter(torch.randn(self.temporal_seq_len))
+        logging.info(f"ConvLSTM input dimension set to {convlstm_input_dim} (Weather: {actual_weather_input_channels} + Prev UHI: 1)")
 
         # --- Static Feature Processing & Clay Backbone --- (Logic remains same)
         self.clay_model = None
@@ -388,14 +392,15 @@ class BranchedUHIModel(nn.Module):
         )
         logging.info(f"BranchedUHIModel initialized with {self.head_type} head and FinalUpsamplerAndProjection.")
 
-    def forward(self, weather_seq: torch.Tensor,
+    def forward(self, input_temporal_seq: torch.Tensor, # RENAMED from weather_seq
                 static_features: Optional[torch.Tensor] = None,
                 clay_mosaic: Optional[torch.Tensor] = None,
                 norm_latlon: Optional[torch.Tensor] = None,
                 norm_timestamp: Optional[torch.Tensor] = None,
                 ) -> torch.Tensor:
-        # --- 1. Temporal Branch (ConvLSTM) --- (Logic remains same for processing sequence)
-        layer_outputs_list, _ = self.conv_lstm(weather_seq)
+        # --- 1. Temporal Branch (ConvLSTM) --- #
+        # Input is now input_temporal_seq (B, T, C_weather+1, H, W)
+        layer_outputs_list, _ = self.conv_lstm(input_temporal_seq) # Pass the combined sequence
         temporal_feature_sequence = layer_outputs_list[-1]
         B, T_actual, C_lstm, H_feat, W_feat = temporal_feature_sequence.shape
         if self.timestep_weights.shape[0] != T_actual: raise ValueError("Timestep_weights vs T_actual mismatch")
@@ -404,7 +409,7 @@ class BranchedUHIModel(nn.Module):
         temporal_features_pooled = (temporal_feature_sequence * weights_reshaped).sum(dim=1)
         temporal_projected = self.temporal_proj(temporal_features_pooled)
 
-        # --- 2. Static Branch --- (Logic remains same for feature extraction & projection)
+        # --- 2. Static Branch --- (Feature extraction & projection)
         all_static_features_list = []
         if self.clay_model is not None:
             if clay_mosaic is None or norm_latlon is None or norm_timestamp is None: raise ValueError("Clay inputs missing")
