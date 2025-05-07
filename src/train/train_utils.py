@@ -314,14 +314,25 @@ def train_epoch_generic(model: nn.Module,
         # --- Explicit Tensor Extraction --- # 
         target = batch.get('target')
         mask = batch.get('mask')
-        weather_seq = batch.get('weather_seq')
-        weather_grid = batch.get('weather') # For CNN
+        weather = batch.get('weather') # For CNN
+        weather_seq = batch.get('weather_seq') # For Branched
         static_features = batch.get('static_features')
-        # Get Clay-specific inputs if they exist in the batch
-        cloudless_mosaic_batch = batch.get('cloudless_mosaic')
-        norm_latlon_batch = batch.get('norm_latlon')
-        norm_timestamp_batch = batch.get('norm_timestamp')
-        
+
+        # Clay-specific inputs
+        clay_mosaic_tensor = None
+        norm_latlon_tensor = None
+        norm_timestamp_tensor = None
+
+        if feature_flags.get("use_clay", False):
+            clay_mosaic_tensor = batch.get('clay_mosaic') 
+            norm_latlon_tensor = batch.get('norm_latlon')
+            norm_timestamp_tensor = batch.get('norm_timestamp')
+
+            if clay_mosaic_tensor is None or norm_latlon_tensor is None or norm_timestamp_tensor is None:
+                logging.error(f"Batch {batch_idx}: 'use_clay' is True but one or more Clay inputs ('clay_mosaic', 'norm_latlon', 'norm_timestamp') not found in batch. Skipping batch.")
+                progress_bar.set_postfix(loss=float('nan'))
+                continue # Skip this batch
+
         # --- Basic Checks and Move to Device --- # 
         if target is None or mask is None:
             logging.warning(f"Batch {batch_idx}: Missing 'target' or 'mask'. Skipping batch.")
@@ -338,8 +349,8 @@ def train_epoch_generic(model: nn.Module,
         if weather_seq is not None:
              model_args['weather_seq'] = weather_seq.to(device)
              weather_input = model_args['weather_seq'] # Prioritize seq if both somehow exist
-        elif weather_grid is not None:
-             model_args['weather'] = weather_grid.to(device)
+        elif weather is not None:
+             model_args['weather'] = weather.to(device)
              weather_input = model_args['weather']
         else:
             logging.error(f"Batch {batch_idx}: Missing 'weather_seq' or 'weather'. Skipping batch.")
@@ -347,24 +358,6 @@ def train_epoch_generic(model: nn.Module,
             
         if static_features is not None: model_args['static_features'] = static_features.to(device)
         
-        # Add Clay inputs to model_args IF use_clay is True AND inputs are in batch
-        if feature_flags.get("use_clay", False):
-            if cloudless_mosaic_batch is not None:
-                model_args['clay_mosaic'] = cloudless_mosaic_batch.to(device)
-            else:
-                logging.error(f"Batch {batch_idx}: 'use_clay' is True but 'cloudless_mosaic' not found in batch. Skipping batch.")
-                continue
-            if norm_latlon_batch is not None:
-                model_args['norm_latlon'] = norm_latlon_batch.to(device)
-            else:
-                logging.error(f"Batch {batch_idx}: 'use_clay' is True but 'norm_latlon' not found in batch. Skipping batch.")
-                continue
-            if norm_timestamp_batch is not None:
-                model_args['norm_timestamp'] = norm_timestamp_batch.to(device)
-            else:
-                logging.error(f"Batch {batch_idx}: 'use_clay' is True but 'norm_timestamp' not found in batch. Skipping batch.")
-                continue
-            
         # --- Forward Pass --- #
         optimizer.zero_grad()
         try:
@@ -469,14 +462,25 @@ def validate_epoch_generic(model: nn.Module,
             # --- Explicit Tensor Extraction --- # 
             target = batch.get('target')
             mask = batch.get('mask')
-            weather_seq = batch.get('weather_seq')
-            weather_grid = batch.get('weather') # For CNN
+            weather = batch.get('weather') # For CNN
+            weather_seq = batch.get('weather_seq') # For Branched
             static_features = batch.get('static_features')
-            # Get Clay-specific inputs if they exist in the batch
-            cloudless_mosaic_batch = batch.get('cloudless_mosaic')
-            norm_latlon_batch = batch.get('norm_latlon')
-            norm_timestamp_batch = batch.get('norm_timestamp')
-            
+
+            # Clay-specific inputs
+            clay_mosaic_tensor = None
+            norm_latlon_tensor = None
+            norm_timestamp_tensor = None
+
+            if feature_flags.get("use_clay", False):
+                clay_mosaic_tensor = batch.get('clay_mosaic') 
+                norm_latlon_tensor = batch.get('norm_latlon')
+                norm_timestamp_tensor = batch.get('norm_timestamp')
+
+                if clay_mosaic_tensor is None or norm_latlon_tensor is None or norm_timestamp_tensor is None:
+                    logging.warning(f"Epoch {desc}, Batch {batch_idx}: 'use_clay' is True but one or more Clay inputs ('clay_mosaic', 'norm_latlon', 'norm_timestamp') not found in batch. Skipping batch.")
+                    progress_bar.set_postfix(loss=float('nan')) # Or some indicator of skip
+                    continue # Skip this batch
+
             # --- Basic Checks and Move to Device --- # 
             if target is None or mask is None:
                 logging.warning(f"Validation Batch {batch_idx}: Missing 'target' or 'mask'. Skipping batch.")
@@ -493,33 +497,14 @@ def validate_epoch_generic(model: nn.Module,
             if weather_seq is not None:
                  model_args['weather_seq'] = weather_seq.to(device)
                  weather_input = model_args['weather_seq']
-            elif weather_grid is not None:
-                 model_args['weather'] = weather_grid.to(device)
+            elif weather is not None:
+                 model_args['weather'] = weather.to(device)
                  weather_input = model_args['weather']
             else:
                 logging.warning(f"Validation Batch {batch_idx}: Missing 'weather_seq' or 'weather'. Skipping batch.")
                 continue
                 
             if static_features is not None: model_args['static_features'] = static_features.to(device)
-
-            # Add Clay inputs to model_args IF use_clay is True AND inputs are in batch
-            if feature_flags.get("use_clay", False):
-                if cloudless_mosaic_batch is not None:
-                    model_args['clay_mosaic'] = cloudless_mosaic_batch.to(device)
-                else:
-                    # During validation, if clay inputs are missing but expected, log and skip.
-                    logging.warning(f"Validation Batch {batch_idx}: 'use_clay' is True but 'cloudless_mosaic' not found. Skipping batch.")
-                    continue
-                if norm_latlon_batch is not None:
-                    model_args['norm_latlon'] = norm_latlon_batch.to(device)
-                else:
-                    logging.warning(f"Validation Batch {batch_idx}: 'use_clay' is True but 'norm_latlon' not found. Skipping batch.")
-                    continue
-                if norm_timestamp_batch is not None:
-                    model_args['norm_timestamp'] = norm_timestamp_batch.to(device)
-                else:
-                    logging.warning(f"Validation Batch {batch_idx}: 'use_clay' is True but 'norm_timestamp' not found. Skipping batch.")
-                    continue
 
             # ------ Forward pass and loss calculation ------ #
             try:
