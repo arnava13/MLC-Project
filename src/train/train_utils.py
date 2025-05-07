@@ -52,27 +52,34 @@ def save_checkpoint(state: Dict[str, Any], is_best: bool, output_dir: Union[str,
     # No finally block needed as rename handles the tmp file removal implicitly on success
 
 
-def check_path(relative_path: Optional[Union[str, Path]],
-               project_root: Union[str, Path],
-               description: str,
-               should_exist: bool = True) -> Optional[Path]:
-    """Checks if a path exists relative to the project root.
-
-    Args:
-        relative_path: Path relative to project root. Can be None.
-        project_root: Absolute path to the project root.
-        description: Description of the file/directory for error messages.
-        should_exist: If True, raises FileNotFoundError if the path doesn't exist.
-
-    Returns:
-        Absolute Path object if relative_path is not None, otherwise None.
+def check_path(path_obj: Path | str, project_root: Path, description: str, should_exist: bool = True, is_absolute: bool = False) -> Path:
     """
-    if relative_path is None:
-        return None
-    project_root = Path(project_root)
-    abs_path = project_root / relative_path
+    Checks if a given path exists and returns its absolute path.
+    If is_absolute is True, path_obj is treated as already absolute or resolvable from CWD.
+    Otherwise, it's resolved relative to project_root.
+    Converts input to Path object if it's a string.
+    """
+    if not isinstance(path_obj, Path):
+        path_obj = Path(path_obj)
+
+    if is_absolute:
+        # If path_obj is already absolute, resolve() cleans it (e.g., resolves '..').
+        # If path_obj is relative but is_absolute=True, it's resolved from CWD.
+        # This is typically used when the path is constructed to be absolute already.
+        abs_path = path_obj.resolve()
+    else:
+        # This branch is for when path_obj is intended to be relative to project_root
+        abs_path = (project_root / path_obj).resolve()
+
     if should_exist and not abs_path.exists():
-        raise FileNotFoundError(f"{description} not found at {abs_path}. Ensure prerequisites are met (e.g., download_data.ipynb ran).")
+        logging.error(f"{description} not found at {abs_path}. Ensure prerequisites are met (e.g., download_data.ipynb ran or file exists).")
+        raise FileNotFoundError(f"{description} not found at {abs_path}. Ensure prerequisites are met (e.g., download_data.ipynb ran or file exists).")
+    elif not should_exist and abs_path.exists():
+        # This case is mainly for output directories or files that might be overwritten.
+        logging.info(f"{description} path: {abs_path}. It will be used. If it is an output path, it might be overwritten/appended to.")
+    elif not should_exist and not abs_path.exists():
+        logging.info(f"{description} path: {abs_path}. It does not exist yet (expected for output paths).")
+    # If should_exist is True and it exists, no message needed, just return.
     return abs_path
 
 
