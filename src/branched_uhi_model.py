@@ -50,14 +50,14 @@ class ConvLSTMCell(nn.Module):
         
         # Initialize weights using orthogonal initialization
         # This helps with gradient stability in recurrent networks
-        # nn.init.orthogonal_(self.conv.weight) # REMOVED
-        # if bias: # REMOVED
+        nn.init.orthogonal_(self.conv.weight)
+        if bias:
             # Initialize biases: forget gate bias to 1.0 (helps with learning), others to 0
-            # nn.init.zeros_(self.conv.bias) # REMOVED
+            nn.init.zeros_(self.conv.bias)
             # Set the biases for the forget gate to 1.0
             # The layout is [input_gate, forget_gate, output_gate, cell_gate]
             # Each is hidden_dim in size
-            # self.conv.bias.data[self.hidden_dim:2*self.hidden_dim].fill_(1.0) # REMOVED
+            self.conv.bias.data[self.hidden_dim:2*self.hidden_dim].fill_(1.0)
 
     def forward(self, input_tensor, cur_state):
         """
@@ -259,7 +259,8 @@ class BranchedUHIModel(nn.Module):
                  clay_gsd: Optional[int] = None,
                  freeze_backbone: bool = True,
                  clay_checkpoint_path: Optional[Union[str, Path]] = None,
-                 clay_metadata_path: Optional[Union[str, Path]] = None):
+                 clay_metadata_path: Optional[Union[str, Path]] = None,
+                 clay_proj_channels: Optional[int] = 32):
         super().__init__()
         self.feature_flags = feature_flags
         self.bounds = bounds
@@ -302,8 +303,14 @@ class BranchedUHIModel(nn.Module):
             self.clay_model = ClayFeatureExtractor(
                 model_size=clay_model_size, bands=clay_bands, platform=clay_platform, gsd=clay_gsd,
                 freeze_backbone=freeze_backbone, checkpoint_path=clay_checkpoint_path, metadata_path=clay_metadata_path)
-            clay_output_channels = self.clay_model.output_channels
-            logging.info(f"Initialized Clay model ({clay_model_size}), output channels: {clay_output_channels}")
+            clay_raw_channels = self.clay_model.output_channels
+            self.clay_proj_dim = clay_proj_channels
+            self.clay_proj = nn.Conv2d(clay_raw_channels, self.clay_proj_dim, kernel_size=1, bias=False)
+            clay_output_channels = self.clay_proj_dim
+            logging.info(f"Added Clay projection Conv1x1: {clay_raw_channels} -> {self.clay_proj_dim} channels")
+        else:
+            self.clay_model = None
+            clay_output_channels = 0
         
         dataloader_static_channels = 0
         if self.feature_flags.get("use_lst", False): dataloader_static_channels += 1
