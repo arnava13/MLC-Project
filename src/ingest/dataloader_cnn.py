@@ -26,7 +26,7 @@ from .data_utils import (
     build_weather_grid, # Weather grid building remains
     normalize_clay_timestamp, # Clay utils remain
     normalize_clay_latlon,
-    WEATHER_NORM_PARAMS, # Constant for weather normalization
+    WEATHER_VARIABLES_INFO, # Corrected import
     calculate_actual_weather_channels, # Import new helper
     resample_xarray_to_target # NEW Resampling utility
 )
