@@ -638,7 +638,6 @@ class UHINetCNN(nn.Module):
     """
     def __init__(self,
                  feature_flags: Dict[str, bool],
-                 weather_channels: int,
                  uhi_grid_resolution_m: int, 
                  bounds: List[float],
                  head_type: str = "unet", # "unet" or "simple_cnn"
