@@ -378,9 +378,18 @@ def train_epoch_generic(model: nn.Module,
             logging.error(f"Model forward pass failed (Other Error) on batch {batch_idx}. Inputs: {model_args.keys()}. Error: {e}")
             continue # Skip batch
 
+        # --- Normalize Predictions & Align Shapes --- #
+        if pred.ndim == 4 and pred.shape[1] == 1:
+            pred_squeezed = pred.squeeze(1)  # (B, H, W)
+        else:
+            pred_squeezed = pred  # Assume already (B, H, W)
+
+        # Normalize predictions to the same scale as target_normalized
+        pred_normalized = (pred_squeezed - uhi_mean) / (uhi_std + 1e-10)
+
         # --- Loss Calculation --- #
         try:
-             loss = loss_fn(pred, target_normalized, mask)
+             loss = loss_fn(pred_normalized, target_normalized, mask)
              if not torch.isfinite(loss):
                   logging.warning(f"Batch {batch_idx}: Loss is NaN/Inf ({loss.item()}). Skipping backward pass.")
                   continue
@@ -401,8 +410,9 @@ def train_epoch_generic(model: nn.Module,
 
         # ------ Metrics calculation ------ #
         with torch.no_grad(): # Ensure metrics calc doesn't affect gradients
-             pred_unnorm = pred * uhi_std + uhi_mean
-             target_unnorm = target * uhi_std + uhi_mean
+             # Use raw (unnormalized) scales for metric calculation
+             pred_unnorm = pred_squeezed
+             target_unnorm = target
              
              # Update running statistics
              total_loss += loss.item()
@@ -529,7 +539,17 @@ def validate_epoch_generic(model: nn.Module,
                     logging.warning(f"Validation Batch {batch_idx}: NaN or Inf detected in model predictions! Skipping.")
                     continue
                     
-                loss = loss_fn(pred, target_normalized, mask)
+                # --- Normalize Predictions & Align Shapes --- #
+                if pred.ndim == 4 and pred.shape[1] == 1:
+                    pred_squeezed = pred.squeeze(1)  # (B, H, W)
+                else:
+                    pred_squeezed = pred  # Assume already (B, H, W)
+
+                # Normalize predictions to the same scale as target_normalized
+                pred_normalized = (pred_squeezed - uhi_mean) / (uhi_std + 1e-10)
+
+                # --- Loss Calculation --- #
+                loss = loss_fn(pred_normalized, target_normalized, mask)
                 if not torch.isfinite(loss):
                     logging.warning(f"Validation Batch {batch_idx}: Loss is NaN/Inf ({loss.item()})! Skipping.")
                     continue
@@ -542,8 +562,9 @@ def validate_epoch_generic(model: nn.Module,
                 continue
             
             # ------ Metrics calculation ------ #
-            pred_unnorm = pred * uhi_std + uhi_mean
-            target_unnorm = target * uhi_std + uhi_mean
+            # Use raw (unnormalized) scales for metric calculation
+            pred_unnorm = pred_squeezed
+            target_unnorm = target
             
             # Update running statistics
             total_loss += loss.item()
