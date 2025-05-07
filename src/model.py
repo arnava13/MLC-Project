@@ -352,7 +352,6 @@ class ClayFeatureExtractor(nn.Module):
 # CNN HEADS -------------------------------------------------------------------
 # -----------------------------------------------------------------------------
 
-# --- NEW: Final Processing Module ---
 class FinalUpsamplerAndProjection(nn.Module):
     """Upsamples features to target UHI resolution and projects to 1 channel."""
     def __init__(self, in_channels: int, refinement_channels: int, target_h: int, target_w: int):
@@ -361,14 +360,8 @@ class FinalUpsamplerAndProjection(nn.Module):
         self.target_w = target_w
         self.in_channels = in_channels # Store for logging or checks if needed
 
-        self.upsampler_conv = nn.Sequential(
-            nn.Upsample(size=(target_h, target_w), mode='bilinear', align_corners=False),
-            nn.Conv2d(in_channels, refinement_channels, kernel_size=3, padding=1, bias=False), # Bias False if BN follows
-            nn.BatchNorm2d(refinement_channels),
-            nn.ReLU(inplace=True)
-        )
-        self.final_projection = nn.Conv2d(refinement_channels, 1, kernel_size=1)
-        logging.info(f"Initialized FinalUpsamplerAndProjection: InCh={in_channels}, RefineCh={refinement_channels}, Target=({target_h},{target_w})")
+        self.final_projection = nn.Conv2d(in_channels, 1, kernel_size=1) # Takes in_channels directly
+        logging.info(f"Initialized FinalUpsamplerAndProjection: Bicubic upsampling. InCh={in_channels}, Target=({target_h},{target_w}).")
 
     def forward(self, x):
         # x is (B, in_channels, H_from_head, W_from_head)
@@ -376,7 +369,10 @@ class FinalUpsamplerAndProjection(nn.Module):
             logging.warning(f"FinalUpsamplerAndProjection input channel mismatch! Expected {self.in_channels}, got {x.shape[1]}. This might indicate an issue.")
             # Attempt to proceed if dynamically possible, but this is a sign of config error.
 
-        x = self.upsampler_conv(x) # Output: (B, refinement_channels, target_h, target_w)
+        # Apply simple bicubic interpolation to target size
+        x = F.interpolate(x, size=(self.target_h, self.target_w), mode='bicubic', align_corners=False)
+        # Output: (B, in_channels, target_h, target_w)
+
         x = self.final_projection(x) # Output: (B, 1, target_h, target_w)
         return x
 
