@@ -415,7 +415,7 @@ class BranchedUHIModel(nn.Module):
             if clay_mosaic is None or norm_latlon is None or norm_timestamp is None: raise ValueError("Clay inputs missing")
             clay_features_raw = self.clay_model(clay_mosaic, norm_latlon, norm_timestamp)
             if clay_features_raw.shape[-2:] != (H_feat, W_feat):
-                clay_features_raw = F.interpolate(clay_features_raw, size=(H_feat, W_feat), mode='bilinear', align_corners=False)
+                clay_features_raw = F.interpolate(clay_features_raw, size=(H_feat, W_feat), mode='bicubic', align_corners=False)
             # Apply BatchNorm before adding to features list
             clay_features_normalized = self.clay_bn(clay_features_raw)
             # Apply 1x1 projection after normalization

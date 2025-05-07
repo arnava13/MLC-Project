@@ -345,22 +345,28 @@ def train_epoch_generic(model: nn.Module,
         target_normalized = (target - uhi_mean) / (uhi_std + 1e-10) # Add epsilon for stability
         
         # Move other tensors if they exist
-        weather_input = None # Keep track of the primary temporal input
+        temporal_input = None # Keep track of the primary temporal input
         model_args = {}
-        if input_temporal_seq is not None:
-             model_args['input_temporal_seq'] = input_temporal_seq.to(device)
-             weather_input = model_args['input_temporal_seq'] # Use this as primary
-        elif weather_seq is not None:
-             # Fallback for non-autoregressive branched?
-             logging.warning(f"Batch {batch_idx}: Found 'weather_seq' but not 'input_temporal_seq'. Using 'weather_seq'.")
-             model_args['weather_seq'] = weather_seq.to(device)
-             weather_input = model_args['weather_seq']
-        elif weather is not None:
-             # Fallback for CNN
-             model_args['weather'] = weather.to(device)
-             weather_input = model_args['weather']
+        # Get the combined sequence first
+        raw_input_temporal_seq = batch.get('input_temporal_seq')
+        
+        if raw_input_temporal_seq is not None:
+            raw_input_temporal_seq = raw_input_temporal_seq.to(device)
+            # Separate weather channels and previous UHI channel
+            # Assumes UHI channel is the LAST channel (index -1)
+            weather_channels = raw_input_temporal_seq[:, :, :-1, :, :] # (B, T, C_weather, H, W)
+            prev_uhi_channel_unnorm = raw_input_temporal_seq[:, :, -1:, :, :] # (B, T, 1, H, W)
+            
+            # Normalize the previous UHI channel
+            prev_uhi_channel_norm = (prev_uhi_channel_unnorm - uhi_mean) / (uhi_std + 1e-10)
+            
+            # Recombine into the final input sequence
+            input_temporal_seq_processed = torch.cat([weather_channels, prev_uhi_channel_norm], dim=2)
+            
+            model_args['input_temporal_seq'] = input_temporal_seq_processed
+            temporal_input = model_args['input_temporal_seq'] # For model call later
         else:
-            logging.error(f"Batch {batch_idx}: Missing primary temporal input ('input_temporal_seq', 'weather_seq', or 'weather'). Skipping batch.")
+            logging.error(f"Batch {batch_idx}: Missing primary temporal input ('input_temporal_seq'). Skipping batch.")
             continue 
             
         if static_features is not None: model_args['static_features'] = static_features.to(device)
@@ -514,20 +520,28 @@ def validate_epoch_generic(model: nn.Module,
             target_normalized = (target - uhi_mean) / (uhi_std + 1e-9) # Add epsilon for stability
             
             # Move other tensors if they exist
-            weather_input = None # Keep track of the primary temporal input
+            temporal_input = None # Keep track of the primary temporal input
             model_args = {}
-            if input_temporal_seq is not None:
-                 model_args['input_temporal_seq'] = input_temporal_seq.to(device)
-                 weather_input = model_args['input_temporal_seq']
-            elif weather_seq is not None:
-                 logging.warning(f"Validation Batch {batch_idx}: Found 'weather_seq' but not 'input_temporal_seq'. Using 'weather_seq'.")
-                 model_args['weather_seq'] = weather_seq.to(device)
-                 weather_input = model_args['weather_seq']
-            elif weather is not None:
-                 model_args['weather'] = weather.to(device)
-                 weather_input = model_args['weather']
+            # Get the combined sequence first
+            raw_input_temporal_seq = batch.get('input_temporal_seq')
+            
+            if raw_input_temporal_seq is not None:
+                raw_input_temporal_seq = raw_input_temporal_seq.to(device)
+                # Separate weather channels and previous UHI channel
+                # Assumes UHI channel is the LAST channel (index -1)
+                weather_channels = raw_input_temporal_seq[:, :, :-1, :, :] # (B, T, C_weather, H, W)
+                prev_uhi_channel_unnorm = raw_input_temporal_seq[:, :, -1:, :, :] # (B, T, 1, H, W)
+                
+                # Normalize the previous UHI channel
+                prev_uhi_channel_norm = (prev_uhi_channel_unnorm - uhi_mean) / (uhi_std + 1e-10)
+                
+                # Recombine into the final input sequence
+                input_temporal_seq_processed = torch.cat([weather_channels, prev_uhi_channel_norm], dim=2)
+                
+                model_args['input_temporal_seq'] = input_temporal_seq_processed
+                temporal_input = model_args['input_temporal_seq']
             else:
-                logging.warning(f"Validation Batch {batch_idx}: Missing primary temporal input ('input_temporal_seq', 'weather_seq', or 'weather'). Skipping batch.")
+                logging.error(f"Validation Batch {batch_idx}: Missing primary temporal input ('input_temporal_seq'). Skipping batch.")
                 continue
                 
             if static_features is not None: model_args['static_features'] = static_features.to(device)

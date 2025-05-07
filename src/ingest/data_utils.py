@@ -246,9 +246,9 @@ def load_process_elevation(
                 # Ensure final shape is correct (just in case reprojection slightly off)
                 if normalized_grid.shape != (target_H, target_W):
                     logging.warning(f"Resizing {data_source_name} from {normalized_grid.shape} to {(target_H, target_W)} post-reprojection.")
-                    # Use zoom for resizing - order=1 (bilinear) is usually reasonable
+                    # Use zoom for resizing
                     zoom_factors = (target_H / normalized_grid.shape[0], target_W / normalized_grid.shape[1])
-                    final_grid = zoom(normalized_grid, zoom=zoom_factors, order=1)
+                    final_grid = zoom(normalized_grid, zoom=zoom_factors, order=1, mode='bicubic')
                 else:
                     final_grid = normalized_grid
 

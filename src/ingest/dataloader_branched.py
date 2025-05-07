@@ -417,10 +417,17 @@ class CityDataSetBranched(Dataset):
                 prev_uhi_resampled_tensor = torch.nn.functional.interpolate(
                     prev_uhi_tensor,
                     size=(self.feat_H, self.feat_W),
-                    mode='bilinear',
+                    mode='bicubic',
                     align_corners=False
                 )
+                # Normalize the resampled previous UHI using train stats (fetched in training script)
+                # Note: uhi_mean and uhi_std are not directly available here.
+                # This normalization should ideally happen *after* loading in the training loop
+                # or the stats need to be passed to the Dataset.
+                # FOR NOW: We will apply normalization later, just prepare the raw resampled grid.
                 prev_uhi_at_feat_res = prev_uhi_resampled_tensor.squeeze(0).numpy() # Back to (1, H_feat, W_feat)
+                # Handle potential NaNs introduced by resampling (fill with 0, assuming 0 anomaly is neutral)
+                prev_uhi_at_feat_res = np.nan_to_num(prev_uhi_at_feat_res, nan=0.0) 
             else:
                 logging.warning(f"Could not find previous UHI grid for timestamp {previous_timestamp} at index {idx-1}. Using zeros.")
         else:

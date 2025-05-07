@@ -102,7 +102,8 @@ def train_epoch(model, dataloader, optimizer, loss_fn, device):
 
             # Resize prediction to target size if needed
             if prediction.shape[2:] != target.shape[1:]:
-                 prediction_resized = F.interpolate(prediction, size=target.shape[1:], mode='bilinear', align_corners=False)
+                 logging.warning(f"Prediction shape {prediction.shape} does not match target shape {target.shape}. Resizing prediction.")
+                 prediction_resized = F.interpolate(prediction, size=target.shape[1:], mode='bicubic', align_corners=False)
             else:
                  prediction_resized = prediction
                  

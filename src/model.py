@@ -274,7 +274,7 @@ class ClayFeatureExtractor(nn.Module):
         pixels_resized = F.interpolate(
             sentinel_mosaic.float(), 
             size=self.target_input_size, 
-            mode='bilinear', 
+            mode='bicubic', 
             align_corners=False
         )
         B, C, H_resized, W_resized = pixels_resized.shape # Get resized dimensions
@@ -503,7 +503,7 @@ class UNetUpBlock(nn.Module):
                 # Indicates a potential issue earlier in the network.
                 # Fallback: Resize x2 to match x1 using interpolation.
                 logging.warning(f"Mixed size mismatch in UNetUpBlock (x1={x1.shape}, x2={x2.shape}). Resizing x2.")
-                x2 = F.interpolate(x2, size=(target_h, target_w), mode='bilinear', align_corners=False)
+                x2 = F.interpolate(x2, size=(target_h, target_w), mode='bicubic', align_corners=False)
 
         # Now x1 and x2 *should* have matching spatial dimensions (target_h, target_w)
         # Add a final assertion for safety during development/debugging
@@ -578,7 +578,7 @@ class UNetDecoderWithTargetResize(UNetDecoder):
         # Lightweight learnable upsampling stage to reach the final target size
         # Takes the output of the main U-Net decoder (base_channels)
         self.final_upsampler = nn.Sequential(
-            nn.Upsample(size=(target_h, target_w), mode='bilinear', align_corners=False),
+            nn.Upsample(size=(target_h, target_w), mode='bicubic', align_corners=False),
             nn.Conv2d(base_channels, base_channels, kernel_size=3, padding=1),
             nn.ReLU(inplace=True)
         )
@@ -620,7 +620,7 @@ class UNetDecoderWithTargetResize(UNetDecoder):
              # This should ideally not happen with the explicit nn.Upsample
              logging.warning(f"Output size {h}x{w} STILL mismatch target {self.target_h}x{self.target_w} after final upsampler! Check architecture.")
              # Fallback resize just in case
-             x = F.interpolate(x, size=(self.target_h, self.target_w), mode='bilinear', align_corners=False)
+             x = F.interpolate(x, size=(self.target_h, self.target_w), mode='bicubic', align_corners=False)
 
         return x
 
@@ -799,7 +799,7 @@ class UHINetCNN(nn.Module):
                 clay_features_interpolated = F.interpolate(
                     clay_features_raw,
                     size=(H_feat, W_feat),
-                    mode='bilinear',
+                    mode='bicubic',
                     align_corners=False
                 )
                 # Apply BatchNorm before projection
