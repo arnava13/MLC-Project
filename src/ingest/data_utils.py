@@ -26,7 +26,7 @@ WEATHER_VARIABLES_INFO = {
     'rel_humidity': {'channels': 1, 'norm_params': {'min': 0.0, 'max': 100.0}}, # Percentage
     'avg_windspeed': {'channels': 1, 'norm_params': {'min': 0.0, 'max': 30.0}}, # m/s
     'solar_flux': {'channels': 1, 'norm_params': {'min': 0.0, 'max': 1100.0}}, # W/m^2
-    'wind_dir': {'channels': 2, 'norm_params': {'min': 0.0, 'max': 360.0}} # Degrees, becomes sin/cos
+    'wind_direction': {'channels': 2, 'norm_params': {'min': 0.0, 'max': 360.0}} # Degrees, becomes sin/cos
 }
 
 # Order in which channels will be stacked if all are enabled.
@@ -35,8 +35,8 @@ CANONICAL_WEATHER_FEATURE_ORDER = [
     'air_temp',       # Channel 0
     'rel_humidity',   # Channel 1
     'avg_windspeed',  # Channel 2
-    'wind_dir_sin',   # Channel 3 (derived from wind_dir)
-    'wind_dir_cos',   # Channel 4 (derived from wind_dir)
+    'wind_direction_sin',   # Channel 3 (derived from wind_direction)
+    'wind_direction_cos',   # Channel 4 (derived from wind_direction)
     'solar_flux'      # Channel 5
 ]
 
@@ -363,10 +363,10 @@ def get_closest_weather_data(timestamp: pd.Timestamp,
     manhattan_data = manhattan_weather.loc[manhattan_idx]
 
     # weather_vars = ['air_temp', 'rel_humidity', 'avg_windspeed', 'wind_direction', 'solar_flux']
-    # Use only enabled features that are base variables (wind_dir_sin/cos handled separately)
-    relevant_vars_for_lookup = [f for f in enabled_weather_features if f in WEATHER_VARIABLES_INFO and f != 'wind_dir']
-    if 'wind_dir' in enabled_weather_features:
-        relevant_vars_for_lookup.append('wind_dir') # Ensure original wind_dir is fetched if selected
+    # Use only enabled features that are base variables (wind_direction_sin/cos handled separately)
+    relevant_vars_for_lookup = [f for f in enabled_weather_features if f in WEATHER_VARIABLES_INFO and f != 'wind_direction']
+    if 'wind_direction' in enabled_weather_features:
+        relevant_vars_for_lookup.append('wind_direction') # Ensure original wind_direction is fetched if selected
 
     return {
         'bronx': {var: bronx_data[var] for var in relevant_vars_for_lookup if var in bronx_data},
@@ -442,17 +442,17 @@ def build_weather_grid(timestamp: pd.Timestamp,
 
     current_channel_idx = 0
     for feature_name in CANONICAL_WEATHER_FEATURE_ORDER:
-        if feature_name == 'wind_dir_sin' or feature_name == 'wind_dir_cos':
-            if 'wind_dir' not in enabled_weather_features:
-                continue # Skip sin/cos if base wind_dir is not enabled
+        if feature_name == 'wind_direction_sin' or feature_name == 'wind_direction_cos':
+            if 'wind_direction' not in enabled_weather_features:
+                continue # Skip sin/cos if base wind_direction is not enabled
             # Wind direction (handled as a pair)
-            if 'wind_dir' not in bronx_raw or 'wind_dir' not in manhattan_raw:
-                logging.warning(f"Base 'wind_dir' data missing for {timestamp} at one or both stations. Wind components will be zero.")
+            if 'wind_direction' not in bronx_raw or 'wind_direction' not in manhattan_raw:
+                logging.warning(f"Base 'wind_direction' data missing for {timestamp} at one or both stations. Wind components will be zero.")
                 # weather_grid[current_channel_idx] remains zero
                 # weather_grid[current_channel_idx+1] remains zero
             else:
-                wd_bronx_rad = np.deg2rad(bronx_raw['wind_dir'])
-                wd_manhattan_rad = np.deg2rad(manhattan_raw['wind_dir'])
+                wd_bronx_rad = np.deg2rad(bronx_raw['wind_direction'])
+                wd_manhattan_rad = np.deg2rad(manhattan_raw['wind_direction'])
                 sin_bronx, cos_bronx = np.sin(wd_bronx_rad), np.cos(wd_bronx_rad)
                 sin_manhattan, cos_manhattan = np.sin(wd_manhattan_rad), np.cos(wd_manhattan_rad)
                 interp_sin = sin_bronx * norm_weight_bronx + sin_manhattan * norm_weight_manhattan
@@ -460,9 +460,9 @@ def build_weather_grid(timestamp: pd.Timestamp,
                 length = np.sqrt(interp_sin**2 + interp_cos**2 + epsilon)
                 valid_length = length > epsilon
                 
-                if feature_name == 'wind_dir_sin':
+                if feature_name == 'wind_direction_sin':
                     weather_grid[current_channel_idx][valid_length] = interp_sin[valid_length] / length[valid_length]
-                elif feature_name == 'wind_dir_cos':
+                elif feature_name == 'wind_direction_cos':
                     weather_grid[current_channel_idx][valid_length] = interp_cos[valid_length] / length[valid_length]
             current_channel_idx +=1
 
