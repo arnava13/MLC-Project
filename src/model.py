@@ -427,18 +427,18 @@ class UNetConvBlock(nn.Module):
         
         # Use better weight initialization (Kaiming/He initialization)
         # This helps with gradient flow in deep networks
-        nn.init.kaiming_normal_(self.conv1.weight, mode='fan_out', nonlinearity='relu')
-        nn.init.kaiming_normal_(self.conv2.weight, mode='fan_out', nonlinearity='relu')
-        if self.conv1.bias is not None:
-            nn.init.zeros_(self.conv1.bias)
-        if self.conv2.bias is not None:
-            nn.init.zeros_(self.conv2.bias)
+        # nn.init.kaiming_normal_(self.conv1.weight, mode='fan_out', nonlinearity='relu') # REMOVED
+        # nn.init.kaiming_normal_(self.conv2.weight, mode='fan_out', nonlinearity='relu') # REMOVED
+        # if self.conv1.bias is not None: # REMOVED
+        #     nn.init.zeros_(self.conv1.bias) # REMOVED
+        # if self.conv2.bias is not None: # REMOVED
+        #     nn.init.zeros_(self.conv2.bias) # REMOVED
             
         # Initialize batch norm to be identity function initially
-        nn.init.constant_(self.bn1.weight, 1.0)
-        nn.init.constant_(self.bn2.weight, 1.0)
-        nn.init.constant_(self.bn1.bias, 0.0)
-        nn.init.constant_(self.bn2.bias, 0.0)
+        # nn.init.constant_(self.bn1.weight, 1.0) # REMOVED
+        # nn.init.constant_(self.bn2.weight, 1.0) # REMOVED
+        # nn.init.constant_(self.bn1.bias, 0.0) # REMOVED
+        # nn.init.constant_(self.bn2.bias, 0.0) # REMOVED
 
     def forward(self, x):
         x = self.conv1(x)

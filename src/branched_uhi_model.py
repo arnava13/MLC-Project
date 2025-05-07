@@ -50,14 +50,14 @@ class ConvLSTMCell(nn.Module):
         
         # Initialize weights using orthogonal initialization
         # This helps with gradient stability in recurrent networks
-        nn.init.orthogonal_(self.conv.weight)
-        if bias:
+        # nn.init.orthogonal_(self.conv.weight) # REMOVED
+        # if bias: # REMOVED
             # Initialize biases: forget gate bias to 1.0 (helps with learning), others to 0
-            nn.init.zeros_(self.conv.bias)
+            # nn.init.zeros_(self.conv.bias) # REMOVED
             # Set the biases for the forget gate to 1.0
             # The layout is [input_gate, forget_gate, output_gate, cell_gate]
             # Each is hidden_dim in size
-            self.conv.bias.data[self.hidden_dim:2*self.hidden_dim].fill_(1.0)
+            # self.conv.bias.data[self.hidden_dim:2*self.hidden_dim].fill_(1.0) # REMOVED
 
     def forward(self, input_tensor, cur_state):
         """
