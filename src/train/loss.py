@@ -20,7 +20,7 @@ def masked_mae_loss(pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor
         # Return a differentiable zero loss if no valid pixels in batch
         return torch.tensor(0.0, device=pred.device, requires_grad=True)
 
-    loss = torch.abs(pred_valid - target_valid).sum()
+    loss = torch.abs(pred_valid - target_valid).mean()
     return loss
 
 def masked_mse_loss(pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
@@ -34,5 +34,5 @@ def masked_mse_loss(pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor
     if num_valid == 0:
         return torch.tensor(0.0, device=pred.device, requires_grad=True)
 
-    loss = torch.pow(pred_valid - target_valid, 2).sum()
+    loss = torch.pow(pred_valid - target_valid, 2).mean()
     return loss 
