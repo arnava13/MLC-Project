@@ -27,6 +27,7 @@ from .data_utils import (
     normalize_clay_timestamp, # Clay utils remain
     normalize_clay_latlon,
     WEATHER_NORM_PARAMS, # Constant for weather normalization
+    calculate_actual_weather_channels, # Import new helper
     resample_xarray_to_target # NEW Resampling utility
 )
 # ------------------------------ #
@@ -58,6 +59,7 @@ class CityDataSet(Dataset):
                  data_dir: str, city_name: str,
                  # --- Feature Flags & Paths --- #
                  feature_flags: Dict[str, bool],
+                 enabled_weather_features: List[str], # NEW
                  sentinel_bands_to_load: List[str],
                  dem_path: Optional[str] = None,
                  dsm_path: Optional[str] = None,
@@ -81,6 +83,7 @@ class CityDataSet(Dataset):
             data_dir: Base directory for stored data.
             city_name: Name of the city.
             feature_flags (Dict[str, bool]): Controls feature inclusion (use_dem, use_dsm, use_clay, ...).
+            enabled_weather_features (List[str]): Specific weather features to load and process.
             sentinel_bands_to_load (List[str]): Bands to load if sentinel_composite used.
             dem_path (Optional[str]): Path to DEM GeoTIFF file.
             dsm_path (Optional[str]): Path to DSM GeoTIFF file.
@@ -101,7 +104,9 @@ class CityDataSet(Dataset):
         self.target_crs = rasterio.crs.CRS.from_string(self.target_crs_str)
         self.elevation_nodata = elevation_nodata
         self.lst_nodata = lst_nodata
-        # CNN Model doesn't use weather sequences, only target timestamp weather
+        self.enabled_weather_features = enabled_weather_features # STORED
+        self.actual_weather_channels = calculate_actual_weather_channels(self.enabled_weather_features)
+        logging.info(f"Dataloader will produce {self.actual_weather_channels} weather channels based on enabled features: {self.enabled_weather_features}")
 
         self.feature_flags = feature_flags
         self.selected_mosaic_bands = sentinel_bands_to_load
@@ -325,16 +330,12 @@ class CityDataSet(Dataset):
             manhattan_coords=self.manhattan_coords,
             grid_coords=self.weather_grid_coords, # Use feature res coords
             sat_H=self.feat_H, # Use feature res dimensions
-            sat_W=self.feat_W
+            sat_W=self.feat_W,
+            enabled_weather_features=self.enabled_weather_features # PASS TO GRID BUILDER
         )
-        if weather_grid_feat_res is None:
-            # This might happen if weather data is missing for the exact timestamp
-            # Handle this case, e.g., by logging and returning a zero grid or raising an error
-            logging.error(f"Failed to build weather grid for {target_timestamp}. Weather data might be missing.")
-            # Option 1: Raise error
-            # raise RuntimeError(f"Failed to build weather grid for {target_timestamp}")
-            # Option 2: Return a zero grid (ensure dimensions match)
-            weather_grid_feat_res = np.zeros((6, self.feat_H, self.feat_W), dtype=np.float32) # Assuming 6 weather channels
+        if weather_grid_feat_res is None or weather_grid_feat_res.shape[0] != self.actual_weather_channels:
+            logging.error(f"Failed to build weather grid correctly for {target_timestamp}. Expected {self.actual_weather_channels} channels, got {weather_grid_feat_res.shape[0] if weather_grid_feat_res is not None else 'None'}.")
+            weather_grid_feat_res = np.zeros((self.actual_weather_channels, self.feat_H, self.feat_W), dtype=np.float32)
 
         # --- Prepare Static Features (resampled to FEATURE resolution) --- #
         static_features_list = [] # For non-Clay, non-Elev features

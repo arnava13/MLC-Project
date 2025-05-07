@@ -27,7 +27,8 @@ from .data_utils import (
     normalize_clay_timestamp, # Clay utils remain
     normalize_clay_latlon,
     WEATHER_NORM_PARAMS, # Constant for weather normalization
-    resample_xarray_to_target # NEW Resampling utility
+    resample_xarray_to_target, # NEW Resampling utility
+    calculate_actual_weather_channels, # Import new helper
 )
 # ------------------------------ #
 
@@ -58,6 +59,7 @@ class CityDataSetBranched(Dataset):
                  data_dir: str, city_name: str,
                  # --- Feature Flags & Paths --- #
                  feature_flags: Dict[str, bool],
+                 enabled_weather_features: List[str], # NEW
                  sentinel_bands_to_load: List[str],
                  dem_path: Optional[str] = None,
                  dsm_path: Optional[str] = None,
@@ -82,6 +84,7 @@ class CityDataSetBranched(Dataset):
             data_dir: Base directory for stored data.
             city_name: Name of the city.
             feature_flags (Dict[str, bool]): Controls feature inclusion (use_dem, use_dsm, use_clay, ...).
+            enabled_weather_features (List[str]): Specific weather features to load and process.
             sentinel_bands_to_load (List[str]): Bands to load if sentinel_composite used.
             dem_path (Optional[str]): Path to DEM GeoTIFF file.
             dsm_path (Optional[str]): Path to DSM GeoTIFF file.
@@ -104,6 +107,9 @@ class CityDataSetBranched(Dataset):
         self.elevation_nodata = elevation_nodata
         self.lst_nodata = lst_nodata
         self.weather_seq_length = weather_seq_length
+        self.enabled_weather_features = enabled_weather_features # STORED
+        self.actual_weather_channels = calculate_actual_weather_channels(self.enabled_weather_features)
+        logging.info(f"Dataloader will produce {self.actual_weather_channels} weather channels based on enabled features: {self.enabled_weather_features}")
 
         self.feature_flags = feature_flags
         self.selected_mosaic_bands = sentinel_bands_to_load
@@ -341,10 +347,15 @@ class CityDataSetBranched(Dataset):
                 manhattan_weather=self.manhattan_weather,
                 bronx_coords=self.bronx_coords,
                 manhattan_coords=self.manhattan_coords,
-                grid_coords=self.weather_grid_coords_for_build, # MODIFIED: Use correct grid coords
-                sat_H=self.feat_H, # Use feature grid dimensions
-                sat_W=self.feat_W
+                grid_coords=self.weather_grid_coords_for_build, 
+                sat_H=self.feat_H, 
+                sat_W=self.feat_W,
+                enabled_weather_features=self.enabled_weather_features # PASS TO GRID BUILDER
             )
+            if weather_grid_ts is None or weather_grid_ts.shape[0] != self.actual_weather_channels:
+                logging.error(f"Failed to build weather grid correctly for {ts} in sequence. Expected {self.actual_weather_channels} channels, got {weather_grid_ts.shape[0] if weather_grid_ts is not None else 'None'}.")
+                weather_grid_ts = np.zeros((self.actual_weather_channels, self.feat_H, self.feat_W), dtype=np.float32)
+
             weather_sequence_list.append(weather_grid_ts)
 
         # Pad if sequence is shorter

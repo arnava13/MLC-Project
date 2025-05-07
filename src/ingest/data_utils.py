@@ -20,14 +20,36 @@ import xarray as xr
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-# --- Weather Normalization Constants --- #
-WEATHER_NORM_PARAMS = {
-    'air_temp': {'min': -15.0, 'max': 40.0},     # Celsius
-    'rel_humidity': {'min': 0.0, 'max': 100.0},  # Percentage
-    'avg_windspeed': {'min': 0.0, 'max': 30.0},  # m/s
-    'solar_flux': {'min': 0.0, 'max': 1100.0}, # W/m^2
-    'wind_direction': {'min': 0.0, 'max': 360.0} # Degrees (for potential direct interpolation before sin/cos)
+# --- Weather Normalization Constants & Feature Definitions --- #
+WEATHER_VARIABLES_INFO = {
+    'air_temp': {'channels': 1, 'norm_params': {'min': -15.0, 'max': 40.0}}, # Celsius
+    'rel_humidity': {'channels': 1, 'norm_params': {'min': 0.0, 'max': 100.0}}, # Percentage
+    'avg_windspeed': {'channels': 1, 'norm_params': {'min': 0.0, 'max': 30.0}}, # m/s
+    'solar_flux': {'channels': 1, 'norm_params': {'min': 0.0, 'max': 1100.0}}, # W/m^2
+    'wind_dir': {'channels': 2, 'norm_params': {'min': 0.0, 'max': 360.0}} # Degrees, becomes sin/cos
 }
+
+# Order in which channels will be stacked if all are enabled.
+# This defines the canonical order for indexing in build_weather_grid.
+CANONICAL_WEATHER_FEATURE_ORDER = [
+    'air_temp',       # Channel 0
+    'rel_humidity',   # Channel 1
+    'avg_windspeed',  # Channel 2
+    'wind_dir_sin',   # Channel 3 (derived from wind_dir)
+    'wind_dir_cos',   # Channel 4 (derived from wind_dir)
+    'solar_flux'      # Channel 5
+]
+
+def calculate_actual_weather_channels(enabled_features: List[str]) -> int:
+    """Calculates the number of grid channels based on enabled weather features."""
+    count = 0
+    for feature_name in enabled_features:
+        if feature_name not in WEATHER_VARIABLES_INFO:
+            # This case should ideally be caught by config validation earlier
+            logging.warning(f"Weather feature '{feature_name}' not recognized in WEATHER_VARIABLES_INFO. Skipping.")
+            continue
+        count += WEATHER_VARIABLES_INFO[feature_name]['channels']
+    return count
 
 # --- Grid/Coordinate Utilities --- #
 
@@ -305,7 +327,7 @@ def normalize_lst(lst_tensor: Optional[np.ndarray], sat_H: int, sat_W: int) -> n
 
 def normalize_min_max(value: float | np.ndarray, var_name: str) -> float | np.ndarray:
     """Normalizes a weather variable using pre-defined min/max values."""
-    params = WEATHER_NORM_PARAMS.get(var_name)
+    params = WEATHER_VARIABLES_INFO.get(var_name)
     if not params:
         return value # No normalization defined
     min_val, max_val = params['min'], params['max']
@@ -318,9 +340,11 @@ def normalize_min_max(value: float | np.ndarray, var_name: str) -> float | np.nd
 
 def get_closest_weather_data(timestamp: pd.Timestamp,
                              bronx_weather: pd.DataFrame,
-                             manhattan_weather: pd.DataFrame) -> Dict[str, Dict[str, float]]:
+                             manhattan_weather: pd.DataFrame,
+                             enabled_weather_features: List[str]) -> Dict[str, Dict[str, float]]:
     """
-    Finds closest weather data from Bronx and Manhattan stations for a given timestamp.
+    Finds closest weather data from Bronx and Manhattan stations for a given timestamp,
+    considering only enabled features.
     """
     # Ensure weather dataframes have datetime index or column named 'datetime'
     if not isinstance(bronx_weather.index, pd.DatetimeIndex) and 'datetime' not in bronx_weather.columns:
@@ -338,11 +362,15 @@ def get_closest_weather_data(timestamp: pd.Timestamp,
     bronx_data = bronx_weather.loc[bronx_idx]
     manhattan_data = manhattan_weather.loc[manhattan_idx]
 
-    weather_vars = ['air_temp', 'rel_humidity', 'avg_windspeed', 'wind_direction', 'solar_flux']
+    # weather_vars = ['air_temp', 'rel_humidity', 'avg_windspeed', 'wind_direction', 'solar_flux']
+    # Use only enabled features that are base variables (wind_dir_sin/cos handled separately)
+    relevant_vars_for_lookup = [f for f in enabled_weather_features if f in WEATHER_VARIABLES_INFO and f != 'wind_dir']
+    if 'wind_dir' in enabled_weather_features:
+        relevant_vars_for_lookup.append('wind_dir') # Ensure original wind_dir is fetched if selected
 
     return {
-        'bronx': {var: bronx_data[var] for var in weather_vars if var in bronx_data},
-        'manhattan': {var: manhattan_data[var] for var in weather_vars if var in manhattan_data}
+        'bronx': {var: bronx_data[var] for var in relevant_vars_for_lookup if var in bronx_data},
+        'manhattan': {var: manhattan_data[var] for var in relevant_vars_for_lookup if var in manhattan_data}
     }
 
 def build_weather_grid(timestamp: pd.Timestamp,
@@ -351,27 +379,35 @@ def build_weather_grid(timestamp: pd.Timestamp,
                        bronx_coords: Tuple[float, float],
                        manhattan_coords: Tuple[float, float],
                        grid_coords: np.ndarray,
-                       sat_H: int, sat_W: int) -> np.ndarray:
-    """Builds normalized weather grid using IDW interpolation."""
-    station_data = get_closest_weather_data(timestamp, bronx_weather, manhattan_weather)
+                       sat_H: int, sat_W: int,
+                       enabled_weather_features: List[str]) -> np.ndarray:
+    """Builds normalized weather grid using IDW interpolation for enabled features only."""
+    
+    actual_num_channels = calculate_actual_weather_channels(enabled_weather_features)
+    if actual_num_channels == 0:
+        logging.warning(f"No weather features enabled for timestamp {timestamp}. Returning empty grid of shape (0, {sat_H}, {sat_W})")
+        return np.zeros((0, sat_H, sat_W), dtype=np.float32)
+
+    station_data = get_closest_weather_data(timestamp, bronx_weather, manhattan_weather, enabled_weather_features)
     bronx_raw = station_data['bronx']
     manhattan_raw = station_data['manhattan']
 
-    if not bronx_raw or not manhattan_raw:
-        logging.error(f"Missing weather data for timestamp {timestamp}. Returning zeros.")
-        return np.zeros((6, sat_H, sat_W), dtype=np.float32)
+    # Check if essential data for any enabled feature is missing
+    # This is a basic check; more robust would be per-feature
+    if not bronx_raw and any(f in enabled_weather_features for f in bronx_raw.keys()):
+        logging.error(f"Missing Bronx weather data for enabled features at timestamp {timestamp}. Returning zeros for all channels.")
+        return np.zeros((actual_num_channels, sat_H, sat_W), dtype=np.float32)
+    if not manhattan_raw and any(f in enabled_weather_features for f in manhattan_raw.keys()):
+        logging.error(f"Missing Manhattan weather data for enabled features at timestamp {timestamp}. Returning zeros for all channels.")
+        return np.zeros((actual_num_channels, sat_H, sat_W), dtype=np.float32)
 
-    weather_grid = np.zeros((6, sat_H, sat_W), dtype=np.float32)
-    # lat_grid = grid_coords[:, :, 0] # ORIGINAL LINE, causes error
-    # lon_grid = grid_coords[:, :, 1] # ORIGINAL LINE
-
-    # NEW LOGIC: grid_coords is (N, 2), reshape to (H,W) for lat and lon
-    grid_lat_raw = grid_coords[:, 0]  # Shape (N,)
-    grid_lon_raw = grid_coords[:, 1]  # Shape (N,)
-
-    lat_grid = grid_lat_raw.reshape(sat_H, sat_W)  # Shape (H, W)
-    lon_grid = grid_lon_raw.reshape(sat_H, sat_W)  # Shape (H, W)
-    # END NEW LOGIC
+    # Initialize weather grid with the correct number of channels
+    weather_grid = np.zeros((actual_num_channels, sat_H, sat_W), dtype=np.float32)
+    
+    grid_lat_raw = grid_coords[:, 0]
+    grid_lon_raw = grid_coords[:, 1]
+    lat_grid = grid_lat_raw.reshape(sat_H, sat_W)
+    lon_grid = grid_lon_raw.reshape(sat_H, sat_W)
 
     dist_sq_bronx = (lat_grid - bronx_coords[0])**2 + (lon_grid - bronx_coords[1])**2
     dist_sq_manhattan = (lat_grid - manhattan_coords[0])**2 + (lon_grid - manhattan_coords[1])**2
@@ -379,40 +415,73 @@ def build_weather_grid(timestamp: pd.Timestamp,
     weight_bronx = 1.0 / (dist_sq_bronx + epsilon)
     weight_manhattan = 1.0 / (dist_sq_manhattan + epsilon)
     total_weight = weight_bronx + weight_manhattan
-    norm_weight_bronx = weight_bronx / total_weight
-    norm_weight_manhattan = weight_manhattan / total_weight
+    # Handle cases where a grid cell is exactly at a station location (total_weight might be huge or inf)
+    # or where total_weight is zero (e.g. if epsilon was too small and both dists were zero, though unlikely)
+    valid_weights = total_weight > epsilon 
+    norm_weight_bronx = np.zeros_like(total_weight)
+    norm_weight_manhattan = np.zeros_like(total_weight)
 
-    channel_map = {'air_temp': 0, 'rel_humidity': 1, 'avg_windspeed': 2, 'solar_flux': 5}
-    for var_name, channel_idx in channel_map.items():
-        # Check if variable exists in both station data dicts
-        if var_name not in bronx_raw or var_name not in manhattan_raw:
-             logging.warning(f"Weather variable '{var_name}' missing for {timestamp}. Skipping interpolation for this variable.")
-             # Keep the channel as zeros
-             continue
+    norm_weight_bronx[valid_weights] = weight_bronx[valid_weights] / total_weight[valid_weights]
+    norm_weight_manhattan[valid_weights] = weight_manhattan[valid_weights] / total_weight[valid_weights]
 
-        val_bronx_norm = normalize_min_max(bronx_raw[var_name], var_name)
-        val_manhattan_norm = normalize_min_max(manhattan_raw[var_name], var_name)
-        interpolated_norm_val = (val_bronx_norm * norm_weight_bronx + val_manhattan_norm * norm_weight_manhattan)
-        weather_grid[channel_idx] = interpolated_norm_val
+    # Fill cells with invalid weights (e.g. directly on a station, or numerical issue)
+    # Heuristic: assign to nearest station if total_weight is zero or problematic
+    # If a point is exactly on Bronx station, weight_bronx is inf, weight_manhattan is finite -> norm_weight_bronx = 1
+    # If a point is equidistant from both (and not on either), weights are equal.
+    # This logic should generally handle points directly on stations correctly due to division by total_weight.
+    # However, if a point is on Bronx, and dist_sq_manhattan is also ~0, total_weight could be inf/inf.
+    # A simple robust way: if not valid_weights, check which distance is smaller.
+    not_valid_weights_mask = ~valid_weights
+    if np.any(not_valid_weights_mask):
+        bronx_closer = dist_sq_bronx[not_valid_weights_mask] < dist_sq_manhattan[not_valid_weights_mask]
+        manhattan_closer_or_equal = dist_sq_manhattan[not_valid_weights_mask] <= dist_sq_bronx[not_valid_weights_mask]
+        
+        norm_weight_bronx[not_valid_weights_mask] = np.where(bronx_closer, 1.0, 0.0)
+        norm_weight_manhattan[not_valid_weights_mask] = np.where(manhattan_closer_or_equal, 1.0, 0.0)
+        # If equidistant and problematic, this might assign 1.0 to Manhattan, adjust if specific behavior needed.
 
-    # Wind Direction (Sin/Cos components)
-    if 'wind_direction' in bronx_raw and 'wind_direction' in manhattan_raw:
-         wd_bronx_rad = np.deg2rad(bronx_raw['wind_direction'])
-         wd_manhattan_rad = np.deg2rad(manhattan_raw['wind_direction'])
-         sin_bronx, cos_bronx = np.sin(wd_bronx_rad), np.cos(wd_bronx_rad)
-         sin_manhattan, cos_manhattan = np.sin(wd_manhattan_rad), np.cos(wd_manhattan_rad)
-         interp_sin = sin_bronx * norm_weight_bronx + sin_manhattan * norm_weight_manhattan
-         interp_cos = cos_bronx * norm_weight_bronx + cos_manhattan * norm_weight_manhattan
-         length = np.sqrt(interp_sin**2 + interp_cos**2 + epsilon)
-         # Handle potential division by zero if length is ~0
-         valid_length = length > epsilon
-         weather_grid[3][valid_length] = interp_sin[valid_length] / length[valid_length] # Sin component (channel 3)
-         weather_grid[4][valid_length] = interp_cos[valid_length] / length[valid_length] # Cos component (channel 4)
-         # Keep 0 for invalid lengths
-    else:
-        logging.warning(f"Wind direction missing for {timestamp}. Skipping interpolation.")
-        # Channels 3 and 4 remain zero
+    current_channel_idx = 0
+    for feature_name in CANONICAL_WEATHER_FEATURE_ORDER:
+        if feature_name == 'wind_dir_sin' or feature_name == 'wind_dir_cos':
+            if 'wind_dir' not in enabled_weather_features:
+                continue # Skip sin/cos if base wind_dir is not enabled
+            # Wind direction (handled as a pair)
+            if 'wind_dir' not in bronx_raw or 'wind_dir' not in manhattan_raw:
+                logging.warning(f"Base 'wind_dir' data missing for {timestamp} at one or both stations. Wind components will be zero.")
+                # weather_grid[current_channel_idx] remains zero
+                # weather_grid[current_channel_idx+1] remains zero
+            else:
+                wd_bronx_rad = np.deg2rad(bronx_raw['wind_dir'])
+                wd_manhattan_rad = np.deg2rad(manhattan_raw['wind_dir'])
+                sin_bronx, cos_bronx = np.sin(wd_bronx_rad), np.cos(wd_bronx_rad)
+                sin_manhattan, cos_manhattan = np.sin(wd_manhattan_rad), np.cos(wd_manhattan_rad)
+                interp_sin = sin_bronx * norm_weight_bronx + sin_manhattan * norm_weight_manhattan
+                interp_cos = cos_bronx * norm_weight_bronx + cos_manhattan * norm_weight_manhattan
+                length = np.sqrt(interp_sin**2 + interp_cos**2 + epsilon)
+                valid_length = length > epsilon
+                
+                if feature_name == 'wind_dir_sin':
+                    weather_grid[current_channel_idx][valid_length] = interp_sin[valid_length] / length[valid_length]
+                elif feature_name == 'wind_dir_cos':
+                    weather_grid[current_channel_idx][valid_length] = interp_cos[valid_length] / length[valid_length]
+            current_channel_idx +=1
 
+        elif feature_name in enabled_weather_features: # Handle other scalar features
+            if feature_name not in bronx_raw or feature_name not in manhattan_raw:
+                logging.warning(f"Weather variable '{feature_name}' missing for {timestamp} at one or both stations. Channel will be zero.")
+                # weather_grid[current_channel_idx] remains zero
+            else:
+                # Use WEATHER_VARIABLES_INFO for normalization parameters
+                norm_params = WEATHER_VARIABLES_INFO[feature_name]['norm_params']
+                val_bronx_norm = (bronx_raw[feature_name] - norm_params['min']) / (norm_params['max'] - norm_params['min'] + epsilon)
+                val_manhattan_norm = (manhattan_raw[feature_name] - norm_params['min']) / (norm_params['max'] - norm_params['min'] + epsilon)
+                val_bronx_norm = np.clip(val_bronx_norm, 0.0, 1.0)
+                val_manhattan_norm = np.clip(val_manhattan_norm, 0.0, 1.0)
+                
+                interpolated_norm_val = (val_bronx_norm * norm_weight_bronx + val_manhattan_norm * norm_weight_manhattan)
+                weather_grid[current_channel_idx] = interpolated_norm_val
+            current_channel_idx += 1
+            
     return weather_grid
 
 # --- Time/Metadata Utilities --- #

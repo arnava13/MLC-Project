@@ -13,7 +13,7 @@ from torchvision.transforms import v2
 import pandas as pd # Added for Timestamp check
 
 from src.Clay.src.module import ClayMAEModule
-from src.ingest.data_utils import determine_target_grid_size # Ensure this is available
+from src.ingest.data_utils import determine_target_grid_size, CANONICAL_WEATHER_FEATURE_ORDER, calculate_actual_weather_channels # Ensure this is available
 
 # -----------------------------------------------------------------------------
 # Pretrained Feature Extractors -----------------------------------------------
@@ -654,6 +654,8 @@ class UHINetCNN(nn.Module):
                  final_processor_refinement_channels: int = 32, # Channels for conv in FinalUpsamplerAndProjection
                  # Optional Sentinel Composite Bands
                  sentinel_bands_to_load: Optional[List[str]] = None,
+                 # NEW: Enabled Weather Features
+                 enabled_weather_features: Optional[List[str]] = None,
                  # Clay Specific (if feature_flags["use_clay"])
                  clay_model_size: Optional[str] = None,
                  clay_bands: Optional[List[str]] = None,
@@ -665,6 +667,26 @@ class UHINetCNN(nn.Module):
         super().__init__()
         self.feature_flags = feature_flags
         self.head_type = head_type.lower()
+
+        if enabled_weather_features is None: # Default to all if not provided
+            logging.warning("'enabled_weather_features' not provided to UHINetCNN, defaulting to all canonical weather features. This may not match dataloader config!")
+            # This default might be risky if dataloader provides fewer channels.
+            # Consider making it a required argument or ensuring dataloader and model get consistent lists.
+            from src.ingest.data_utils import CANONICAL_WEATHER_FEATURE_ORDER # Temp import
+            # Infer base feature names from canonical order (e.g., wind_dir_sin -> wind_dir)
+            temp_base_features = set()
+            for f_name in CANONICAL_WEATHER_FEATURE_ORDER:
+                if "_sin" in f_name or "_cos" in f_name:
+                    temp_base_features.add(f_name.split('_')[0] + "_" + f_name.split('_')[1]) # e.g. wind_dir
+                else:
+                    temp_base_features.add(f_name)
+            self.enabled_weather_features = list(temp_base_features)
+        else:
+            self.enabled_weather_features = enabled_weather_features
+
+        # Calculate actual weather channels based on the enabled features
+        from src.ingest.data_utils import calculate_actual_weather_channels # Moved import here
+        actual_weather_channels = calculate_actual_weather_channels(self.enabled_weather_features)
 
         # --- Clay Backbone (Optional) --- #
         self.clay_model = None
@@ -679,15 +701,26 @@ class UHINetCNN(nn.Module):
             logging.info(f"Initialized Clay model ({clay_model_size}), output channels: {clay_output_channels}")
 
         # --- Calculate Input Channels for the selected Feature Head --- #
-        input_channels_to_head = weather_channels + clay_output_channels
-        if self.feature_flags.get("use_lst", False): input_channels_to_head += 1
-        if self.feature_flags.get("use_dem", False): input_channels_to_head += 1
-        if self.feature_flags.get("use_dsm", False): input_channels_to_head += 1
-        if self.feature_flags.get("use_ndvi", False): input_channels_to_head += 1
-        if self.feature_flags.get("use_ndbi", False): input_channels_to_head += 1
-        if self.feature_flags.get("use_ndwi", False): input_channels_to_head += 1
+        # Start with weather and Clay channels
+        input_channels_to_head = actual_weather_channels
+        if self.feature_flags.get("use_clay", False):
+            input_channels_to_head += clay_output_channels
+
+        # Add channels for each enabled static feature
+        # These are passed together in the 'static_features' tensor from the dataloader
+        # The __init__ needs to know the total count that will be in that tensor.
+        num_static_channels_from_flags = 0
+        if self.feature_flags.get("use_lst", False): num_static_channels_from_flags += 1
+        if self.feature_flags.get("use_dem", False): num_static_channels_from_flags += 1
+        if self.feature_flags.get("use_dsm", False): num_static_channels_from_flags += 1
+        if self.feature_flags.get("use_ndvi", False): num_static_channels_from_flags += 1
+        if self.feature_flags.get("use_ndbi", False): num_static_channels_from_flags += 1
+        if self.feature_flags.get("use_ndwi", False): num_static_channels_from_flags += 1
         if self.feature_flags.get("use_sentinel_composite", False) and sentinel_bands_to_load:
-            input_channels_to_head += len(sentinel_bands_to_load)
+            num_static_channels_from_flags += len(sentinel_bands_to_load)
+        
+        input_channels_to_head += num_static_channels_from_flags
+
         if input_channels_to_head == 0: raise ValueError("No input features for the head.")
         logging.info(f"Total input channels for feature head: {input_channels_to_head}")
 

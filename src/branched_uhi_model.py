@@ -9,7 +9,7 @@ import torch.nn.functional as F
 import logging
 
 from src.model import UNetConvBlock, ClayFeatureExtractor, UNetUpBlock, UNetDecoder, UNetDecoderWithTargetResize, FinalUpsamplerAndProjection, SimpleCNNFeatureHead
-from src.ingest.data_utils import determine_target_grid_size
+from src.ingest.data_utils import determine_target_grid_size, calculate_actual_weather_channels, CANONICAL_WEATHER_FEATURE_ORDER
 
 # -----------------------------------------------------------------------------
 # ConvLSTM Implementation -----------------------------------------------------
@@ -252,6 +252,7 @@ class BranchedUHIModel(nn.Module):
                  final_processor_refinement_channels: int = 16, 
                  weather_seq_length: int = 60,
                  sentinel_bands_to_load: Optional[List[str]] = None,
+                 enabled_weather_features: Optional[List[str]] = None,
                  clay_model_size: Optional[str] = None,
                  clay_bands: Optional[List[str]] = None,
                  clay_platform: Optional[str] = None,
@@ -265,6 +266,20 @@ class BranchedUHIModel(nn.Module):
         self.uhi_grid_resolution_m = uhi_grid_resolution_m
         self.head_type = head_type.lower()
 
+        if enabled_weather_features is None: # Default to all if not provided
+            logging.warning("'enabled_weather_features' not provided to BranchedUHIModel, defaulting to all canonical. This may not match dataloader!")
+            temp_base_features = set()
+            for f_name in CANONICAL_WEATHER_FEATURE_ORDER:
+                if "_sin" in f_name or "_cos" in f_name:
+                    temp_base_features.add(f_name.split('_')[0] + "_" + f_name.split('_')[1])
+                else:
+                    temp_base_features.add(f_name)
+            self.enabled_weather_features = list(temp_base_features)
+        else:
+            self.enabled_weather_features = enabled_weather_features
+
+        actual_weather_input_channels = calculate_actual_weather_channels(self.enabled_weather_features)
+
         self.target_H, self.target_W = determine_target_grid_size(
             self.bounds, self.uhi_grid_resolution_m
         )
@@ -272,7 +287,7 @@ class BranchedUHIModel(nn.Module):
 
         # --- Weather Branch (ConvLSTM) --- (Logic remains same)
         self.conv_lstm = ConvLSTM(
-            input_dim=weather_input_channels, hidden_dim=convlstm_hidden_dims,
+            input_dim=actual_weather_input_channels, hidden_dim=convlstm_hidden_dims,
             kernel_size=convlstm_kernel_sizes, num_layers=convlstm_num_layers,
             batch_first=True, bias=True, return_all_layers=True)
         self.weather_seq_length = weather_seq_length
@@ -302,6 +317,9 @@ class BranchedUHIModel(nn.Module):
 
         static_input_channels_to_proj = clay_output_channels + dataloader_static_channels
         logging.info(f"Total input channels for STATIC projection: {static_input_channels_to_proj}")
+
+        # Ensure weather input channels for ConvLSTM is logged correctly
+        logging.info(f"ConvLSTM input channels (actual_weather_input_channels): {actual_weather_input_channels}")
 
         if static_input_channels_to_proj > 0:
             self.static_proj = nn.Conv2d(static_input_channels_to_proj, proj_static_ch, kernel_size=1)
