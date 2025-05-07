@@ -514,7 +514,7 @@ class CityDataSet(Dataset):
         # Add optional Clay inputs
         if self.feature_flags["use_clay"] and clay_mosaic_input is not None and \
            norm_latlon_tensor is not None and norm_time_tensor is not None: # Added None checks
-            sample['cloudless_mosaic'] = torch.from_numpy(clay_mosaic_input).float()
+            sample['clay_mosaic'] = torch.from_numpy(clay_mosaic_input).float()
             sample['norm_latlon'] = torch.from_numpy(norm_latlon_tensor).float() # Will be (4,)
             sample['norm_timestamp'] = torch.from_numpy(norm_time_tensor).float() # Will be (4,)
 

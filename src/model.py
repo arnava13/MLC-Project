@@ -729,8 +729,22 @@ class UHINetCNN(nn.Module):
                 raise ValueError("Clay inputs (mosaic, latlon, timestamp) required when Clay model is enabled.")
             if clay_mosaic.shape[-2:] != (H_feat, W_feat):
                  raise ValueError(f"Clay mosaic spatial dim {clay_mosaic.shape[-2:]} != Weather dim {(H_feat, W_feat)}")
-            clay_features = self.clay_model(clay_mosaic, norm_latlon, norm_timestamp)
-            all_features_list.append(clay_features)
+            
+            # clay_features will be (B, D_clay, H_patch, W_patch), e.g. (B, 1024, 14, 14)
+            clay_features_raw = self.clay_model(clay_mosaic, norm_latlon, norm_timestamp)
+
+            # Explicitly interpolate clay_features_raw to match H_feat, W_feat
+            if clay_features_raw.shape[-2:] != (H_feat, W_feat):
+                clay_features_interpolated = F.interpolate(
+                    clay_features_raw,
+                    size=(H_feat, W_feat),
+                    mode='bilinear',
+                    align_corners=False
+                )
+                logging.debug(f"Interpolated Clay output from {clay_features_raw.shape} to {clay_features_interpolated.shape}")
+                all_features_list.append(clay_features_interpolated)
+            else:
+                all_features_list.append(clay_features_raw) # Already matching
 
         # --- Other Static Features (Optional) --- #
         if static_features is not None:
