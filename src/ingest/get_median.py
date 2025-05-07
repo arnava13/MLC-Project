@@ -603,8 +603,21 @@ def create_and_save_cloudless_mosaic(city_name, bounds, output_dir,
         if mosaic_data is None:
              raise ValueError("Mosaic generation returned None (likely processing error).")
 
+        # Calculate median over time dimension
+        if "time" in mosaic_data.dims:
+            median_bands_tensor = mosaic_data.median("time", skipna=True) # NaNs are preserved if all inputs are NaN for a pixel
+        else:
+            median_bands_tensor = mosaic_data # No time dimension, use as is
+            logging.warning("No 'time' dimension found in Sentinel array for median calculation.")
+        
+        # Ensure the data is float32. NaNs will be preserved.
+        median_bands_tensor_float = median_bands_tensor.astype(np.float32)
+        
+        # Use the tensor that preserves NaNs for saving.
+        output_numpy_array = median_bands_tensor_float.data 
+
         # Save the mosaic tensor data
-        np.save(output_path, mosaic_data)
+        np.save(output_path, output_numpy_array)
         logging.info(f"Saved cloudless mosaic to {output_path}")
         
         # Save metadata in a JSON file if needed

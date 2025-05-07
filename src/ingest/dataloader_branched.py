@@ -213,24 +213,34 @@ class CityDataSetBranched(Dataset):
         self.global_dem_min, self.global_dem_max = None, None
         if self.dem_xr is not None:
             try:
-                logging.info("Calculating global DEM min/max...")
-                # Compute min/max, ignoring NaNs potentially introduced by nodata handling
-                # Ensure computation happens on the actual data, not lazy representation
-                self.global_dem_min = float(np.nanmin(self.dem_xr.values))
-                self.global_dem_max = float(np.nanmax(self.dem_xr.values))
-                logging.info(f"Global DEM Min: {self.global_dem_min}, Max: {self.global_dem_max}")
+                logging.info("Calculating global DEM 2nd/98th percentiles...")
+                valid_dem_values = self.dem_xr.data[~np.isnan(self.dem_xr.data)]
+                if valid_dem_values.size > 0:
+                    self.global_dem_p2 = float(np.percentile(valid_dem_values, 2))
+                    self.global_dem_p98 = float(np.percentile(valid_dem_values, 98))
+                    logging.info(f"Global DEM p2: {self.global_dem_p2:.2f}, p98: {self.global_dem_p98:.2f}")
+                else:
+                    logging.warning("No valid DEM values to calculate percentiles. DEM features might be all zeros or NaNs.")
+                    self.global_dem_p2, self.global_dem_p98 = 0.0, 1.0 # Fallback
             except Exception as e:
-                logging.error(f"Failed to compute global DEM stats: {e}. Proceeding without global stats.")
+                logging.error(f"Failed to compute global DEM percentiles: {e}. DEM features might not be normalized correctly.")
+                self.global_dem_p2, self.global_dem_p98 = 0.0, 1.0 # Fallback
 
-        self.global_dsm_min, self.global_dsm_max = None, None
+        self.global_dsm_p2, self.global_dsm_p98 = None, None
         if self.dsm_xr is not None:
             try:
-                logging.info("Calculating global DSM min/max...")
-                self.global_dsm_min = float(np.nanmin(self.dsm_xr.values))
-                self.global_dsm_max = float(np.nanmax(self.dsm_xr.values))
-                logging.info(f"Global DSM Min: {self.global_dsm_min}, Max: {self.global_dsm_max}")
+                logging.info("Calculating global DSM 2nd/98th percentiles...")
+                valid_dsm_values = self.dsm_xr.data[~np.isnan(self.dsm_xr.data)]
+                if valid_dsm_values.size > 0:
+                    self.global_dsm_p2 = float(np.percentile(valid_dsm_values, 2))
+                    self.global_dsm_p98 = float(np.percentile(valid_dsm_values, 98))
+                    logging.info(f"Global DSM p2: {self.global_dsm_p2:.2f}, p98: {self.global_dsm_p98:.2f}")
+                else:
+                    logging.warning("No valid DSM values to calculate percentiles. DSM features might be all zeros or NaNs.")
+                    self.global_dsm_p2, self.global_dsm_p98 = 0.0, 1.0 # Fallback
             except Exception as e:
-                logging.error(f"Failed to compute global DSM stats: {e}. Proceeding without global stats.")
+                logging.error(f"Failed to compute global DSM percentiles: {e}. DSM features might not be normalized correctly.")
+                self.global_dsm_p2, self.global_dsm_p98 = 0.0, 1.0 # Fallback
 
         # 3. Cloudless Mosaic (Keep as NumPy array for now, will wrap in xr in getitem)
         self.cloudless_mosaic_full_np = None
@@ -528,17 +538,19 @@ class CityDataSetBranched(Dataset):
                          dem_feat_res = None
                 
                 if dem_feat_res is not None:
-                    # Robust percentile-based normalization
-                    # Ensure DEM is treated as a 1-band image for percentile calculation
-                    dem_values_for_norm = dem_feat_res.squeeze() # Remove single channel dim if present
-                    p2 = np.nanpercentile(dem_values_for_norm, 2)
-                    p98 = np.nanpercentile(dem_values_for_norm, 98)
-                    dem_feat_res = np.clip(dem_feat_res, p2, p98)
-                    if (p98 - p2) > 1e-6: # Avoid division by zero if percentiles are too close
-                        dem_feat_res = (dem_feat_res - p2) / (p98 - p2)
+                    # --- MODIFIED: Normalization to [-1, 1] using GLOBAL percentiles ---
+                    if hasattr(self, 'global_dem_p2') and hasattr(self, 'global_dem_p98'):
+                        dem_min_val, dem_max_val = self.global_dem_p2, self.global_dem_p98
+                        dem_feat_res_clipped = np.clip(dem_feat_res, dem_min_val, dem_max_val)
+                        if (dem_max_val - dem_min_val) > 1e-6:
+                            norm_01 = (dem_feat_res_clipped - dem_min_val) / (dem_max_val - dem_min_val)
+                            dem_feat_res = (norm_01 * 2.0) - 1.0
+                        else: 
+                            dem_feat_res = np.full_like(dem_feat_res, 0.0) 
+                        logging.debug(f"DEM normalized to [-1, 1] using global p2/p98 ({dem_min_val:.2f}, {dem_max_val:.2f})")
                     else:
-                        dem_feat_res = np.full_like(dem_feat_res, 0.5) # Default to mid-range if data is flat
-                    logging.debug(f"DEM normalized using 2nd/98th percentiles ({p2:.2f}, {p98:.2f})")
+                        logging.warning("Global DEM percentiles not available. DEM might not be normalized correctly.")
+                    # --- END MODIFIED ---
                     
                     static_features_list.append(dem_feat_res)
                     feature_names.append("dem")
@@ -567,16 +579,19 @@ class CityDataSetBranched(Dataset):
                          dsm_feat_res = None
                 
                 if dsm_feat_res is not None:
-                    # Robust percentile-based normalization
-                    dsm_values_for_norm = dsm_feat_res.squeeze()
-                    p2 = np.nanpercentile(dsm_values_for_norm, 2)
-                    p98 = np.nanpercentile(dsm_values_for_norm, 98)
-                    dsm_feat_res = np.clip(dsm_feat_res, p2, p98)
-                    if (p98 - p2) > 1e-6:
-                        dsm_feat_res = (dsm_feat_res - p2) / (p98 - p2)
+                    # --- MODIFIED: Normalization to [-1, 1] using GLOBAL percentiles ---
+                    if hasattr(self, 'global_dsm_p2') and hasattr(self, 'global_dsm_p98'):
+                        dsm_min_val, dsm_max_val = self.global_dsm_p2, self.global_dsm_p98
+                        dsm_feat_res_clipped = np.clip(dsm_feat_res, dsm_min_val, dsm_max_val)
+                        if (dsm_max_val - dsm_min_val) > 1e-6:
+                            norm_01 = (dsm_feat_res_clipped - dsm_min_val) / (dsm_max_val - dsm_min_val)
+                            dsm_feat_res = (norm_01 * 2.0) - 1.0
+                        else:
+                            dsm_feat_res = np.full_like(dsm_feat_res, 0.0)
+                        logging.debug(f"DSM normalized to [-1, 1] using global p2/p98 ({dsm_min_val:.2f}, {dsm_max_val:.2f})")
                     else:
-                        dsm_feat_res = np.full_like(dsm_feat_res, 0.5)
-                    logging.debug(f"DSM normalized using 2nd/98th percentiles ({p2:.2f}, {p98:.2f})")
+                        logging.warning("Global DSM percentiles not available. DSM might not be normalized correctly.")
+                    # --- END MODIFIED ---
                     
                     static_features_list.append(dsm_feat_res)
                     feature_names.append("dsm")
