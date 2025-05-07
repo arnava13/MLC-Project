@@ -288,10 +288,16 @@ class CityDataSet(Dataset):
         logging.info(f"Loaded Manhattan weather data: {len(self.manhattan_weather)} records")
         # --- END Weather Loading --- #
 
-        # --- Precompute Weather Grid Coordinates (at FEATURE resolution) --- #
-        self.weather_grid_coords = compute_grid_cell_coordinates(self.bounds, self.feat_H, self.feat_W)
-        # --- Precompute Static Clay Lat/Lon Embedding --- #
-        self._cached_norm_latlon = normalize_clay_latlon(self.bounds)
+        # --- Compute Grid Cell Center Coordinates for WEATHER GRID (at FEATURE resolution) --- #
+        # These are used for interpolating weather station data to the feature grid
+        self.grid_cell_center_lon_feat_res, self.grid_cell_center_lat_feat_res = compute_grid_cell_coordinates(
+            self.bounds, self.feat_H, self.feat_W, self.target_crs
+        )
+        self.weather_grid_coords = np.stack(
+            [self.grid_cell_center_lon_feat_res.ravel(), self.grid_cell_center_lat_feat_res.ravel()], axis=-1
+        )
+        logging.info("Computed grid cell center coordinates for weather grid at feature resolution.")
+        # --- END Weather Grid Coords --- #
 
         # --- Final Log --- #
         logging.info(f"Dataset initialized for {self.city_name} with {len(self)} unique timestamps.")
@@ -485,8 +491,14 @@ class CityDataSet(Dataset):
                         clay_input_indices.append(available_bands_in_resampled[band_name])
                     clay_mosaic_input = mosaic_feat_res[clay_input_indices, :, :]
                 except KeyError as e: raise ValueError(f"Cannot extract Clay bands ('{e}') from resampled mosaic.")
-                norm_latlon_tensor = self._cached_norm_latlon
-                norm_time_tensor = normalize_clay_timestamp(target_timestamp)
+                
+                # --- MODIFIED: Calculate center lat/lon and normalize for Clay ---
+                center_lon = (self.bounds[0] + self.bounds[2]) / 2
+                center_lat = (self.bounds[1] + self.bounds[3]) / 2
+                norm_latlon_tensor = self._normalize_latlon_for_clay_scalar(center_lat, center_lon) # Shape (4,)
+                # --- END MODIFIED ---
+
+                norm_time_tensor = normalize_clay_timestamp(target_timestamp) # Shape (4,)
 
         # --- Assemble Sample Dictionary --- #
         sample = {
@@ -500,10 +512,11 @@ class CityDataSet(Dataset):
             sample['static_features'] = torch.from_numpy(combined_static_features).float()
 
         # Add optional Clay inputs
-        if self.feature_flags["use_clay"] and clay_mosaic_input is not None:
+        if self.feature_flags["use_clay"] and clay_mosaic_input is not None and \
+           norm_latlon_tensor is not None and norm_time_tensor is not None: # Added None checks
             sample['cloudless_mosaic'] = torch.from_numpy(clay_mosaic_input).float()
-            sample['norm_latlon'] = torch.from_numpy(norm_latlon_tensor).float()
-            sample['norm_timestamp'] = torch.from_numpy(norm_time_tensor).float()
+            sample['norm_latlon'] = torch.from_numpy(norm_latlon_tensor).float() # Will be (4,)
+            sample['norm_timestamp'] = torch.from_numpy(norm_time_tensor).float() # Will be (4,)
 
         # REMOVE HIGH-RES ELEVATION OUTPUT
 
@@ -525,3 +538,9 @@ class CityDataSet(Dataset):
                 self.lst_xr.close()
             except Exception as e:
                 logging.warning(f"Exception closing LST file handle: {e}")
+
+    def _normalize_latlon_for_clay_scalar(self, lat: float, lon: float) -> np.ndarray:
+        """Normalizes a single lat/lon pair for Clay model input."""
+        lat_rad = lat * np.pi / 180
+        lon_rad = lon * np.pi / 180
+        return np.array([math.sin(lat_rad), math.cos(lat_rad), math.sin(lon_rad), math.cos(lon_rad)], dtype=np.float32)

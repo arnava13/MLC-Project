@@ -294,9 +294,13 @@ class CityDataSetBranched(Dataset):
         # --- END Weather Loading --- #
 
         # --- Precompute Weather Grid Coordinates (at FEATURE resolution) --- #
-        self.weather_grid_coords = compute_grid_cell_coordinates(self.bounds, self.feat_H, self.feat_W)
-        # --- Precompute Static Clay Lat/Lon Embedding --- #
-        self._cached_norm_latlon = normalize_clay_latlon(self.bounds)
+        self.grid_cell_center_lon_feat_res, self.grid_cell_center_lat_feat_res = compute_grid_cell_coordinates(
+            self.bounds, self.feat_H, self.feat_W, self.target_crs
+        )
+        self.weather_grid_coords_for_build = np.stack(
+            [self.grid_cell_center_lon_feat_res.ravel(), self.grid_cell_center_lat_feat_res.ravel()], axis=-1
+        )
+        logging.info("Computed grid cell center coordinates for potential weather grid building at feature resolution.")
 
         # --- Final Log --- #
         logging.info(f"Dataset initialized for {self.city_name} with {len(self)} unique timestamps.")
@@ -306,6 +310,12 @@ class CityDataSetBranched(Dataset):
         logging.info(f"DSM loaded: {self.dsm_xr is not None}")
         logging.info(f"LST loaded: {self.lst_xr is not None}")
         logging.info(f"Mosaic loaded: {self.cloudless_mosaic_full_np is not None}")
+
+    def _normalize_latlon_for_clay_scalar(self, lat: float, lon: float) -> np.ndarray:
+        """Normalizes a single lat/lon pair for Clay model input."""
+        lat_rad = lat * np.pi / 180
+        lon_rad = lon * np.pi / 180
+        return np.array([math.sin(lat_rad), math.cos(lat_rad), math.sin(lon_rad), math.cos(lon_rad)], dtype=np.float32)
 
     def __len__(self):
         return len(self.unique_timestamps)
@@ -331,7 +341,7 @@ class CityDataSetBranched(Dataset):
                 manhattan_weather=self.manhattan_weather,
                 bronx_coords=self.bronx_coords,
                 manhattan_coords=self.manhattan_coords,
-                grid_coords=self.weather_grid_coords, # Use coords for feature grid
+                grid_coords=self.weather_grid_coords_for_build, # MODIFIED: Use correct grid coords
                 sat_H=self.feat_H, # Use feature grid dimensions
                 sat_W=self.feat_W
             )
@@ -576,11 +586,17 @@ class CityDataSetBranched(Dataset):
                     for band_name in clay_input_band_names:
                             clay_input_indices.append(available_bands_in_resampled[band_name])
                     clay_mosaic_input = mosaic_feat_res[clay_input_indices, :, :]
-                    norm_latlon_tensor = self._cached_norm_latlon
+                    
+                    # --- MODIFIED: Calculate center lat/lon and normalize for Clay --- #
+                    center_lon = (self.bounds[0] + self.bounds[2]) / 2
+                    center_lat = (self.bounds[1] + self.bounds[3]) / 2
+                    norm_latlon_tensor = self._normalize_latlon_for_clay_scalar(center_lat, center_lon) # Shape (4,)
+                    # --- END MODIFIED --- #
+
                     norm_time_tensor = normalize_clay_timestamp(target_timestamp)
                 except KeyError as e:
                         logging.warning(f"Cannot extract required bands for Clay ('{e}') from resampled mosaic bands. Skipping Clay.")
-                        clay_mosaic_input = None
+                        clay_mosaic_input = None # Ensure it's None if bands are missing
 
         # --- Assemble Sample Dictionary --- #
         sample = {
@@ -592,10 +608,11 @@ class CityDataSetBranched(Dataset):
         if combined_static_features.shape[0] > 0:
             sample['static_features'] = torch.from_numpy(combined_static_features).float()
 
-        if self.feature_flags["use_clay"] and clay_mosaic_input is not None:
+        if self.feature_flags["use_clay"] and clay_mosaic_input is not None and \
+           norm_latlon_tensor is not None and norm_time_tensor is not None: # Added None checks for safety
             sample['clay_mosaic'] = torch.from_numpy(clay_mosaic_input).float()
-            sample['norm_latlon'] = torch.from_numpy(norm_latlon_tensor).float()
-            sample['norm_timestamp'] = torch.from_numpy(norm_time_tensor).float()
+            sample['norm_latlon'] = torch.from_numpy(norm_latlon_tensor).float() # Will be (4,)
+            sample['norm_timestamp'] = torch.from_numpy(norm_time_tensor).float() # Will be (4,)
 
         # Explicitly delete large intermediate arrays at the end of __getitem__
         if 'mosaic_feat_res' in locals() and mosaic_feat_res is not None: del mosaic_feat_res
