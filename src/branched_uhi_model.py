@@ -261,7 +261,10 @@ class BranchedUHIModel(nn.Module):
                  freeze_backbone: bool = True,
                  clay_checkpoint_path: Optional[Union[str, Path]] = None,
                  clay_metadata_path: Optional[Union[str, Path]] = None,
-                 clay_proj_channels: Optional[int] = 32):
+                 clay_proj_channels: Optional[int] = 32,
+                 # --- Dropout for Projections --- #
+                 projection_dropout_rate: Optional[float] = 0.0 # NEW
+                 ):
         super().__init__()
         self.feature_flags = feature_flags
         self.bounds = bounds
@@ -346,9 +349,15 @@ class BranchedUHIModel(nn.Module):
             proj_static_ch = 0
             logging.info("No static projection layer created (no static features)")
 
+        # Add static projection dropout layer if rate > 0
+        self.static_proj_dropout = nn.Dropout2d(p=projection_dropout_rate) if projection_dropout_rate > 0 else nn.Identity()
+
         temporal_input_channels_to_proj = convlstm_hidden_dims[-1]
         self.temporal_proj = nn.Conv2d(temporal_input_channels_to_proj, proj_temporal_ch, kernel_size=1)
         logging.info(f"Temporal projection: {temporal_input_channels_to_proj} -> {proj_temporal_ch} channels")
+
+        # Add temporal projection dropout layer if rate > 0
+        self.temporal_proj_dropout = nn.Dropout2d(p=projection_dropout_rate) if projection_dropout_rate > 0 else nn.Identity()
 
         # --- Instantiate Selected Feature Head --- #
         # Update input_channels_to_head to account for projected clay features
@@ -407,7 +416,9 @@ class BranchedUHIModel(nn.Module):
         normalized_attention_weights = F.softmax(self.timestep_weights, dim=0)
         weights_reshaped = normalized_attention_weights.view(1, T_actual, 1, 1, 1)
         temporal_features_pooled = (temporal_feature_sequence * weights_reshaped).sum(dim=1)
-        temporal_projected = self.temporal_proj(temporal_features_pooled)
+        temporal_projected_raw = self.temporal_proj(temporal_features_pooled)
+        # Apply temporal projection dropout
+        temporal_projected = self.temporal_proj_dropout(temporal_projected_raw)
 
         # --- 2. Static Branch --- (Feature extraction & projection)
         all_static_features_list = []
@@ -427,7 +438,9 @@ class BranchedUHIModel(nn.Module):
         if static_features is not None:
             if static_features.shape[-2:] != (H_feat, W_feat): raise ValueError("Static features spatial dim mismatch")
             if self.static_proj is not None:
-                static_projected = self.static_proj(static_features)
+                static_projected_raw = self.static_proj(static_features)
+                # Apply static projection dropout
+                static_projected = self.static_proj_dropout(static_projected_raw)
         elif self.static_proj is not None:
             # No static features were provided but static_proj exists, create empty tensor
             static_projected = torch.zeros(B, self.static_proj.out_channels, H_feat, W_feat, device=temporal_projected.device)
