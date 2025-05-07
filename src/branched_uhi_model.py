@@ -305,6 +305,9 @@ class BranchedUHIModel(nn.Module):
                 model_size=clay_model_size, bands=clay_bands, platform=clay_platform, gsd=clay_gsd,
                 freeze_backbone=freeze_backbone, checkpoint_path=clay_checkpoint_path, metadata_path=clay_metadata_path)
             clay_raw_channels = self.clay_model.output_channels
+            # Add BatchNorm before projection
+            self.clay_bn = nn.BatchNorm2d(clay_raw_channels)
+            logging.info(f"Added BatchNorm2d before Clay projection for {clay_raw_channels} channels")
             self.clay_proj_dim = clay_proj_channels
             self.clay_proj = nn.Conv2d(clay_raw_channels, self.clay_proj_dim, kernel_size=1, bias=False)
             clay_output_channels = self.clay_proj_dim
@@ -323,7 +326,9 @@ class BranchedUHIModel(nn.Module):
         if self.feature_flags.get("use_sentinel_composite", False) and sentinel_bands_to_load:
             dataloader_static_channels += len(sentinel_bands_to_load)
 
-        static_input_channels_to_proj = clay_output_channels + dataloader_static_channels
+        # Now static_input_channels_to_proj only includes regular static features from dataloader
+        # Clay features are processed separately through clay_bn and clay_proj
+        static_input_channels_to_proj = dataloader_static_channels
         logging.info(f"Total input channels for STATIC projection: {static_input_channels_to_proj}")
 
         # Ensure weather input channels for ConvLSTM is logged correctly
@@ -338,7 +343,11 @@ class BranchedUHIModel(nn.Module):
         self.temporal_proj = nn.Conv2d(temporal_input_channels_to_proj, proj_temporal_ch, kernel_size=1)
 
         # --- Instantiate Selected Feature Head --- #
+        # Update input_channels_to_head to account for projected clay features
         input_channels_to_head = proj_static_ch + proj_temporal_ch
+        if self.clay_model is not None:
+            input_channels_to_head += clay_output_channels
+            logging.info(f"Adding clay_output_channels ({clay_output_channels}) to head input channels")
         if input_channels_to_head == 0: raise ValueError("No features for head.")
         
         channels_from_feature_head = 0
@@ -398,24 +407,42 @@ class BranchedUHIModel(nn.Module):
             clay_features_raw = self.clay_model(clay_mosaic, norm_latlon, norm_timestamp)
             if clay_features_raw.shape[-2:] != (H_feat, W_feat):
                 clay_features_raw = F.interpolate(clay_features_raw, size=(H_feat, W_feat), mode='bilinear', align_corners=False)
-            all_static_features_list.append(clay_features_raw)
+            # Apply BatchNorm before adding to features list
+            clay_features_normalized = self.clay_bn(clay_features_raw)
+            # Apply 1x1 projection after normalization
+            clay_features_projected = self.clay_proj(clay_features_normalized)
+            all_static_features_list.append(clay_features_projected)
         if static_features is not None:
              if static_features.shape[-2:] != (H_feat, W_feat): raise ValueError("Static features spatial dim mismatch")
              all_static_features_list.append(static_features)
 
         static_projected = torch.zeros(B, 0, H_feat, W_feat, device=temporal_projected.device)
         if self.static_proj is not None and all_static_features_list:
-            combined_static = torch.cat(all_static_features_list, dim=1)
-            if self.static_proj.weight.shape[1] != combined_static.shape[1]: 
-                raise ValueError(f"Static proj channel mismatch: {self.static_proj.weight.shape[1]} vs {combined_static.shape[1]}")
-            static_projected = self.static_proj(combined_static)
+            # Check if static_features is present and clay features are already projected
+            if static_features is not None and self.clay_model is not None:
+                # Pass only static_features through static_proj
+                static_projected = self.static_proj(static_features)
+            elif static_features is not None:
+                # Only static features present, pass through static_proj
+                static_projected = self.static_proj(static_features)
+            else:
+                # No static features, only clay features which are already projected
+                pass
         elif self.static_proj is not None and not all_static_features_list:
              # This means static_proj was created but no static inputs were actually fed to forward
              # This case implies proj_static_ch > 0. Outputting zeros of proj_static_ch.
              static_projected = torch.zeros(B, self.static_proj.out_channels, H_feat, W_feat, device=temporal_projected.device)
 
+        # Create the complete list of features to fuse (clay_proj + static_proj or just one of them)
+        fused_features_list = []
+        if len(all_static_features_list) > 0:
+            fused_features_list.extend(all_static_features_list)
+        if static_projected.shape[1] > 0:
+            fused_features_list.append(static_projected)
+        fused_features_list.append(temporal_projected)
+
         # --- 3. Fusion --- #
-        fused_features = torch.cat([static_projected, temporal_projected], dim=1)
+        fused_features = torch.cat(fused_features_list, dim=1)
 
         # --- 4. Pass through selected Feature Head --- #
         head_output_features = self.feature_head(fused_features)

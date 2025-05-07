@@ -696,6 +696,9 @@ class UHINetCNN(nn.Module):
                 model_size=clay_model_size, bands=clay_bands, platform=clay_platform, gsd=clay_gsd,
                 freeze_backbone=freeze_backbone, checkpoint_path=clay_checkpoint_path, metadata_path=clay_metadata_path)
             clay_raw_channels = self.clay_model.output_channels
+            # --- ADD BATCHNORM BEFORE PROJECTION ---
+            self.clay_bn = nn.BatchNorm2d(clay_raw_channels)
+            logging.info(f"Added BatchNorm2d before Clay projection for {clay_raw_channels} channels")
             # --- NEW: projection to reduce Clay channels ---
             self.clay_proj_dim = clay_proj_channels
             self.clay_proj = nn.Conv2d(clay_raw_channels, self.clay_proj_dim, kernel_size=1, bias=False)
@@ -799,11 +802,15 @@ class UHINetCNN(nn.Module):
                     mode='bilinear',
                     align_corners=False
                 )
-                clay_proj = self.clay_proj(clay_features_interpolated)
-                logging.debug(f"Interpolated & projected Clay: {clay_features_interpolated.shape} -> {clay_proj.shape}")
+                # Apply BatchNorm before projection
+                clay_features_normalized = self.clay_bn(clay_features_interpolated)
+                clay_proj = self.clay_proj(clay_features_normalized)
+                logging.debug(f"Interpolated, normalized & projected Clay: {clay_features_interpolated.shape} -> {clay_proj.shape}")
                 all_features_list.append(clay_proj)
             else:
-                clay_proj = self.clay_proj(clay_features_raw)
+                # Apply BatchNorm before projection
+                clay_features_normalized = self.clay_bn(clay_features_raw)
+                clay_proj = self.clay_proj(clay_features_normalized)
                 all_features_list.append(clay_proj)
 
         # --- Other Static Features (Optional) --- #
