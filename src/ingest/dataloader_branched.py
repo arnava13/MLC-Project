@@ -26,7 +26,7 @@ from .data_utils import (
     build_weather_grid, # Weather grid building remains
     normalize_clay_timestamp, # Clay utils remain
     normalize_clay_latlon,
-    WEATHER_NORM_PARAMS, # Constant for weather normalization
+    WEATHER_VARIABLES_INFO, # Corrected import
     resample_xarray_to_target, # NEW Resampling utility
     calculate_actual_weather_channels, # Import new helper
 )
@@ -261,19 +261,51 @@ class CityDataSetBranched(Dataset):
             if not self._single_lst_median_path: raise ValueError("single_lst_median_path required if use_lst is True.")
             lst_path = Path(self._single_lst_median_path)
             if lst_path.exists():
-                try:
-                    self.lst_xr = rioxarray.open_rasterio(lst_path, masked=True)
-                    if self.lst_nodata is not None:
-                        self.lst_xr = self.lst_xr.where(self.lst_xr != self.lst_nodata)
-                        self.lst_xr.rio.write_nodata(np.nan, encoded=True, inplace=True)
-                    if self.lst_xr.rio.crs != self.target_crs:
-                        logging.info(f"Reprojecting LST from {self.lst_xr.rio.crs} to {self.target_crs_str}")
-                    logging.info(f"Opened LST (lazy load). Native shape (approx): {self.lst_xr.shape}")
-                except Exception as e:
-                    logging.error(f"Failed LST loading/processing from {lst_path}: {e}")
-                    if hasattr(self, 'lst_xr') and self.lst_xr: 
-                        self.lst_xr.close()
-                    self.lst_xr = None
+                logging.info(f"Loading LST from: {lst_path}")
+                if lst_path.suffix == '.npy':
+                    logging.info("LST path is a .npy file. Loading with NumPy and assuming alignment with dataset bounds.")
+                    try:
+                        lst_np = np.load(lst_path)
+                        if lst_np.ndim == 2:
+                            lst_np = lst_np[np.newaxis, :, :] # Add channel dim
+                        elif lst_np.ndim != 3 or lst_np.shape[0] != 1:
+                            raise ValueError(f"Loaded LST .npy file has unexpected shape: {lst_np.shape}. Expected (H, W) or (1, H, W).")
+                        
+                        lst_h_orig, lst_w_orig = lst_np.shape[1], lst_np.shape[2]
+                        lst_transform_orig = rasterio.transform.from_bounds(*self.bounds, lst_w_orig, lst_h_orig)
+                        
+                        y_coords = np.linspace(self.bounds[3], self.bounds[1], lst_h_orig)
+                        x_coords = np.linspace(self.bounds[0], self.bounds[2], lst_w_orig)
+
+                        self.lst_xr = xr.DataArray(
+                            lst_np.astype(np.float32),
+                            coords={'channel': [1], 'y': y_coords, 'x': x_coords},
+                            dims=['channel', 'y', 'x'],
+                            name='lst_median'
+                        )
+                        self.lst_xr = self.lst_xr.rio.write_crs(self.target_crs_str)
+                        self.lst_xr = self.lst_xr.rio.write_transform(lst_transform_orig)
+                        if self.lst_nodata is not None:
+                            self.lst_xr = self.lst_xr.where(self.lst_xr != self.lst_nodata)
+                            self.lst_xr.rio.write_nodata(np.nan, encoded=True, inplace=True)
+                        logging.info(f"Opened LST .npy. Assumed native shape: {self.lst_xr.shape}, CRS: {self.target_crs_str}")
+                    except Exception as e:
+                        logging.error(f"Failed LST .npy loading/processing from {lst_path}: {e}")
+                        self.lst_xr = None
+                else: # Assume GeoTIFF or other rioxarray compatible format
+                    try:
+                        self.lst_xr = rioxarray.open_rasterio(lst_path, masked=True)
+                        if self.lst_nodata is not None:
+                            self.lst_xr = self.lst_xr.where(self.lst_xr != self.lst_nodata)
+                            self.lst_xr.rio.write_nodata(np.nan, encoded=True, inplace=True)
+                        if self.lst_xr.rio.crs != self.target_crs:
+                            logging.info(f"Reprojecting LST from {self.lst_xr.rio.crs} to {self.target_crs_str}")
+                        logging.info(f"Opened LST (lazy load). Native shape (approx): {self.lst_xr.shape}")
+                    except Exception as e:
+                        logging.error(f"Failed LST loading/processing from {lst_path}: {e}")
+                        if hasattr(self, 'lst_xr') and self.lst_xr: 
+                            self.lst_xr.close()
+                        self.lst_xr = None
             else:
                 logging.warning(f"LST path specified but not found: {self._single_lst_median_path}")
 
