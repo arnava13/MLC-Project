@@ -23,7 +23,6 @@ from .data_utils import (
     compute_grid_cell_coordinates,
     precompute_uhi_grids,
     normalize_lst, # Still useful for LST
-    get_closest_weather_data, # Weather logic remains
     build_weather_grid, # Weather grid building remains
     normalize_clay_timestamp, # Clay utils remain
     normalize_clay_latlon,

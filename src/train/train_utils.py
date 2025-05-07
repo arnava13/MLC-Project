@@ -404,14 +404,15 @@ def train_epoch_generic(model: nn.Module,
 
         # ------ Metrics calculation ------ #
         with torch.no_grad(): # Ensure metrics calc doesn't affect gradients
-             # Use raw (unnormalized) scales for metric calculation (squeeze channel for readability)
-             pred_unnorm = pred.squeeze(1) if pred.ndim == 4 else pred
+             # Un-normalise predictions back to raw scale for metrics
+             pred_unnorm = (pred_normalized * uhi_std + uhi_mean).squeeze(1) if pred_normalized.ndim == 4 else (pred_normalized * uhi_std + uhi_mean)
              target_unnorm = target.squeeze(1) if target.ndim == 4 else target
+             mask_flat = mask.squeeze(1).bool() if mask.ndim == 4 else mask.bool()
              
              # Update running statistics
              total_loss += loss.item()
-             all_targets_unnorm.append(target_unnorm.detach().cpu())
-             all_preds_unnorm.append(pred_unnorm.detach().cpu())
+             all_targets_unnorm.append(target_unnorm[mask_flat].detach().cpu())
+             all_preds_unnorm.append(pred_unnorm[mask_flat].detach().cpu())
              num_batches += 1
         
         # Update progress bar
@@ -550,14 +551,15 @@ def validate_epoch_generic(model: nn.Module,
                 continue
             
             # ------ Metrics calculation ------ #
-            # Use raw (unnormalized) scales for metric calculation (squeeze channel for readability)
-            pred_unnorm = pred.squeeze(1) if pred.ndim == 4 else pred
+            # Un-normalise predictions back to raw scale for metrics
+            pred_unnorm = (pred_normalized * uhi_std + uhi_mean).squeeze(1) if pred_normalized.ndim == 4 else (pred_normalized * uhi_std + uhi_mean)
             target_unnorm = target.squeeze(1) if target.ndim == 4 else target
+            mask_flat = mask.squeeze(1).bool() if mask.ndim == 4 else mask.bool()
             
             # Update running statistics
             total_loss += loss.item()
-            all_targets_unnorm.append(target_unnorm.detach().cpu())
-            all_preds_unnorm.append(pred_unnorm.detach().cpu())
+            all_targets_unnorm.append(target_unnorm[mask_flat].detach().cpu())
+            all_preds_unnorm.append(pred_unnorm[mask_flat].detach().cpu())
             num_batches += 1
             
             # Update progress bar
