@@ -336,11 +336,15 @@ class BranchedUHIModel(nn.Module):
 
         if static_input_channels_to_proj > 0:
             self.static_proj = nn.Conv2d(static_input_channels_to_proj, proj_static_ch, kernel_size=1)
+            logging.info(f"Static projection: {static_input_channels_to_proj} -> {proj_static_ch} channels")
         else:
-            self.static_proj = None; proj_static_ch = 0
+            self.static_proj = None
+            proj_static_ch = 0
+            logging.info("No static projection layer created (no static features)")
 
         temporal_input_channels_to_proj = convlstm_hidden_dims[-1]
         self.temporal_proj = nn.Conv2d(temporal_input_channels_to_proj, proj_temporal_ch, kernel_size=1)
+        logging.info(f"Temporal projection: {temporal_input_channels_to_proj} -> {proj_temporal_ch} channels")
 
         # --- Instantiate Selected Feature Head --- #
         # Update input_channels_to_head to account for projected clay features
@@ -412,28 +416,18 @@ class BranchedUHIModel(nn.Module):
             # Apply 1x1 projection after normalization
             clay_features_projected = self.clay_proj(clay_features_normalized)
             all_static_features_list.append(clay_features_projected)
-        if static_features is not None:
-             if static_features.shape[-2:] != (H_feat, W_feat): raise ValueError("Static features spatial dim mismatch")
-             all_static_features_list.append(static_features)
-
+        
+        # Handle regular static features separately
         static_projected = torch.zeros(B, 0, H_feat, W_feat, device=temporal_projected.device)
-        if self.static_proj is not None and all_static_features_list:
-            # Check if static_features is present and clay features are already projected
-            if static_features is not None and self.clay_model is not None:
-                # Pass only static_features through static_proj
+        if static_features is not None:
+            if static_features.shape[-2:] != (H_feat, W_feat): raise ValueError("Static features spatial dim mismatch")
+            if self.static_proj is not None:
                 static_projected = self.static_proj(static_features)
-            elif static_features is not None:
-                # Only static features present, pass through static_proj
-                static_projected = self.static_proj(static_features)
-            else:
-                # No static features, only clay features which are already projected
-                pass
-        elif self.static_proj is not None and not all_static_features_list:
-             # This means static_proj was created but no static inputs were actually fed to forward
-             # This case implies proj_static_ch > 0. Outputting zeros of proj_static_ch.
-             static_projected = torch.zeros(B, self.static_proj.out_channels, H_feat, W_feat, device=temporal_projected.device)
+        elif self.static_proj is not None:
+            # No static features were provided but static_proj exists, create empty tensor
+            static_projected = torch.zeros(B, self.static_proj.out_channels, H_feat, W_feat, device=temporal_projected.device)
 
-        # Create the complete list of features to fuse (clay_proj + static_proj or just one of them)
+        # Create the complete list of features to fuse (clay_proj + static_proj + temporal)
         fused_features_list = []
         if len(all_static_features_list) > 0:
             fused_features_list.extend(all_static_features_list)
