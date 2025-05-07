@@ -362,8 +362,16 @@ def build_weather_grid(timestamp: pd.Timestamp,
         return np.zeros((6, sat_H, sat_W), dtype=np.float32)
 
     weather_grid = np.zeros((6, sat_H, sat_W), dtype=np.float32)
-    lat_grid = grid_coords[:, :, 0]
-    lon_grid = grid_coords[:, :, 1]
+    # lat_grid = grid_coords[:, :, 0] # ORIGINAL LINE, causes error
+    # lon_grid = grid_coords[:, :, 1] # ORIGINAL LINE
+
+    # NEW LOGIC: grid_coords is (N, 2), reshape to (H,W) for lat and lon
+    grid_lat_raw = grid_coords[:, 0]  # Shape (N,)
+    grid_lon_raw = grid_coords[:, 1]  # Shape (N,)
+
+    lat_grid = grid_lat_raw.reshape(sat_H, sat_W)  # Shape (H, W)
+    lon_grid = grid_lon_raw.reshape(sat_H, sat_W)  # Shape (H, W)
+    # END NEW LOGIC
 
     dist_sq_bronx = (lat_grid - bronx_coords[0])**2 + (lon_grid - bronx_coords[1])**2
     dist_sq_manhattan = (lat_grid - manhattan_coords[0])**2 + (lon_grid - manhattan_coords[1])**2
