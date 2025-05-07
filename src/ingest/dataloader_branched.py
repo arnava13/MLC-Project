@@ -112,12 +112,25 @@ class CityDataSetBranched(Dataset):
         logging.info("Dataloader configured to include previous UHI grid for autoregression (always active).")
         logging.info(f"Dataloader will produce {self.actual_weather_channels} weather channels based on enabled features: {self.enabled_weather_features}")
 
+        # --- Check Flags and Paths Early --- #
         self.feature_flags = feature_flags
         self.selected_mosaic_bands = sentinel_bands_to_load
         self._dem_path = dem_path
         self._dsm_path = dsm_path
         self._cloudless_mosaic_path = cloudless_mosaic_path
         self._single_lst_median_path = single_lst_median_path
+        
+        # Check if mosaic is needed based on flags
+        needs_mosaic = self.feature_flags.get("use_sentinel_composite", False) or \
+                       self.feature_flags.get("use_ndvi", False) or \
+                       self.feature_flags.get("use_ndbi", False) or \
+                       self.feature_flags.get("use_ndwi", False) or \
+                       self.feature_flags.get("use_clay", False)
+                       
+        # If mosaic is needed, ensure the path *argument* was provided
+        if needs_mosaic and not cloudless_mosaic_path: # Check argument directly
+            raise ValueError("cloudless_mosaic_path argument is missing or empty, but is required because use_clay, use_sentinel_composite, or use_indices is True.")
+        # --- End Early Checks --- #
 
         # --- Determine Target Grid Size for FEATURES --- #
         self.feat_H, self.feat_W = determine_target_grid_size(self.bounds, self.feature_resolution_m)
@@ -254,9 +267,7 @@ class CityDataSetBranched(Dataset):
                        self.feature_flags["use_clay"]
 
         if needs_mosaic:
-            if not self._cloudless_mosaic_path:
-                raise ValueError("cloudless_mosaic_path required if using Sentinel composite, indices, or Clay.")
-            mosaic_path = Path(self._cloudless_mosaic_path)
+            mosaic_path = Path(self._cloudless_mosaic_path) # Path must be valid here
             if not mosaic_path.exists(): raise FileNotFoundError(f"Cloudless mosaic file not found: {mosaic_path}")
             logging.info(f"Loading cloudless mosaic from {mosaic_path} with memory mapping")
             # USE mmap_mode='r'
