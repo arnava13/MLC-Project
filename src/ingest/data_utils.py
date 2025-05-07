@@ -43,7 +43,7 @@ def determine_target_grid_size(bounds: List[float], resolution_m: int) -> Tuple[
     W = math.ceil(width_deg / (resolution_m * deg_per_meter_lon))
     return max(1, H), max(1, W)
 
-def compute_grid_cell_coordinates(bounds: List[float], sat_H: int, sat_W: int) -> np.ndarray:
+def compute_grid_cell_coordinates(bounds: List[float], sat_H: int, sat_W: int, target_crs: Any) -> Tuple[np.ndarray, np.ndarray]:
     """Compute lat/lon coordinates for each target grid cell center."""
     min_lon, min_lat, max_lon, max_lat = bounds
     # Calculate pixel size in degrees
@@ -53,9 +53,8 @@ def compute_grid_cell_coordinates(bounds: List[float], sat_H: int, sat_W: int) -
     lons = np.linspace(min_lon + x_res/2, max_lon - x_res/2, sat_W)
     lats = np.linspace(max_lat - y_res/2, min_lat + y_res/2, sat_H) # Lat decreases downwards
     grid_lon, grid_lat = np.meshgrid(lons, lats)
-    grid_coords = np.stack([grid_lat, grid_lon], axis=-1) # Shape (H, W, 2)
-    logging.info("Computed grid cell center coordinates.")
-    return grid_coords
+    logging.info(f"Computed grid cell center coordinates for CRS: {target_crs}.")
+    return grid_lon, grid_lat
 
 # --- Elevation Data Processing --- #
 
