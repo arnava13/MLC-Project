@@ -230,7 +230,6 @@ class BranchedUHIModel(nn.Module):
     static features, fused before a selectable head, followed by final processing.
     """
     def __init__(self,
-                 weather_input_channels: int,
                  convlstm_hidden_dims: List[int],
                  convlstm_kernel_sizes: List[Tuple[int, int]],
                  convlstm_num_layers: int,
