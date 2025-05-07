@@ -659,6 +659,7 @@ class UHINetCNN(nn.Module):
                  freeze_backbone: bool = True,
                  clay_checkpoint_path: Optional[str] = None,
                  clay_metadata_path: Optional[str] = None,
+                 clay_proj_channels: Optional[int] = 32, # <<< RENAMED and ADDED DEFAULT
                  # U-Net dropout
                  unet_dropout_rate: float = 0.1):
         super().__init__()
