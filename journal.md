@@ -247,3 +247,6 @@ src/uhi-pipeline
 - Re-trained the Random Forest and XGBoost models using the sequential split.
 - Evaluated model performance again on the sequential split using R², RMSE, and MAE.
 - Result: Random Forest Evaluation (Sequential Split): R² Score: 0.1763, RMSE: 0.0138, MAE: 0.0110 / XGBoost Evaluation (Sequential Split): R² Score: 0.2101, RMSE: 0.0136, MAE: 0.0111
+
+## May 9 2025:
+- Change the folder structure and file paths. 
