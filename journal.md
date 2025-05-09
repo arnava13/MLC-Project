@@ -240,3 +240,10 @@ src/uhi-pipeline
   static features to channel dimmension of final hidden state from the ConvLSTM. 
 
 - Passes feature cube to a UNet-like architecture to make UHI predictions at each timestamp.
+
+## May 8 2025:
+- Sorted the dataset chronologically by the `datetime` column to prepare for sequential splitting.
+- Applied a sequential split: first 80% of time as train, last 20% as test.
+- Re-trained the Random Forest and XGBoost models using the sequential split.
+- Evaluated model performance again on the sequential split using R², RMSE, and MAE.
+- Result: Random Forest Evaluation (Sequential Split): R² Score: 0.1763, RMSE: 0.0138, MAE: 0.0110 / XGBoost Evaluation (Sequential Split): R² Score: 0.2101, RMSE: 0.0136, MAE: 0.0111
