@@ -24,3 +24,10 @@ cartopy
 lightning
 wandb
 sklearn
+fiona
+shapely
+pyproj
+lxml
+xgboost
+shap
+rasterstats
