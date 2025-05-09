@@ -53,7 +53,7 @@ The project utilizes several data sources for New York City (NYC), primarily foc
 
 ## Models and Experiments
 
-### 1. Baseline Models (`notebooks/RF & XGBoost.ipynb`)
+### 1. Baseline Models (`notebooks/RF_XGBoost.ipynb`)
 
 Traditional machine learning models were implemented as baselines using point-based features:
 *   **Features Used**: NDVI, NDWI, NDBI, LST, interpolated weather variables (air\_temp, rel\_humidity, avg\_windspeed, wind\_dir\_sin, wind\_dir\_cos, solar\_flux), building\_count\_100m, building\_area\_100m.
