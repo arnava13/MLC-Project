@@ -8,8 +8,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 import logging
 
-from src.model import UNetConvBlock, ClayFeatureExtractor, UNetUpBlock, UNetDecoder, UNetDecoderWithTargetResize, FinalUpsamplerAndProjection, SimpleCNNFeatureHead
-from src.ingest.data_utils import determine_target_grid_size, calculate_actual_weather_channels, CANONICAL_WEATHER_FEATURE_ORDER
+from model import UNetConvBlock, ClayFeatureExtractor, UNetUpBlock, UNetDecoder, UNetDecoderWithTargetResize, FinalUpsamplerAndProjection, SimpleCNNFeatureHead
+from ingest.data_utils import determine_target_grid_size, calculate_actual_weather_channels, CANONICAL_WEATHER_FEATURE_ORDER
 
 # -----------------------------------------------------------------------------
 # ConvLSTM Implementation -----------------------------------------------------

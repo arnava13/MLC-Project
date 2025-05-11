@@ -12,8 +12,8 @@ import numpy as np
 from torchvision.transforms import v2
 import pandas as pd # Added for Timestamp check
 
-from src.Clay.src.module import ClayMAEModule
-from src.ingest.data_utils import determine_target_grid_size, CANONICAL_WEATHER_FEATURE_ORDER, calculate_actual_weather_channels # Ensure this is available
+from Clay.src.module import ClayMAEModule
+from ingest.data_utils import determine_target_grid_size, CANONICAL_WEATHER_FEATURE_ORDER, calculate_actual_weather_channels # Ensure this is available
 
 # -----------------------------------------------------------------------------
 # Pretrained Feature Extractors -----------------------------------------------

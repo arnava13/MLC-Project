@@ -9,7 +9,7 @@ import argparse
 from typing import Optional
 
 # Assuming get_median contains the necessary loading function
-from .get_median import load_lst_tensor_from_bbox_median # Relative import
+from get_median import load_lst_tensor_from_bbox_median # Relative import
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 

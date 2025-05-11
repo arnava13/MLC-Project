@@ -17,7 +17,7 @@ import rioxarray # Use rioxarray for easier loading/clipping/resampling
 import xarray as xr # Needed for DataArray type hint
 
 # --- Import centralized utils --- #
-from .data_utils import (
+from data_utils import (
     determine_target_grid_size, # Keep for potentially calculating UHI grid size
     compute_grid_cell_coordinates,
     precompute_uhi_grids,
