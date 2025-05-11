@@ -7,7 +7,7 @@ This project aims to predict Urban Heat Island (UHI) intensity using machine lea
 -   **`data/`**: (Not versioned) Stores raw and processed data, including UHI measurements, weather station records, satellite imagery mosaics (Sentinel-2), elevation models (DEM/DSM), LST, and derived spectral indices.
 -   **`notebooks/`**: Contains Jupyter notebooks for various tasks:
     -   `download_data.ipynb`: Initial data acquisition and preprocessing scripts.
-    -   `RF & XGBoost.ipynb`: Experiments with Random Forest, XGBoost, and MLP baselines.
+    -   `RF_XGBoost.ipynb`: Experiments with Random Forest, XGBoost, and MLP baselines.
     -   `train_uhi_cnn.ipynb`: Training pipeline for the CNN-based UHI model (`UHINetCNN`).
     -   `train_uhi_branched_model.ipynb`: Training pipeline for the branched recurrent UHI model (`BranchedUHIModel`).
 -   **`src/`**: Houses the core Python source code for the project.
