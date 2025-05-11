@@ -6,15 +6,15 @@ import rasterio
 import rasterio.warp
 import rasterio.transform
 import logging
-import xarray as xr # Restore xarray for stac_load output processing
-import rioxarray   # Add rioxarray for proper geospatial handling
-from odc.stac import stac_load # Restore stac_load
-import subprocess # For calling gdalwarp
-import tempfile   # For temporary files
-import os         # For path manipulation
-from pathlib import Path # For path manipulation
-import copy       # For deep copying items
-import pystac     # Add pystac import
+import xarray as xr 
+import rioxarray   
+from odc.stac import stac_load 
+import subprocess 
+import tempfile
+import os
+from pathlib import Path
+import copy 
+import pystac
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
@@ -334,9 +334,6 @@ def load_sentinel_tensor_from_bbox_median(bounds, time_window, selected_bands=["
                 arr = arr.transpose("band", "y", "x")
                 arr = arr.expand_dims("time", axis=1)
             else: raise e
-            
-        # Ensure we have rioxarray for proper geospatial handling
-        import rioxarray  # Make sure this is imported
         
         # Get dimensions for proper transform creation
         width = arr.sizes.get('x')

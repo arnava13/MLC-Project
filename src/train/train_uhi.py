@@ -1,13 +1,13 @@
 import torch
 import torch.optim as optim
-import torch.nn.functional as F # Added for interpolation
+import torch.nn.functional as F
 from torch.utils.data import DataLoader, random_split
 import logging
 import argparse
 from pathlib import Path
 import sys
 import numpy as np
-import pandas as pd # Needed for loading bounds from csv
+import pandas as pd
 from tqdm import tqdm
 import json
 import os
@@ -19,14 +19,13 @@ project_root = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(project_root))
 
 from src.ingest.dataloader import CityDataSet
-from src.model import UHINet # Import the refactored model
+from src.model import UHINet
 from src.train.loss import masked_mae_loss, masked_mse_loss
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # Function to save checkpoint
 def save_checkpoint(state, is_best, filename='checkpoint.pth.tar', best_filename='model_best.pth.tar'):
-    """Saves model checkpoint."""
     Path(filename).parent.mkdir(parents=True, exist_ok=True)
     torch.save(state, filename)
     if is_best:
@@ -98,7 +97,6 @@ def train_epoch(model, dataloader, optimizer, loss_fn, device):
             
             # 5. Predict from final hidden state
             prediction = model.predict(h) # (B, 1, H', W')
-            # --------------------------
 
             # Resize prediction to target size if needed
             if prediction.shape[2:] != target.shape[1:]:
@@ -128,10 +126,10 @@ def train_epoch(model, dataloader, optimizer, loss_fn, device):
              logging.error(f"Runtime error during training: {e}")
              if "out of memory" in str(e):
                  logging.error("CUDA out of memory. Try reducing batch size.")
-             continue # Skip this batch
+             continue 
         except Exception as e:
              logging.error(f"Unexpected error during training step: {e}", exc_info=True)
-             continue # Skip this batch
+             continue 
 
     return total_loss / num_batches if num_batches > 0 else 0.0
 

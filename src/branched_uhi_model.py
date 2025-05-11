@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 import math
 from pathlib import Path
 from typing import List, Tuple, Optional, Dict, Union
@@ -10,10 +9,6 @@ import logging
 
 from model import UNetConvBlock, ClayFeatureExtractor, UNetUpBlock, UNetDecoder, UNetDecoderWithTargetResize, FinalUpsamplerAndProjection, SimpleCNNFeatureHead
 from ingest.data_utils import determine_target_grid_size, calculate_actual_weather_channels, CANONICAL_WEATHER_FEATURE_ORDER
-
-# -----------------------------------------------------------------------------
-# ConvLSTM Implementation -----------------------------------------------------
-# -----------------------------------------------------------------------------
 
 class ConvLSTMCell(nn.Module):
     """Basic ConvLSTM Cell implementation.
@@ -90,7 +85,7 @@ class ConvLSTMCell(nn.Module):
         return h_next, c_next
 
     def init_hidden(self, batch_size, image_size):
-        """Initializes hidden state and cell state with zeros."""
+        # Initializes hidden state and cell state with zeros
         height, width = image_size
         return (torch.zeros(batch_size, self.hidden_dim, height, width, device=self.conv.weight.device),
                 torch.zeros(batch_size, self.hidden_dim, height, width, device=self.conv.weight.device))
@@ -215,15 +210,12 @@ class ConvLSTM(nn.Module):
 
     @staticmethod
     def _extend_for_multilayer(param, num_layers):
-        """Helper function to expand single param value to a list for all layers."""
+        # Helper function to expand single param value to a list for all layers
         if not isinstance(param, list):
             param = [param] * num_layers
         return param
 
-# -----------------------------------------------------------------------------
-# Branched UHI Model (MODIFIED) -----------------------------------------------
-# -----------------------------------------------------------------------------
-
+# Branched UHI Model 
 class BranchedUHIModel(nn.Module):
     """
     UHI prediction model with separate branches for temporal (weather) and
@@ -407,7 +399,7 @@ class BranchedUHIModel(nn.Module):
                 norm_latlon: Optional[torch.Tensor] = None,
                 norm_timestamp: Optional[torch.Tensor] = None,
                 ) -> torch.Tensor:
-        # --- 1. Temporal Branch (ConvLSTM) --- #
+        # 1. Temporal Branch (ConvLSTM)
         # Input is now input_temporal_seq (B, T, C_weather+1, H, W)
         layer_outputs_list, _ = self.conv_lstm(input_temporal_seq) # Pass the combined sequence
         temporal_feature_sequence = layer_outputs_list[-1]
@@ -420,7 +412,7 @@ class BranchedUHIModel(nn.Module):
         # Apply temporal projection dropout
         temporal_projected = self.temporal_proj_dropout(temporal_projected_raw)
 
-        # --- 2. Static Branch --- (Feature extraction & projection)
+        # 2. Static Branch (Feature extraction & projection)
         all_static_features_list = []
         if self.clay_model is not None:
             if clay_mosaic is None or norm_latlon is None or norm_timestamp is None: raise ValueError("Clay inputs missing")
@@ -453,13 +445,13 @@ class BranchedUHIModel(nn.Module):
             fused_features_list.append(static_projected)
         fused_features_list.append(temporal_projected)
 
-        # --- 3. Fusion --- #
+        # 3. Fusion
         fused_features = torch.cat(fused_features_list, dim=1)
 
-        # --- 4. Pass through selected Feature Head --- #
+        # 4. Pass through selected Feature Head 
         head_output_features = self.feature_head(fused_features)
         
-        # --- 5. Pass through Final Processor --- #
+        # 5. Pass through Final Processor 
         prediction = self.final_processor(head_output_features)
 
         return prediction 

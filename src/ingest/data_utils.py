@@ -127,7 +127,6 @@ def load_process_elevation(
             # This case should ideally be prevented by checks in the Dataset __init__ if defaults are not used.
             logging.error(f"elevation_nodata is None and no default known for {data_source_name}. Cannot proceed.")
             return None
-    # ----------------------------- #
 
     merged_data = None
     source_crs = None
@@ -241,7 +240,6 @@ def load_process_elevation(
                 else: # Should not happen if nodata filling worked
                     logging.warning(f"Could not normalize {data_source_name}, max <= min after nodata fill. Using raw grid.")
                     normalized_grid = reprojected_grid
-                # ---------------------------------------- #
 
                 # Ensure final shape is correct (just in case reprojection slightly off)
                 if normalized_grid.shape != (target_H, target_W):
@@ -261,12 +259,11 @@ def load_process_elevation(
 
 
 # --- UHI/LST Utilities --- #
-
 def precompute_uhi_grids(uhi_data: pd.DataFrame,
                          bounds: List[float],
                          sat_H: int, sat_W: int,
                          resolution_m: int) -> Tuple[Dict[pd.Timestamp, np.ndarray], Dict[pd.Timestamp, np.ndarray]]:
-    """Create target UHI grids and masks for all unique timestamps in the dataframe."""
+    # Create target UHI grids and masks for all unique timestamps in the dataframe
     target_grids = {}
     valid_masks = {}
 
@@ -342,10 +339,7 @@ def get_closest_weather_data(timestamp: pd.Timestamp,
                              bronx_weather: pd.DataFrame,
                              manhattan_weather: pd.DataFrame,
                              enabled_weather_features: List[str]) -> Dict[str, Dict[str, float]]:
-    """
-    Finds closest weather data from Bronx and Manhattan stations for a given timestamp,
-    considering only enabled features.
-    """
+    # Finds closest weather data from Bronx and Manhattan stations for a given timestamp, considering only enabled features.
     # Ensure weather dataframes have datetime index or column named 'datetime'
     if not isinstance(bronx_weather.index, pd.DatetimeIndex) and 'datetime' not in bronx_weather.columns:
          raise ValueError("Bronx weather DataFrame must have a DatetimeIndex or a 'datetime' column.")

@@ -8,15 +8,14 @@ import pandas as pd
 import numpy as np
 from tqdm import tqdm
 from typing import Tuple, Dict, Optional, List, Union, Any
-import torch.nn.functional as F # For interpolation
-import tempfile # Added for safe saving
-from sklearn.metrics import r2_score # <<< Add import for r2_score
+import torch.nn.functional as F 
+import tempfile 
+from sklearn.metrics import r2_score 
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 def save_checkpoint(state: Dict[str, Any], is_best: bool, output_dir: Union[str, Path], filename: str = 'checkpoint.pth.tar', best_filename: str = 'model_best.pth.tar'):
-    """Saves model checkpoint safely using a temporary file."""
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     filepath = output_dir / filename
@@ -118,7 +117,7 @@ def split_data(dataset: Dataset, val_percent: float = 0.40, seed: int = 42) -> T
 
 
 def calculate_uhi_stats(train_ds: Subset) -> Tuple[float, float]:
-    """Calculates the mean and standard deviation of UHI values from the training subset (memory efficient)."""
+    # Calculates the mean and standard deviation of UHI values from the training subset (memory efficient)
     logging.info("Calculating UHI statistics from training data...")
     all_train_targets = []
 
@@ -185,7 +184,6 @@ def create_dataloaders(train_ds: Subset,
                          n_train_batches: int,
                          num_workers: int,
                          device: torch.device) -> Tuple[Optional[DataLoader], Optional[DataLoader]]:
-    """Creates training and validation dataloaders."""
     logging.info("Creating dataloaders...")
     train_loader = None
     val_loader = None
@@ -230,7 +228,7 @@ def create_dataloaders(train_ds: Subset,
 
 
 def validate_model(model, val_loader, loss_fn, device=None):
-    """Evaluates model performance on a validation set, properly handling NaN values."""
+    # Evaluates model performance on a validation set
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.eval()
@@ -475,7 +473,7 @@ def validate_epoch_generic(model: nn.Module,
                             uhi_std: float,
                             feature_flags: Dict[str, bool],
                             desc: str = 'Validation') -> Tuple[float, float, float]:
-    """Validates a generic UHI model for one epoch, handling different batch structures robustly."""
+    # Validates a generic UHI model for one epoch, handling different batch structures robustly
     model.eval()
     total_loss = 0.0
     all_targets_unnorm = []
@@ -546,15 +544,14 @@ def validate_epoch_generic(model: nn.Module,
                 
             if static_features is not None: model_args['static_features'] = static_features.to(device)
 
-            # --- ADD CLAY INPUTS TO MODEL_ARGS IF ENABLED ---
+            # Add Clay inputs if feature_flags.get("use_clay", False) is True
             if feature_flags.get("use_clay", False):
                 if clay_mosaic_tensor is not None: model_args['clay_mosaic'] = clay_mosaic_tensor.to(device)
                 if norm_latlon_tensor is not None: model_args['norm_latlon'] = norm_latlon_tensor.to(device)
                 if norm_timestamp_tensor is not None: model_args['norm_timestamp'] = norm_timestamp_tensor.to(device)
                 # The check for None on these tensors was already done earlier when extracting from batch
-            # --- END ADD CLAY INPUTS ---
 
-            # ------ Forward pass and loss calculation ------ #
+            # Forward pass and loss calculation
             try:
                 # Separate temporal sequence (positional) from other args (keyword)
                 if 'input_temporal_seq' not in model_args:
@@ -624,5 +621,3 @@ def validate_epoch_generic(model: nn.Module,
         r2 = float('nan')
     
     return avg_loss, rmse, r2
-
-# --- End Generic Train/Validate Functions --- # 

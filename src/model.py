@@ -1,7 +1,6 @@
 import math
 from pathlib import Path
 from typing import List, Tuple, Optional, Dict
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -10,15 +9,12 @@ import yaml
 from box import Box
 import numpy as np
 from torchvision.transforms import v2
-import pandas as pd # Added for Timestamp check
-
+import pandas as pd
 from Clay.src.module import ClayMAEModule
 from ingest.data_utils import determine_target_grid_size, CANONICAL_WEATHER_FEATURE_ORDER, calculate_actual_weather_channels # Ensure this is available
 
-# -----------------------------------------------------------------------------
-# Pretrained Feature Extractors -----------------------------------------------
-# -----------------------------------------------------------------------------
 
+# Pretrained Feature Extractors 
 class ClayFeatureExtractor(nn.Module):
     """
     Loads a pre-trained Clay model from a local checkpoint and extracts features.
@@ -97,9 +93,8 @@ class ClayFeatureExtractor(nn.Module):
             #     adjusted_state_dict[k] = v 
         
         print("Loading state_dict manually into self.model.model...")
-        # --- MODIFIED: Load into self.model.model --- 
+        # --- Load into self.model.model --- 
         missing_keys, unexpected_keys = self.model.model.load_state_dict(adjusted_state_dict, strict=False)
-        # -------------------------------------------
         if missing_keys:
             print(f"Warning: Missing keys in state_dict (relative to self.model.model): {missing_keys}")
         if unexpected_keys:
@@ -108,9 +103,8 @@ class ClayFeatureExtractor(nn.Module):
         self.model.to(self.device) # Move model to target device
         # Set to eval mode initially. Will be set to train mode later if needed.
         self.model.eval()
-        # ----------------------------------------
 
-        # --- MODIFIED Freezing Logic ---
+        # Freezing Logic
         # Freeze all parameters initially
         for param in self.model.parameters():
             param.requires_grad = False
@@ -141,15 +135,12 @@ class ClayFeatureExtractor(nn.Module):
         else:
             logging.info("Keeping Clay backbone frozen.")
             self.model.eval() # Ensure model is in eval mode if fully frozen
-        # --- END MODIFIED Freezing Logic ---
-
         # Get embed_dim and patch_size from hparams, inferring embed_dim from model_size
-        # --- MODIFIED: Override patch_size based on observed error --- 
+        # Override patch_size based on observed error 
         try:
             # --- Set patch_size explicitly --- 
             self.patch_size = 16 # Override based on error: 196 patches from 224x224 -> 16x16 patches
             print(f"WARNING: Overriding patch size from hparams. Using fixed patch_size = {self.patch_size}")
-            # --------------------------------
 
             # --- Get model_size and infer embed_dim from hparams --- 
             self.model_size = hparams.get('model_size')
@@ -181,7 +172,6 @@ class ClayFeatureExtractor(nn.Module):
                          raise ValueError(f"Unsupported model_size '{self.model_size}' and could not infer embed_dim from model structure.")
                  except Exception as e:
                       raise ValueError(f"Unsupported model_size '{self.model_size}' found in hparams. Could not infer embed_dim: {e}")
-            # --------------------------------------------------------
 
             print(f"Clay model properties: model_size={self.model_size}, embed_dim={self.embed_dim}, patch_size={self.patch_size} (patch_size OVERRIDDEN)")
             
@@ -198,10 +188,9 @@ class ClayFeatureExtractor(nn.Module):
         # Prepare normalization based on metadata and selected bands
         self._prepare_normalization()
 
-        # --- ADDED: Assign output channels ---
+        # --- Assign output channels ---
         self.output_channels = self.embed_dim
         logging.info(f"ClayFeatureExtractor output channels set to: {self.output_channels}")
-        # --- END ADDED ---
 
     def _prepare_normalization(self):
         """Prepares the normalization transform based on loaded metadata."""
@@ -290,7 +279,6 @@ class ClayFeatureExtractor(nn.Module):
         # GSD remains fixed based on initialization
         gsd_tensor = torch.full((batch_size,), self.gsd, device=self.device)
         gsd_tensor_unsqueezed = gsd_tensor.unsqueeze(1)       # (B, 1)
-        # -----------------------------------------------------------------------
 
         # Adapt datacube structure for batch processing by Clay's encoder
         # Add a dummy time dimension (T=1) using the *resized* pixels
@@ -314,7 +302,6 @@ class ClayFeatureExtractor(nn.Module):
                  }
                  # --- Encoder forward pass --- 
                  unmsk_patch, _, _, _ = self.model.model.encoder(single_datacube) # Output shape (1, N+1, D)
-                 # --------------------------
 
                  # Get spatial patch embeddings (excluding CLS token)
                  patch_embeddings = unmsk_patch[:, 1:, :] # Shape (1, N, D)
@@ -347,11 +334,7 @@ class ClayFeatureExtractor(nn.Module):
 
         return spatial_features
 
-# -----------------------------------------------------------------------------
-# -----------------------------------------------------------------------------
-# CNN HEADS -------------------------------------------------------------------
-# -----------------------------------------------------------------------------
-
+# CNN HEADS 
 class FinalUpsamplerAndProjection(nn.Module):
     """Upsamples features to target UHI resolution and projects to 1 channel."""
     def __init__(self, in_channels: int, refinement_channels: int, target_h: int, target_w: int):
@@ -624,10 +607,7 @@ class UNetDecoderWithTargetResize(UNetDecoder):
 
         return x
 
-# -----------------------------------------------------------------------------
-# 5. CNN-BASED UHI NET MODEL (MODIFIED) ---------------------------------------
-# -----------------------------------------------------------------------------
-
+# 5. CNN-based UHI net model
 class UHINetCNN(nn.Module):
     """
     UHI Prediction CNN model with optional Clay integration and selectable head.
@@ -659,9 +639,8 @@ class UHINetCNN(nn.Module):
                  freeze_backbone: bool = True,
                  clay_checkpoint_path: Optional[str] = None,
                  clay_metadata_path: Optional[str] = None,
-                 clay_proj_channels: Optional[int] = 32, # <<< RENAMED and ADDED DEFAULT
-                 # U-Net dropout
-                 unet_dropout_rate: float = 0.1):
+                 clay_proj_channels: Optional[int] = 32,
+                 unet_dropout_rate: float = 0.1): # U-Net dropout
         super().__init__()
         self.feature_flags = feature_flags
         self.head_type = head_type.lower()
@@ -826,7 +805,7 @@ class UHINetCNN(nn.Module):
         x = self.feature_head(x)
         
         # --- Pass through Final Processor --- #
-        # prediction = self.final_processor(x) # REMOVED
-        prediction = self.final_projection(x) # ADDED: Apply final projection
+        # prediction = self.final_processor(x) 
+        prediction = self.final_projection(x) # Apply final projection
 
         return prediction

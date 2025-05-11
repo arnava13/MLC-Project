@@ -4,8 +4,8 @@ import torch.nn.functional as F
 def masked_mae_loss(pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
     """Mean Absolute Error computed only over valid grid cells.
 
-    This variant avoids NaNs that arise when unobserved cells in *target* contain
-    NaNs by selecting the valid locations *before* performing the arithmetic
+    This variant avoids NaNs that arise when unobserved cells in target contain
+    NaNs by selecting the valid locations before performing the arithmetic
     operations rather than multiplying by the mask.
     """
     # Ensure boolean mask
@@ -24,7 +24,7 @@ def masked_mae_loss(pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor
     return loss
 
 def masked_mse_loss(pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-    """Mean Squared Error computed only over valid grid cells, avoiding NaNs."""
+    # Mean Squared Error computed only over valid grid cells, avoiding NaNs.
     mask_bool = mask.bool()
 
     pred_valid = pred[mask_bool]
